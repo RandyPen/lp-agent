@@ -1,0 +1,23 @@
+{
+  "name": "liquidity-manager",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "events:print": "bun run scripts/print-events.ts",
+    "key:bootstrap": "bun run scripts/bootstrap-agent-key.ts"
+  },
+  "dependencies": {
+    "@mysten/sui": "^2.16.0",
+    "@cetusprotocol/dlmm-sdk": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

@@ -1,0 +1,75 @@
+import { loadConfig } from "./config.ts";
+import { openDb } from "./db/client.ts";
+import { getAgentAddress } from "./sui/keypair.ts";
+import { createOnchainPriceFeed } from "./data/feeds/onchain.ts";
+import { createSubscriptionsService } from "./services/subscriptions.ts";
+import { createExecutorService } from "./services/executor.ts";
+import { createRebalancerService } from "./services/rebalancer.ts";
+import { log } from "./lib/logger.ts";
+
+async function main(): Promise<void> {
+  // 1. Load config — fails fast on missing env vars.
+  const cfg = loadConfig();
+
+  // 2. Open and migrate the database.
+  openDb(cfg.dbFile);
+
+  // 3. Log startup context.
+  const agentAddress = getAgentAddress();
+  log.info("liquidity-manager starting", {
+    network: cfg.network,
+    agentAddress,
+    poolId: cfg.poolProfile.poolId,
+    poolName: cfg.poolProfile.name,
+    priceFeed: cfg.priceFeed,
+  });
+
+  // 4. Create the price feed. Only "onchain" is implemented in P0.
+  if (cfg.priceFeed !== "onchain") {
+    log.error("price feed not yet implemented", { priceFeed: cfg.priceFeed });
+    process.exit(1);
+  }
+  const priceFeed = createOnchainPriceFeed(cfg.poolProfile);
+
+  // 5. Create and initially poll subscriptions so we backfill on first start.
+  const subscriptionsService = createSubscriptionsService();
+  const initial = await subscriptionsService.pollOnce();
+  log.info("subscriptions: initial poll complete", initial);
+
+  // 6. Schedule recurring subscription polling.
+  const subHandle = setInterval(() => {
+    subscriptionsService.pollOnce().catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error("subscriptions: poll failed", { error: msg });
+    });
+  }, cfg.eventPollIntervalMs);
+
+  // 7. Create and start the rebalancer.
+  const executorService = createExecutorService();
+  const rebalancerService = createRebalancerService(
+    subscriptionsService,
+    executorService,
+    priceFeed,
+  );
+  const stopRebalancer = rebalancerService.start();
+
+  log.info("liquidity-manager running");
+
+  // 8. Graceful shutdown on SIGINT / SIGTERM.
+  function shutdown(signal: string): void {
+    log.info("received signal, shutting down", { signal });
+    clearInterval(subHandle);
+    stopRebalancer();
+    log.info("liquidity-manager stopped");
+    process.exit(0);
+  }
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+}
+
+main().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  log.error("liquidity-manager fatal error", { error: msg });
+  process.exit(1);
+});
