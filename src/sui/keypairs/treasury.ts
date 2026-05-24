@@ -97,10 +97,17 @@ export function getTreasuryMasterAddress(): string {
  * User indices start at 1. The runtime enforces this through `treasury_users.derivation_index ≥ 1`
  * in the SQL store.
  */
+/** SLIP-0010 hardened index upper bound (exclusive). */
+const HARDENED_INDEX_MAX = 2_147_483_648; // 2^31
+
 export function getUserDepositKeypair(derivationIndex: number): Ed25519Keypair {
-  if (!Number.isInteger(derivationIndex) || derivationIndex < 1) {
+  if (
+    !Number.isInteger(derivationIndex) ||
+    derivationIndex < 1 ||
+    derivationIndex >= HARDENED_INDEX_MAX
+  ) {
     throw new ConfigError(
-      `treasury user derivation index must be integer ≥ 1, got ${derivationIndex}`,
+      `treasury user derivation index must be integer in [1, ${HARDENED_INDEX_MAX}), got ${derivationIndex}`,
     );
   }
   const cfg = loadConfig();

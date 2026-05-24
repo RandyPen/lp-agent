@@ -110,10 +110,12 @@ CREATE INDEX IF NOT EXISTS position_state_strategy ON position_state(strategy_na
 ------------------------------------------------------------------------------
 
 -- 充值用户:一个 sui_address(用户主钱包)→ 唯一 derivation_index →
--- 唯一 deposit_address。derivation_index ≥ 1(0 留给 treasury master)。
+-- 唯一 deposit_address。derivation_index ∈ [1, 2^31)(0 留给 treasury master;
+-- SLIP-0010 hardened 上限 2^31-1 = 2147483647)。
 CREATE TABLE IF NOT EXISTS treasury_users (
   sui_address       TEXT PRIMARY KEY,
-  derivation_index  INTEGER NOT NULL UNIQUE CHECK(derivation_index >= 1),
+  derivation_index  INTEGER NOT NULL UNIQUE
+                    CHECK(derivation_index >= 1 AND derivation_index < 2147483648),
   deposit_address   TEXT NOT NULL UNIQUE,
   credits           INTEGER NOT NULL DEFAULT 0 CHECK(credits >= 0),
   created_at_ms     INTEGER NOT NULL

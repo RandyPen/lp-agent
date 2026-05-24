@@ -662,3 +662,47 @@ v1 已实现(见本文开头 Status banner)。下一步:
 - [ ] credit_rates 没设的 coin_type → watcher 入账时记 deposits 行但 credits_granted=0,**不静默丢弃**
 - [ ] scripts/ 下任何运营脚本都不打印助记词、私钥、master seed
 - [ ] 加 treasury 表时直接追加到 `src/db/schema.sql` 末尾,所有 CREATE 都用 `IF NOT EXISTS`(本项目不做版本化迁移,见 `db/client.ts` 注释)
+
+---
+
+## Treasury 与 Seal 加密研报的关系
+
+**Treasury 不参与 Seal 收件人身份**。早期设计稿讨论过"用 deposit_address 当 Seal recipient"(模型 A)或"用 user 主钱包"(模型 B),都不是最优解。落地方案是模型 C:
+
+| 系统 | 角色 | 派生路径 / 持有人 |
+|---|---|---|
+| **Treasury per-user deposit** | 用户充值收款 + 退款收回 | `m/44'/784'/0'/0'/N'`,treasury 持私钥 |
+| **Seal 授权读者**(v2) | 研报 / 加密数据的接收 + 解密 | **AGENT_ADDRESS**(`m/44'/784'/1'/0'/0'`),agent 持私钥 |
+
+两套地址完全独立,只通过 `treasury_users.sui_address` 这一行把"哪个用户付了哪笔订阅 / 哪笔 rebalance 费"对账起来。
+
+### 与 credit 扣减的协同
+
+如果运营想"让用户花 credit 订阅研报"(而不是再次链上付费):
+
+```
+1. user 在前端点"订阅研报 X"
+2. 前端调 agent HTTP API (v2),带上 user.sui_address + reportId
+3. agent 端:
+   a. attemptCharge(user, cost=订阅价的 credit 数, memo="seal-sub:reportId")
+   b. 余额够 → operator 自己签个 PTB 调 SEAL_PACKAGE::subscribe(),把 Subscription mint 到 AGENT_ADDRESS
+   c. 余额不够 → 拒绝
+4. 后续 agent 用自己的 SessionKey 自动拉取该研报内容,投递给 user
+```
+
+这条路径**完全复用**现有 `attemptCharge` / `refundCharge` API,Seal 那边只需要新的 `src/seal/policy.ts` 来构造 Move 调用 PTB。详细落地见 `docs/seal-integration.md`。
+
+### 派生命名空间约定(forward compat)
+
+为防止未来"deposit + Seal 角色拆分"时改 base path 带来历史地址迁移地狱,**约定**:
+
+```
+m/44'/784'/0'/0'/N'   ← deposit + 退款收款,treasury 派生(当前唯一在用)
+m/44'/784'/0'/1'/N'   ← 预留:如果未来选模型 B 让用户控 Seal 私钥,本分支当独立 user identity
+m/44'/784'/0'/2'/N'   ← 预留:专门的 swap / rebalance 操作子地址
+m/44'/784'/0'/3'/N'+  ← 预留扩展
+```
+
+**当前代码只用 `0'` 分支**;其他分支不要先实现。任何新功能用新分支,不污染已分配的 N'。
+
+容量上 `0'` 分支可装 2,147,483,647 用户,日常远不会触底。`schema.sql` 的 CHECK 约束已经把上限钉死(`derivation_index < 2^31`)防数据库被人为污染。

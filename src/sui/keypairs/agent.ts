@@ -1,17 +1,26 @@
 /**
- * Agent role keypair — the address that signs CDPM rebalance transactions.
+ * Agent role keypair — single Ed25519 identity with two on-chain roles:
+ *
+ *   1. **DLMM rebalance signer** — whitelisted on each CDPM PositionManager;
+ *      signs add/remove/collect PTBs.
+ *   2. **Seal authorised reader** (v2) — users who pay for research-report
+ *      access mint a Subscription / Allowlist entry pointing at this same
+ *      address through a Move contract. The agent then derives a Seal
+ *      SessionKey with this keypair and pulls decryption shares from the
+ *      Key Servers autonomously until the session TTL or subscription
+ *      expires. See `docs/seal-integration.md`.
  *
  * Sources, in precedence order:
  *   1. `AGENT_PRIVATE_KEY` (bech32 `suiprivkey1…`)
  *   2. `AGENT_MNEMONICS` (preferred new name) or `MNEMONICS` (legacy alias)
  *      + `AGENT_DERIVATION_PATH` (default `m/44'/784'/1'/0'/0'`)
  *
- * The resolver enforces `EXPECTED_AGENT_ADDRESS` when set; mismatch throws.
+ * The resolver enforces `EXPECTED_AGENT_ADDRESS` (required env) + the TOFU
+ * identity file (`<dbDir>/agent.identity.json`); either mismatch throws.
  *
- * Singleton with module-private cache — never shared with other roles (see
- * `src/sui/keypairs/treasury.ts` when added). This isolation matters: a
- * compromised agent code path must not be able to obtain the treasury key
- * by accident.
+ * Singleton with module-private cache — never shared with the treasury
+ * singleton. This isolation matters: a compromised agent code path must
+ * not be able to obtain the treasury key by accident.
  */
 
 import type { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
