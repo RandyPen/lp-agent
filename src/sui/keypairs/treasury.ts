@@ -31,6 +31,11 @@ import { loadConfig } from "../../config.ts";
 import { ConfigError } from "../../lib/errors.ts";
 import { log } from "../../lib/logger.ts";
 import { resolveKeypair } from "./resolve.ts";
+import {
+  defaultIdentityFilePath,
+  identityFilesDisabled,
+  loadOrPersistIdentity,
+} from "./identityFile.ts";
 
 let cachedMaster: Ed25519Keypair | null = null;
 let cachedMasterAddress: string | null = null;
@@ -44,6 +49,24 @@ export function getTreasuryMasterKeypair(): Ed25519Keypair {
     );
   }
   const resolved = resolveKeypair(cfg.keys.treasury);
+
+  // TOFU identity gate — see src/sui/keypairs/identityFile.ts.
+  let identityNote = "skipped";
+  if (!identityFilesDisabled()) {
+    const filePath =
+      process.env.TREASURY_IDENTITY_FILE?.trim() ||
+      defaultIdentityFilePath("treasury", cfg.dbFile);
+    const result = loadOrPersistIdentity({
+      role: "treasury",
+      derivedAddress: resolved.address,
+      source: resolved.source,
+      derivationPath:
+        resolved.source === "mnemonic" ? cfg.keys.treasury.derivationPath : null,
+      filePath,
+    });
+    identityNote = result.created ? `created:${filePath}` : `verified:${filePath}`;
+  }
+
   cachedMaster = resolved.keypair;
   cachedMasterAddress = resolved.address;
   log.info("treasury master keypair resolved", {
@@ -53,6 +76,7 @@ export function getTreasuryMasterKeypair(): Ed25519Keypair {
     derivationPath:
       resolved.source === "mnemonic" ? cfg.keys.treasury.derivationPath : undefined,
     addressGuard: cfg.keys.treasury.expectedAddress ? "enforced" : "unset",
+    identityFile: identityNote,
   });
   return cachedMaster;
 }

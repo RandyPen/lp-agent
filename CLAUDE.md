@@ -82,6 +82,19 @@ Operator setup checklist:
 
 `AGENT_MNEMONICS` wins over `MNEMONICS` when both are set. `EXPECTED_AGENT_ADDRESS` is enforced inside `getAgentKeypair()` regardless of source — mismatch aborts at first key resolution, not just at startup.
 
+### TOFU identity files (defense in depth)
+
+In addition to the optional `EXPECTED_*_ADDRESS` env guard, the agent and treasury singletons each persist a **trust-on-first-use** record to disk:
+
+- Default location: `<dirname(DB_FILE)>/agent.identity.json` and `treasury.identity.json` (e.g. `./data/agent.identity.json`).
+- First run: the derived address is written to the file with `firstSeenMs`.
+- Every subsequent run: the file is read; mismatch with the derived address aborts with a `ConfigError` before the keypair gets cached.
+- Override path via `AGENT_IDENTITY_FILE` / `TREASURY_IDENTITY_FILE` env vars.
+- Kill switch: `IDENTITY_FILES_DISABLED=true` (used by tests and ephemeral dev loops).
+- Rotate intentionally: delete the file and restart. The file contains only the public address, source label, derivation path, and timestamps — never seed material.
+
+Both `EXPECTED_*_ADDRESS` and the identity file run; if either fails the role refuses to start. The env guard is the primary safety; the file is a secondary catch for operators who don't pin the expected address in `.env`. See `src/sui/keypairs/identityFile.ts`.
+
 ## Multi-role keys (forward-looking)
 
 This project will eventually grow a second on-chain identity: the **treasury / deposit-handling address** for the SuiAgentsTopUp-style monetization layer (per `项目.md` and `src/data/feeds` / future treasury module). That address is operationally and cryptographically **independent** of the agent — different mnemonic, different derivation path, different `EXPECTED_*_ADDRESS` guard.
