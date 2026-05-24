@@ -56,7 +56,7 @@ When writing a verification script:
 
 ## Agent Identity (mainnet)
 
-The production agent signs from a single Ed25519 address derived from the operator's mnemonic stored in `.env` as `MNEMONICS`. **One keypair, two roles**: (a) CDPM rebalance signer (whitelisted on each `PositionManager`), and (b) Seal authorised reader for the optional encrypted research-report layer (v2). Operators pay for research access through a Move contract that mints a Subscription / Allowlist entry to this same address; the agent then signs Seal `SessionKey` requests with its own keypair. See `docs/seal-integration.md`.
+The production agent signs from a single Ed25519 address derived from the operator's mnemonic stored in `.env` as `MNEMONICS`. **Single role**: CDPM rebalance / lending PTB signer, whitelisted on each `PositionManager`. The optional Seal encrypted-research-report layer (v2) is **per-user**, not per-agent — each user's treasury deposit address doubles as their own Seal reader identity; the agent keypair is not involved. See `docs/seal-integration.md`.
 
 The mapping is fixed:
 

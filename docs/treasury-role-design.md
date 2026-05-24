@@ -667,42 +667,75 @@ v1 已实现(见本文开头 Status banner)。下一步:
 
 ## Treasury 与 Seal 加密研报的关系
 
-**Treasury 不参与 Seal 收件人身份**。早期设计稿讨论过"用 deposit_address 当 Seal recipient"(模型 A)或"用 user 主钱包"(模型 B),都不是最优解。落地方案是模型 C:
+**每个用户的 deposit 地址同时就是该用户在 Seal 上的授权阅读地址**。这是一个三合一身份:充值收款 + 退款收回 + Seal 解密身份,**完全 per-user 隔离**。
 
-| 系统 | 角色 | 派生路径 / 持有人 |
+| 用途 | 派生路径 | 谁持有私钥 |
 |---|---|---|
-| **Treasury per-user deposit** | 用户充值收款 + 退款收回 | `m/44'/784'/0'/0'/N'`,treasury 持私钥 |
-| **Seal 授权读者**(v2) | 研报 / 加密数据的接收 + 解密 | **AGENT_ADDRESS**(`m/44'/784'/1'/0'/0'`),agent 持私钥 |
+| 用户充值入账 | `m/44'/784'/0'/0'/N'` | treasury runtime |
+| credit 退款 | 同上 | treasury runtime |
+| **Seal 阅读身份**(v2) | **同上** | treasury runtime(为该 user_N 签 SessionKey) |
 
-两套地址完全独立,只通过 `treasury_users.sui_address` 这一行把"哪个用户付了哪笔订阅 / 哪笔 rebalance 费"对账起来。
+为什么 per-user 而不是 per-agent:Seal 的访问控制是**单个用户为提升自己交易表现购买**,user_A 付费后获得的研报权限,user_B 在合约层就拿不到 — 这是隔离的自然边界。如果让 agent 地址当全局 Seal reader,意味着"运营整体订阅一份,所有用户共享",这跟"按用户独立付费"的产品模型不符。
 
-### 与 credit 扣减的协同
-
-如果运营想"让用户花 credit 订阅研报"(而不是再次链上付费):
+### 端到端流程
 
 ```
-1. user 在前端点"订阅研报 X"
-2. 前端调 agent HTTP API (v2),带上 user.sui_address + reportId
-3. agent 端:
-   a. attemptCharge(user, cost=订阅价的 credit 数, memo="seal-sub:reportId")
-   b. 余额够 → operator 自己签个 PTB 调 SEAL_PACKAGE::subscribe(),把 Subscription mint 到 AGENT_ADDRESS
+1. user_N 在前端"订阅研报 X"
+   - 前端先查 GET /api/user/{sui_address} 拿到 user_N_deposit_address
+   - 构造 PTB 调 SEAL_PACKAGE::subscribe(payment, user_N_deposit_address)
+     注意:Subscription 对象 transfer 到 user_N_deposit_address,不是 agent 地址
+
+2. 用户钱包(Sui Wallet 等)签 + 提交
+   - 钱包是 user 自己的主钱包(user.sui_address)
+   - 付的是 user 钱包里的资产(SUI / USDC)
+   - 但 Subscription 飞到 user_N_deposit_address 那个收件箱
+
+3. 研报投递 / agent 自动拉取
+   - Treasury runtime 周期 / 按需触发:
+     a. user = findUserBySuiAddress(<some user>)
+     b. kp = getUserDepositKeypair(user.derivationIndex)
+     c. session = SessionKey.create({ address: user.depositAddress,
+                                       packageId: cfg.seal.packageId,
+                                       signer: kp,                    // ← user_N 自己的 keypair
+                                       ttlMin: cfg.seal.sessionTtlMin })
+     d. dry-run PTB 调 SEAL_PACKAGE::seal_approve_subscription(...)
+        Key Servers 看 tx.sender = user_N_deposit_address ∈ allowlist → 返回 IBE 分片
+     e. runtime 解密 → 喂给 user_N 的 PM 对应策略
+```
+
+### 一并用 credit 扣减(可选,内部托管订阅)
+
+如果运营想让 user **不必再次链上付费**、直接用已有的 credit 余额订阅:
+
+```
+1. user 调 HTTP API (v2): subscribeReport(user.sui_address, reportId)
+2. 后端:
+   a. attemptCharge(user, cost=报价的 credit 数, memo="seal-sub:reportId")
+   b. 余额够 → treasury 自己 derive user_N keypair,
+      由 treasury master 签 PTB 调 SEAL_PACKAGE::subscribe_internal(user_N_deposit_address),
+      把 Subscription mint 给 user_N_deposit_address
    c. 余额不够 → 拒绝
-4. 后续 agent 用自己的 SessionKey 自动拉取该研报内容,投递给 user
 ```
 
-这条路径**完全复用**现有 `attemptCharge` / `refundCharge` API,Seal 那边只需要新的 `src/seal/policy.ts` 来构造 Move 调用 PTB。详细落地见 `docs/seal-integration.md`。
+完全复用现有 `attemptCharge` / `refundCharge` API。Seal 那边新增的合约接口需要支持"由 treasury master 代付"的入口 — 但 Subscription 接收方仍然是 user_N_deposit_address(语义上 user_N 才是订阅人)。
+
+### 信任层级
+
+- **链上**:Move 合约保证 user_A 的 Subscription 对 user_B 完全不可见(对象 owner 不同)
+- **agent 进程内**:treasury mnemonic 能 derive 所有用户的 keypair → 进程层面 operator 有能力解所有用户的 Seal 数据(这是 *operator hosting* 模型的固有信任,不可能用纯密码学消除)
+- **审计**:每次 SessionKey 创建 + 每次解密都写 `treasury_ops` 留痕(`op_kind='seal_read'`,memo 带 reportId + 时间戳)
 
 ### 派生命名空间约定(forward compat)
 
-为防止未来"deposit + Seal 角色拆分"时改 base path 带来历史地址迁移地狱,**约定**:
+为防止未来再加新功能时改 base path 带来历史地址迁移地狱,**约定**:
 
 ```
-m/44'/784'/0'/0'/N'   ← deposit + 退款收款,treasury 派生(当前唯一在用)
-m/44'/784'/0'/1'/N'   ← 预留:如果未来选模型 B 让用户控 Seal 私钥,本分支当独立 user identity
-m/44'/784'/0'/2'/N'   ← 预留:专门的 swap / rebalance 操作子地址
+m/44'/784'/0'/0'/N'   ← deposit + 退款 + Seal 阅读身份(三合一,当前唯一在用)
+m/44'/784'/0'/1'/N'   ← 预留扩展(未确定具体用途;新增功能用本分支,不污染 0')
+m/44'/784'/0'/2'/N'   ← 预留扩展
 m/44'/784'/0'/3'/N'+  ← 预留扩展
 ```
 
-**当前代码只用 `0'` 分支**;其他分支不要先实现。任何新功能用新分支,不污染已分配的 N'。
+**当前代码只用 `0'` 分支**;其他分支不要先实现。任何不能用同一 keypair 的新角色再开新分支。
 
-容量上 `0'` 分支可装 2,147,483,647 用户,日常远不会触底。`schema.sql` 的 CHECK 约束已经把上限钉死(`derivation_index < 2^31`)防数据库被人为污染。
+容量上 `0'` 分支可装 2,147,483,647 用户(SLIP-0010 hardened 上限),日常远不会触底。`schema.sql` 的 CHECK 约束已经把上限钉死(`derivation_index < 2^31`),`getUserDepositKeypair()` 在代码层也校验同一上限。

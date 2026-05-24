@@ -1,14 +1,9 @@
 /**
- * Agent role keypair — single Ed25519 identity with two on-chain roles:
- *
- *   1. **DLMM rebalance signer** — whitelisted on each CDPM PositionManager;
- *      signs add/remove/collect PTBs.
- *   2. **Seal authorised reader** (v2) — users who pay for research-report
- *      access mint a Subscription / Allowlist entry pointing at this same
- *      address through a Move contract. The agent then derives a Seal
- *      SessionKey with this keypair and pulls decryption shares from the
- *      Key Servers autonomously until the session TTL or subscription
- *      expires. See `docs/seal-integration.md`.
+ * Agent role keypair — the address that signs CDPM rebalance / lending PTBs.
+ * Seal authorisation in this project is per-user (each user pays for their
+ * own research-report access; the authorised reader is the user's per-user
+ * treasury deposit address, signed by the treasury mnemonic). Agent does
+ * NOT touch Seal SessionKeys. See `docs/seal-integration.md`.
  *
  * Sources, in precedence order:
  *   1. `AGENT_PRIVATE_KEY` (bech32 `suiprivkey1…`)
