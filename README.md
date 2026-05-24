@@ -28,8 +28,11 @@ bun install                              # aftermath override 已锁定 2.0.1
 
 # 2. 配置(.env 文件)
 cp .env.example .env                     # 编辑填密钥
-                                         # 至少需要 AGENT_MNEMONICS 或 AGENT_PRIVATE_KEY
-                                         # SUI_USDC_POOL_ID(mainnet 池 id)
+                                         # 必填:
+                                         #   - AGENT_MNEMONICS 或 AGENT_PRIVATE_KEY
+                                         #   - EXPECTED_AGENT_ADDRESS(防止换错助记词)
+                                         #   - SUI_USDC_POOL_ID(mainnet 池 id)
+                                         # 没填会在启动时一次性列出所有缺失字段
 
 # 3. 验证密钥派生
 bun run scripts/verify-agent-address.ts  # ✅ 应该 match

@@ -70,7 +70,7 @@ The production agent signs from a single Ed25519 address derived from the operat
 
 Operator setup checklist:
 1. Set `MNEMONICS=<phrase>` (or `AGENT_MNEMONICS=<phrase>`, preferred new name) in `.env`.
-2. Set `EXPECTED_AGENT_ADDRESS=0xf3f8feeba6b94376511dfc38d51ea3f5d2f3d1b70725fa0f50e5253a66d0d0b9` in `.env` so `bun start` refuses to launch if the wrong key is ever loaded.
+2. **REQUIRED**: set `EXPECTED_AGENT_ADDRESS=0xf3f8feeba6b94376511dfc38d51ea3f5d2f3d1b70725fa0f50e5253a66d0d0b9` in `.env`. This is enforced at `loadConfig()` — missing or malformed value aborts startup with a single error listing every gap.
 3. Run `bun run scripts/verify-agent-address.ts` — must print ✅ match.
 4. `bun start` — the runtime derives the keypair from `AGENT_MNEMONICS`/`MNEMONICS` at the default path `m/44'/784'/1'/0'/0'` (override via `AGENT_DERIVATION_PATH` if ever needed). No `sui keytool` export step required.
 5. Whitelist this address as an agent on any `PositionManager` you want managed.

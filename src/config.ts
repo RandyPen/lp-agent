@@ -91,6 +91,38 @@ function optional(name: string, fallback: string): string {
   return v && v.trim() !== "" ? v : fallback;
 }
 
+/** Sui addresses are 0x-prefixed 32-byte hex (64 hex chars). */
+const SUI_ADDR_RE = /^0x[0-9a-fA-F]{64}$/;
+function isValidSuiAddress(s: string): boolean {
+  return SUI_ADDR_RE.test(s);
+}
+
+/**
+ * Accumulator that lets us scan every required .env field, collect ALL
+ * missing/invalid ones, and surface them in a single error message.
+ *
+ * The point: an operator deploying for the first time should see every
+ * gap in one go, not have to launch-fail-fix-launch ten times.
+ */
+class ConfigErrorAggregator {
+  private readonly issues: string[] = [];
+
+  push(msg: string): void {
+    this.issues.push(msg);
+  }
+
+  hasIssues(): boolean {
+    return this.issues.length > 0;
+  }
+
+  toError(): ConfigError {
+    const numbered = this.issues.map((s, i) => `  ${i + 1}. ${s}`).join("\n");
+    return new ConfigError(
+      `配置缺失或无效(共 ${this.issues.length} 项),请补齐 .env(参见 .env.example):\n${numbered}`,
+    );
+  }
+}
+
 function parseNetwork(raw: string): Network {
   if (raw === "mainnet" || raw === "testnet" || raw === "devnet") return raw;
   throw new ConfigError(`SUI_NETWORK must be mainnet|testnet|devnet, got '${raw}'`);
@@ -121,15 +153,32 @@ let cached: AppConfig | null = null;
 export function loadConfig(): AppConfig {
   if (cached) return cached;
 
+  const errs = new ConfigErrorAggregator();
+
   const network = parseNetwork(optional("SUI_NETWORK", "mainnet"));
   const grpcUrl = optional("SUI_GRPC_URL", defaultGrpcUrl(network));
   const poolProfileName = optional("POOL_PROFILE", "sui-usdc");
-  const poolProfile = loadPoolProfile(poolProfileName);
 
-  if (poolProfile.network !== network) {
-    throw new ConfigError(
-      `pool profile '${poolProfile.name}' targets ${poolProfile.network} but SUI_NETWORK=${network}`,
-    );
+  // Pool profile loading throws on its own — collect into the aggregator
+  // so missing SUI_USDC_POOL_ID shows up alongside other gaps.
+  let poolProfile: PoolProfile | null = null;
+  try {
+    const candidate = loadPoolProfile(poolProfileName);
+    if (candidate.network !== network) {
+      errs.push(
+        `pool profile '${candidate.name}' targets ${candidate.network} but SUI_NETWORK=${network}`,
+      );
+    } else if (!candidate.poolId) {
+      // Profile loaded but pool id env was empty (e.g. SUI_USDC_POOL_ID).
+      errs.push(
+        `pool profile '${candidate.name}' requires its pool-id env (e.g. SUI_USDC_POOL_ID) — currently empty`,
+      );
+    } else {
+      poolProfile = candidate;
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    errs.push(`pool profile '${poolProfileName}' could not be loaded: ${msg}`);
   }
 
   const lending: LendingAppConfig = {
@@ -141,7 +190,7 @@ export function loadConfig(): AppConfig {
     },
   };
   if (!Number.isFinite(lending.apyCacheTtlMs) || lending.apyCacheTtlMs <= 0) {
-    throw new ConfigError(`LENDING_APY_CACHE_TTL_MS must be a positive number`);
+    errs.push(`LENDING_APY_CACHE_TTL_MS must be a positive number (got '${process.env.LENDING_APY_CACHE_TTL_MS ?? ""}')`);
   }
 
   // Agent role: AGENT_PRIVATE_KEY wins over the mnemonic; mnemonic name
@@ -150,11 +199,23 @@ export function loadConfig(): AppConfig {
   const agentMnemonicRaw =
     process.env.AGENT_MNEMONICS?.trim() ?? process.env.MNEMONICS?.trim() ?? "";
   if (!agentPrivateKeyRaw && !agentMnemonicRaw) {
-    throw new ConfigError(
+    errs.push(
       "agent key not configured: set AGENT_PRIVATE_KEY (suiprivkey1…) or AGENT_MNEMONICS / MNEMONICS in .env",
     );
   }
+
+  // EXPECTED_AGENT_ADDRESS is REQUIRED — fail-fast safety guard against
+  // accidentally swapping mnemonics or running the wrong derivation path.
   const expectedAgentAddrRaw = process.env.EXPECTED_AGENT_ADDRESS?.trim() ?? "";
+  if (!expectedAgentAddrRaw) {
+    errs.push(
+      "EXPECTED_AGENT_ADDRESS not set: required so 'bun start' aborts if the wrong agent key is loaded. Set it to the address you whitelisted on the PositionManager.",
+    );
+  } else if (!isValidSuiAddress(expectedAgentAddrRaw)) {
+    errs.push(
+      `EXPECTED_AGENT_ADDRESS malformed: '${expectedAgentAddrRaw}' — expected a 0x-prefixed 64-hex Sui address`,
+    );
+  }
 
   // Treasury role (optional — TREASURY_ENABLED=false disables the whole layer).
   const treasuryEnabled =
@@ -164,12 +225,17 @@ export function loadConfig(): AppConfig {
   let treasuryKey: KeyRoleEnvConfig | null = null;
   if (treasuryEnabled) {
     if (!treasuryPrivateKeyRaw && !treasuryMnemonicRaw) {
-      throw new ConfigError(
+      errs.push(
         "treasury enabled but key not configured: set TREASURY_PRIVATE_KEY or TREASURY_MNEMONICS in .env (or set TREASURY_ENABLED=false)",
       );
     }
     const expectedTreasuryAddrRaw =
       process.env.EXPECTED_TREASURY_MASTER_ADDRESS?.trim() ?? "";
+    if (expectedTreasuryAddrRaw && !isValidSuiAddress(expectedTreasuryAddrRaw)) {
+      errs.push(
+        `EXPECTED_TREASURY_MASTER_ADDRESS malformed: '${expectedTreasuryAddrRaw}' — expected a 0x-prefixed 64-hex Sui address`,
+      );
+    }
     treasuryKey = {
       role: "treasury",
       privateKey: treasuryPrivateKeyRaw === "" ? null : treasuryPrivateKeyRaw,
@@ -190,14 +256,40 @@ export function loadConfig(): AppConfig {
   };
   if (treasury.enabled) {
     if (!Number.isFinite(treasury.watcherIntervalMs) || treasury.watcherIntervalMs <= 0) {
-      throw new ConfigError("TREASURY_WATCHER_INTERVAL_MS must be a positive number");
+      errs.push("TREASURY_WATCHER_INTERVAL_MS must be a positive number");
     }
     if (!Number.isFinite(treasury.rebalanceBaseCost) || treasury.rebalanceBaseCost < 0) {
-      throw new ConfigError("TREASURY_REBALANCE_BASE_COST must be ≥ 0");
+      errs.push("TREASURY_REBALANCE_BASE_COST must be ≥ 0");
     }
     if (!Number.isFinite(treasury.rebalanceFeeRate) || treasury.rebalanceFeeRate < 0) {
-      throw new ConfigError("TREASURY_REBALANCE_FEE_RATE must be ≥ 0");
+      errs.push("TREASURY_REBALANCE_FEE_RATE must be ≥ 0");
     }
+  }
+
+  // Loop tunings (collected, not thrown one-by-one).
+  const eventPollIntervalMs = Number(optional("EVENT_POLL_INTERVAL_MS", "5000"));
+  const rebalanceIntervalMs = Number(optional("REBALANCE_INTERVAL_MS", "60000"));
+  const perPmCooldownMs = Number(optional("PER_PM_COOLDOWN_MS", "30000"));
+  for (const [name, value] of [
+    ["EVENT_POLL_INTERVAL_MS", eventPollIntervalMs],
+    ["REBALANCE_INTERVAL_MS", rebalanceIntervalMs],
+    ["PER_PM_COOLDOWN_MS", perPmCooldownMs],
+  ] as const) {
+    if (!Number.isFinite(value) || value <= 0) {
+      errs.push(`${name} must be a positive number, got ${process.env[name] ?? ""}`);
+    }
+  }
+
+  // Surface every gap in one shot.
+  if (errs.hasIssues()) throw errs.toError();
+
+  // Past the gate: all collected slots are valid.
+  // poolProfile cannot be null here since loadPoolProfile success path
+  // is gated by the absence of errors.
+  if (!poolProfile) {
+    throw new ConfigError(
+      "internal: poolProfile is null after validation passed (this is a bug, please report)",
+    );
   }
 
   const keys: KeyConfig = {
@@ -206,7 +298,7 @@ export function loadConfig(): AppConfig {
       privateKey: agentPrivateKeyRaw === "" ? null : agentPrivateKeyRaw,
       mnemonic: agentMnemonicRaw === "" ? null : agentMnemonicRaw,
       derivationPath: optional("AGENT_DERIVATION_PATH", "m/44'/784'/1'/0'/0'"),
-      expectedAddress: expectedAgentAddrRaw === "" ? null : expectedAgentAddrRaw,
+      expectedAddress: expectedAgentAddrRaw,
     },
     treasury: treasuryKey,
   };
@@ -217,9 +309,9 @@ export function loadConfig(): AppConfig {
     poolProfile,
     keys,
     dbFile: optional("DB_FILE", "./data/app.db"),
-    eventPollIntervalMs: Number(optional("EVENT_POLL_INTERVAL_MS", "5000")),
-    rebalanceIntervalMs: Number(optional("REBALANCE_INTERVAL_MS", "60000")),
-    perPmCooldownMs: Number(optional("PER_PM_COOLDOWN_MS", "30000")),
+    eventPollIntervalMs,
+    rebalanceIntervalMs,
+    perPmCooldownMs,
     priceFeed: parsePriceFeed(optional("PRICE_FEED", "onchain")),
     strategy: parseStrategy(optional("STRATEGY", "singleBin")),
     unifiedTx: optional("UNIFIED_TX", "false").toLowerCase() === "true",
@@ -227,11 +319,6 @@ export function loadConfig(): AppConfig {
     treasury,
   };
 
-  for (const k of ["eventPollIntervalMs", "rebalanceIntervalMs", "perPmCooldownMs"] as const) {
-    if (!Number.isFinite(cached[k]) || cached[k] <= 0) {
-      throw new ConfigError(`${k} must be a positive number, got ${cached[k]}`);
-    }
-  }
   return cached;
 }
 
