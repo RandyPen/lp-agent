@@ -21,7 +21,7 @@ import type { PriceFeed } from "../priceFeed.ts";
 import type { PoolProfile } from "../../pools/types.ts";
 import type { PriceObservation } from "../../domain/types.ts";
 import type { OhlcvBar } from "../../forecast/types.ts";
-import { bucketToOhlcv } from "../../forecast/garch.ts";
+import { bucketToOhlcv } from "../../forecast/volatility.ts";
 import { priceFromBinId } from "../../domain/binMath.ts";
 import { getSuiClient } from "../../sui/client.ts";
 import { getDb } from "../../db/client.ts";

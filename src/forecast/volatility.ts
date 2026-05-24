@@ -1,14 +1,18 @@
 /**
- * Volatility estimators for the v0 forecaster.
+ * Volatility estimators (closed-form, no learning).
  *
- * Tier-0 (per `docs/forecasting-approach.md`):
- *   - EWMA on close-to-close log returns (RiskMetrics λ = 0.94 default).
- *   - Parkinson / Garman-Klass on OHLC bars when available (more efficient).
+ * Three families ship in the template, all O(n) single-pass:
+ *   - `ewmaSigma`         RiskMetrics EWMA on close-to-close log returns (λ=0.94)
+ *   - `parkinsonSigma`    high/low range, ~5× more efficient than C2C
+ *   - `garmanKlassSigma`  OHLC, ~7× more efficient than C2C
  *
- * We deliberately don't fit GARCH(1,1) parameters via MLE in v0 — the EWMA
- * baseline captures volatility clustering well enough and ships in a day. v1
- * upgrades to LightGBM quantile regression via the offline Rust trainer
- * described in `docs/implementation-roadmap.md` Phase 2.
+ * These are *estimators*, not models — no parameters are learned, no training
+ * data is needed, no checkpoints exist. The constants λ=0.94, 1/(4 ln 2),
+ * (2 ln 2 − 1) come from RiskMetrics / Brownian-motion math, not from fitting.
+ *
+ * For a learned σ (GARCH(1,1) MLE, LightGBM quantile, LSTM, …) see
+ * `docs/forecasting-approach.md` §"Upgrading to a learned model" — drop a new
+ * file `src/forecast/ml.ts` and have your Strategy call it instead.
  *
  * All inputs are plain JS numbers (decimal-adjusted prices, oldest-first).
  * Outputs are σ values in log-return units, per *one bar period*. Callers

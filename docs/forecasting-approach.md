@@ -147,3 +147,93 @@ DLMM LP 不需要"下一时刻价格"，需要的是**未来 Δt 内价格的概
 - **先用 GARCH 把 80% 价值拿到手**，工程精力花在**回测框架 + bin 映射 + CDPM 约束对接**上。
 - 神经网络要上就上**概率输出**模型（DeepAR / MDN / PatchTST + quantile head），配合 conformal 校准与严格 walk‑forward 回测。
 - LLM 退到 **meta 控制 / 特征生成 / 用户解释** 三个位置，发挥它真正强的地方。
+
+---
+
+## 模板当前实现状态
+
+| 文件 | 实现 | 是否有学习 |
+|---|---|---|
+| `src/forecast/volatility.ts` | EWMA(λ=0.94) / Parkinson / Garman-Klass | ❌ 闭式公式，O(n) 单次扫描 |
+| `src/forecast/binWeights.ts` | log-normal CDF 数值积分到 bin | ❌ 闭式 |
+| `src/strategies/multiBinSpot.ts` | 用 volatility.ts 估 σ → log-normal → 权重 | ❌ |
+| `src/strategies/emaTrend.ts` | 双 EMA 趋势分类 → 偏侧布仓 | ❌ EMA 衰减率由 period 决定 |
+| `src/data/feeds/onchain.ts` | Cetus SwapEvent → price_observations 表 | ❌ |
+| `src/data/feeds/binance.ts` | Binance REST → klines / ticker | ❌ |
+
+**所有路径都没有 training step。** 这是有意的:模板不带 alpha,只带骨架。
+
+---
+
+## 升级到机器学习算法（Upgrading to a learned model）
+
+如果你 fork 这个模板,想把 σ 估计或方向预测换成 ML(LightGBM quantile / GARCH MLE / LSTM / Transformer),按以下结构走 — **不需要改框架,走 Strategy 扩展点**。
+
+### 1. 数据流(已经够用)
+
+- 价格历史已经在 `price_observations` 表(由 `onchain.ts` / `binance.ts` 持续写入)
+- 用 `SELECT pool_id, source, price, observed_ms FROM price_observations WHERE pool_id = ? AND observed_ms >= ?` 导出训练集
+- 1 分钟 bar → `bucketToOhlcv()`(from `src/forecast/volatility.ts`)→ 特征工程
+
+### 2. 离线训练(放 fork 里,不并回模板)
+
+```
+src/ml/
+├── features.ts       # 从 SQLite 拉数据 + 滚窗特征(log returns、RSI、Parkinson σ、...)
+├── train.ts          # CLI: bun run src/ml/train.ts --out=./models/sigma.bin
+├── inference.ts      # 加载模型 + predict(features) → σ
+└── types.ts          # FeatureVector / Prediction 接口
+```
+
+- 模型物件存 `./models/<name>.bin`,加到 `.gitignore`(运营本地维护,不入仓)
+- 训练在你的开发机本地跑(LightGBM 几分钟,深度模型 GPU)
+- 验收:walk-forward backtest 跑 `src/backtest/cli.ts`(模板已有),对比 ML σ vs EWMA σ 的 `fee − IL − cost`
+
+### 3. 在线推断(运行时调用)
+
+新策略 `src/strategies/mlBinSpot.ts` 实现 `Strategy` 接口:
+
+```ts
+import { loadSigmaModel } from "../ml/inference.ts";
+import { computeBinWeights, pickBinRange } from "../forecast/binWeights.ts";
+
+export function createMlBinSpotStrategy(): Strategy {
+  const model = loadSigmaModel(process.env.SIGMA_MODEL_PATH || "./models/sigma.bin");
+  return {
+    name: "mlBinSpot",
+    plan(input) {
+      const features = buildFeatures(input.history, input.spot);
+      const sigma = model.predict(features);   // ← ML 在这里替换 ewmaSigma
+      // ...同 multiBinSpot.ts 的后续:log-normal → computeBinWeights → splitProportional
+    }
+  };
+}
+```
+
+### 4. 注册 + 切换
+
+```ts
+// src/strategies/registry.ts
+import { createMlBinSpotStrategy } from "./mlBinSpot.ts";
+export type StrategyName = "singleBin" | "multiBinSpot" | "emaTrend" | "mlBinSpot";
+const BUILDERS = { ..., mlBinSpot: () => createMlBinSpotStrategy() };
+```
+
+```bash
+STRATEGY=mlBinSpot bun start
+```
+
+### 5. 必须做对的几件事
+
+| 项 | 说明 |
+|---|---|
+| **冷启动兜底** | 模型加载失败 / 特征不足 → 回退 `ewmaSigma`,不要 throw |
+| **推断耗时预算** | 每 tick < 100ms。LightGBM 单棵树 < 1ms,深度模型必须 batched / pre-warmed |
+| **特征漂移监控** | 训练集 vs 在线 feature 分布偏移 → 定期重训。可写 `scripts/feature-drift.ts` |
+| **conformal 校准** | 直接吐 σ 容易出现 mis-calibration。包一层 conformal interval 在 walk-forward 上验证覆盖率 |
+| **回测 vs 实盘 gap** | 链上 fee/slippage、PTB 失败、subscription 中断会让实盘比回测差。先用小额 PM 跑 1 周再放量 |
+| **多源 feed 时校正 CEX-DEX 偏差** | Binance 价 ≠ Cetus 池价(几 bp 持续 gap + 短期套利漂移)。混合时先 detrend |
+
+### 6. 与 EMA 策略并存
+
+EMA 策略和 ML 策略**不冲突**,可以分别按 PM 启用(目前 `STRATEGY` env 是全局的,但 strategy 是 per-PM 调度的,改 rebalancer 让它根据 `subscriptions.strategy_pref` 列选 — 这是 v2 扩展点)。

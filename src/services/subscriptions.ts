@@ -1,3 +1,21 @@
+/**
+ * PM subscription auto-discovery.
+ *
+ * Every poll cycle we tail three CDPM event streams from the last saved
+ * cursor (cursor=null on first run = scan from genesis, so PMs authorised
+ * before the agent ever started running get picked up too):
+ *
+ *   - `AgentAdded`           → INSERT subscription as 'active'
+ *   - `AgentRemoved`         → DELETE subscription (stop monitoring)
+ *   - `PositionManagerClosed`→ DELETE subscription (PM is gone on-chain)
+ *
+ * All three are filtered to events where `agent == getAgentAddress()`
+ * (derived once from the operator's mnemonic via the keypair module).
+ *
+ * Lending events (Scallop/Kai supplied/redeemed) are tailed in the same
+ * pass to keep `lending_positions` in sync.
+ */
+
 import { getDb } from "../db/client.ts";
 import { getAgentAddress } from "../sui/keypair.ts";
 import { getPositionManager } from "../sui/cdpm/read.ts";
@@ -257,16 +275,15 @@ export function createSubscriptionsService(): SubscriptionsService {
           if (agent !== agentAddress) continue;
 
           db.transaction(() => {
-            db.prepare(
-              `UPDATE subscriptions SET status = 'revoked', removed_at_ms = ?
-               WHERE pm_id = ?`,
-            ).run(ev.timestampMs || Date.now(), pmId);
-
+            // Hard-delete: user revoked our agency, stop monitoring this PM
+            // entirely. Audit trail lives on-chain (AgentRemoved event) and in
+            // `rebalances` / `lending_actions` (keyed by pm_id, not FK'd).
+            db.prepare(`DELETE FROM subscriptions WHERE pm_id = ?`).run(pmId);
             saveCursor(stream, { txDigest: ev.txDigest, eventSeq: ev.eventSeq }, Date.now());
           })();
 
           removed++;
-          log.info("subscriptions: agent removed", { pmId, agent });
+          log.info("subscriptions: agent removed, dropped from monitor", { pmId, agent });
         }
 
         if (nextCursor) {
@@ -285,16 +302,13 @@ export function createSubscriptionsService(): SubscriptionsService {
           const { pmId } = ev.payload.data;
 
           db.transaction(() => {
-            db.prepare(
-              `UPDATE subscriptions SET status = 'closed', removed_at_ms = ?
-               WHERE pm_id = ?`,
-            ).run(ev.timestampMs || Date.now(), pmId);
-
+            // PM is gone on-chain — drop from monitor.
+            db.prepare(`DELETE FROM subscriptions WHERE pm_id = ?`).run(pmId);
             saveCursor(stream, { txDigest: ev.txDigest, eventSeq: ev.eventSeq }, Date.now());
           })();
 
           closed++;
-          log.info("subscriptions: PM closed", { pmId });
+          log.info("subscriptions: PM closed, dropped from monitor", { pmId });
         }
 
         if (nextCursor) {

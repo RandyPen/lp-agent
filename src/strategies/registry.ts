@@ -8,14 +8,17 @@
 import type { Strategy } from "./types.ts";
 import { createSingleBinStrategy } from "./singleBin.ts";
 import { createMultiBinSpotStrategy } from "./multiBinSpot.ts";
+import { createEmaTrendStrategy } from "./emaTrend.ts";
 
 export type StrategyName =
   | "singleBin"
-  | "multiBinSpot";
+  | "multiBinSpot"
+  | "emaTrend";
 
 const BUILDERS: Record<StrategyName, () => Strategy> = {
   singleBin: () => createSingleBinStrategy(),
   multiBinSpot: () => createMultiBinSpotStrategy(),
+  emaTrend: () => createEmaTrendStrategy(),
 };
 
 /** Build a strategy by name. Throws when the name is unknown. */

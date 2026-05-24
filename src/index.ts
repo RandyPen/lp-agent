@@ -2,6 +2,8 @@ import { loadConfig } from "./config.ts";
 import { openDb } from "./db/client.ts";
 import { getAgentAddress } from "./sui/keypair.ts";
 import { createOnchainPriceFeed } from "./data/feeds/onchain.ts";
+import { createBinancePriceFeed } from "./data/feeds/binance.ts";
+import type { PriceFeed } from "./data/priceFeed.ts";
 import { createSubscriptionsService } from "./services/subscriptions.ts";
 import { createExecutorService } from "./services/executor.ts";
 import { createRebalancerService } from "./services/rebalancer.ts";
@@ -34,12 +36,21 @@ async function main(): Promise<void> {
     priceFeed: cfg.priceFeed,
   });
 
-  // 4. Create the price feed. Only "onchain" is implemented in P0.
-  if (cfg.priceFeed !== "onchain") {
-    log.error("price feed not yet implemented", { priceFeed: cfg.priceFeed });
-    process.exit(1);
+  // 4. Create the price feed. Currently `onchain` (Cetus SwapEvent) and
+  // `binance` (public Binance REST) are implemented; `pyth` is a stub for
+  // downstream forks.
+  let priceFeed: PriceFeed;
+  switch (cfg.priceFeed) {
+    case "onchain":
+      priceFeed = createOnchainPriceFeed(cfg.poolProfile);
+      break;
+    case "binance":
+      priceFeed = createBinancePriceFeed(cfg.poolProfile);
+      break;
+    case "pyth":
+      log.error("price feed not yet implemented", { priceFeed: cfg.priceFeed });
+      process.exit(1);
   }
-  const priceFeed = createOnchainPriceFeed(cfg.poolProfile);
 
   // 5. Create and initially poll subscriptions so we backfill on first start.
   const subscriptionsService = createSubscriptionsService();

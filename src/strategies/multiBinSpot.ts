@@ -29,7 +29,7 @@ import {
   ewmaSigma,
   parkinsonSigma,
   scaleSigmaToHorizon,
-} from "../forecast/garch.ts";
+} from "../forecast/volatility.ts";
 import type { OhlcvBar, PriceDistribution } from "../forecast/types.ts";
 import { priceFromBinId } from "../domain/binMath.ts";
 import { log } from "../lib/logger.ts";

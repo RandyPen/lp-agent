@@ -6,8 +6,10 @@
 
 ## 它能做什么
 
-- **算法调节仓位** — 多 bin 概率分布 (GARCH + log-normal),触发条件可配置 (out-of-range / drift / fees-only),原子单 PTB 提交
+- **算法调节仓位** — 三种内置策略(`singleBin` / `multiBinSpot` / `emaTrend`),概率分布 + 趋势偏侧两种范式,原子单 PTB 提交
 - **闲置资产借贷** — Scallop + Kai SAV 集成,APY-aware router (Scallop tie-break 25 bps),per-coin dust 阈值
+- **多源价格 feed** — 链上 Cetus SwapEvent 与 Binance REST 两路实现,统一 `PriceFeed` 接口 + 共享 `price_observations` 历史表
+- **PM 自动发现** — 用 `MNEMONICS` 派生 agent 地址 → 监听链上 `AgentAdded` → 自动加入监控库;`AgentRemoved` / `PositionManagerClosed` → 自动从监控库删除
 - **用户充值记录** — Per-user 派生地址,SQLite credit ledger,周期 watcher 入账,APY-aware 兑换率
 - **CDPM 权限边界** — 通过 LeafSheep `PositionManager` 操作,用户资金不离开自己的 vault
 
@@ -107,7 +109,7 @@ src/
 │   ├── cdpm/                 # CDPM PTB 构造器(unified + legacy)
 │   └── lending/              # 借贷整合(Scallop + Kai + router + math + config)
 ├── data/                     # 价格 feed
-├── forecast/                 # σ 估计 (garch) + bin 权重映射
+├── forecast/                 # σ 估计 (volatility.ts: EWMA/Parkinson/GK) + bin 权重映射
 ├── strategies/               # 策略实现 + registry
 ├── treasury/                 # 用户充值 + credit ledger + watcher + charges
 ├── services/                 # 编排层(rebalancer / executor / subscriptions / treasuryService)
