@@ -13,6 +13,10 @@ import type {
   AgentLiquidityRemovedPayload,
   AgentFeeCollectedPayload,
   AgentRewardCollectedPayload,
+  ScallopSuppliedPayload,
+  ScallopRedeemedPayload,
+  KaiSuppliedPayload,
+  KaiRedeemedPayload,
 } from "./types.ts";
 
 export interface PollResult {
@@ -158,6 +162,58 @@ export function decodeEvent(raw: unknown): DecodedCdpmEvent | null {
         by: String(p["by"] ?? ""),
       };
       payload = { name: "AgentRewardCollected", data };
+      break;
+    }
+
+    case EVENT_TYPES.ScallopSupplied: {
+      const data: ScallopSuppliedPayload = {
+        pmId: String(p["pm_id"] ?? ""),
+        coinType: String(p["coin_type"] ?? ""),
+        depositAmount: toBigInt(p["deposit_amount"] ?? 0),
+        marketCoinMinted: toBigInt(p["market_coin_minted"] ?? 0),
+      };
+      payload = { name: "ScallopSupplied", data };
+      break;
+    }
+
+    case EVENT_TYPES.ScallopRedeemed: {
+      const data: ScallopRedeemedPayload = {
+        pmId: String(p["pm_id"] ?? ""),
+        coinType: String(p["coin_type"] ?? ""),
+        marketCoinRedeemed: toBigInt(p["market_coin_redeemed"] ?? 0),
+        redeemedAmount: toBigInt(p["redeemed_amount"] ?? 0),
+        principalPortion: toBigInt(p["principal_portion"] ?? 0),
+        interest: toBigInt(p["interest"] ?? 0),
+        feeAmount: toBigInt(p["fee_amount"] ?? 0),
+      };
+      payload = { name: "ScallopRedeemed", data };
+      break;
+    }
+
+    case EVENT_TYPES.KaiSupplied: {
+      const data: KaiSuppliedPayload = {
+        pmId: String(p["pm_id"] ?? ""),
+        coinType: String(p["coin_type"] ?? ""),
+        ytType: String(p["yt_type"] ?? ""),
+        depositAmount: toBigInt(p["deposit_amount"] ?? 0),
+        ytMinted: toBigInt(p["yt_minted"] ?? 0),
+      };
+      payload = { name: "KaiSupplied", data };
+      break;
+    }
+
+    case EVENT_TYPES.KaiRedeemed: {
+      const data: KaiRedeemedPayload = {
+        pmId: String(p["pm_id"] ?? ""),
+        coinType: String(p["coin_type"] ?? ""),
+        ytType: String(p["yt_type"] ?? ""),
+        ytBurned: toBigInt(p["yt_burned"] ?? 0),
+        redeemedAmount: toBigInt(p["redeemed_amount"] ?? 0),
+        principalPortion: toBigInt(p["principal_portion"] ?? 0),
+        interest: toBigInt(p["interest"] ?? 0),
+        feeAmount: toBigInt(p["fee_amount"] ?? 0),
+      };
+      payload = { name: "KaiRedeemed", data };
       break;
     }
 

@@ -1,0 +1,16 @@
+PLACEHOLDER LICENSE
+===================
+
+This file is a placeholder. The project author has NOT yet chosen a license.
+
+Before forking, publishing, or distributing this code, you MUST:
+
+1. Choose an OSI-approved license appropriate for your goals:
+   - MIT or BSD-3-Clause for permissive
+   - Apache-2.0 if you want explicit patent grant
+   - AGPL-3.0 for strong copyleft
+2. Replace the entire contents of this file with the license text.
+3. Add a SPDX-License-Identifier comment to source files if desired.
+
+Until a real license is chosen and committed, this code is implicitly
+ALL RIGHTS RESERVED — copying / forking / modifying is not granted.

@@ -2,6 +2,8 @@ import { getSuiClient } from "../client.ts";
 import { OnchainFailureError, NoPositionError } from "../../lib/errors.ts";
 import { log } from "../../lib/logger.ts";
 import type { PMState, PositionBin } from "../../domain/types.ts";
+import { emptyLendingState, type LendingState, type LendingPosition } from "../lending/types.ts";
+import { getDb } from "../../db/client.ts";
 
 // ---- I32 helpers ----
 
@@ -192,6 +194,8 @@ export async function getPositionManager(pmId: string): Promise<PMState> {
     agents: agentContents.length,
   });
 
+  const lending = loadLendingState(pmId);
+
   return {
     pmId,
     owner,
@@ -201,7 +205,50 @@ export async function getPositionManager(pmId: string): Promise<PMState> {
     balance: { a: balA, b: balB },
     feeBag: { a: feeA, b: feeB },
     positionBins,
+    lending,
   };
+}
+
+interface LendingPosRow {
+  protocol: string;
+  coin_type: string;
+  yt_type: string;
+  underlying_principal: string;
+  market_coin_amount: string;
+}
+
+/**
+ * Reconstruct LendingState for a PM from the local DB. Events are the source of truth
+ * (kept up-to-date by subscriptions.ts); chain reads of the lending Bag would also work
+ * but are heavier and not needed every tick.
+ */
+export function loadLendingState(pmId: string): LendingState {
+  const state = emptyLendingState();
+  let db;
+  try {
+    db = getDb();
+  } catch {
+    // DB not initialised yet (e.g. in unit tests reading a PM before openDb).
+    return state;
+  }
+  const rows = db
+    .query<LendingPosRow, [string]>(
+      `SELECT protocol, coin_type, yt_type, underlying_principal, market_coin_amount
+       FROM lending_positions WHERE pm_id = ?`,
+    )
+    .all(pmId);
+  for (const row of rows) {
+    if (row.protocol !== "scallop" && row.protocol !== "kai") continue;
+    const pos: LendingPosition = {
+      protocol: row.protocol,
+      coinType: row.coin_type,
+      ytType: row.yt_type,
+      underlyingPrincipal: BigInt(row.underlying_principal),
+      marketCoinAmount: BigInt(row.market_coin_amount),
+    };
+    state[pos.protocol][pos.coinType] = pos;
+  }
+  return state;
 }
 
 /**

@@ -8,16 +8,23 @@
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "events:print": "bun run scripts/print-events.ts",
-    "key:bootstrap": "bun run scripts/bootstrap-agent-key.ts"
+    "key:bootstrap": "bun run scripts/bootstrap-agent-key.ts",
+    "lending:bootstrap": "bun run scripts/lending-bootstrap.ts",
+    "backtest": "bun run src/backtest/cli.ts"
   },
   "dependencies": {
+    "@cetusprotocol/dlmm-sdk": "latest",
+    "@kunalabs-io/kai": "^0.26.0",
     "@mysten/sui": "^2.16.0",
-    "@cetusprotocol/dlmm-sdk": "latest"
+    "@scallop-io/sui-scallop-sdk": "^3.0.2"
   },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
+  },
+  "overrides": {
+    "aftermath-ts-sdk": "^2.0.1"
   }
 }

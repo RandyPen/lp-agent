@@ -5,6 +5,8 @@
  * (object ids, type tags) are kept as strings.
  */
 
+import type { LendingState } from "../sui/lending/types.ts";
+
 /** Snapshot of one PositionManager + its current pool state, ready for strategies to consume. */
 export interface PMState {
   pmId: string;
@@ -18,6 +20,8 @@ export interface PMState {
   feeBag: { a: bigint; b: bigint };
   /** Current position bins; empty if no position is open yet. */
   positionBins: PositionBin[];
+  /** Current lending positions held by this PM (per protocol, per coin type). */
+  lending: LendingState;
 }
 
 export interface PositionBin {

@@ -79,6 +79,42 @@ export interface AgentRewardCollectedPayload {
   by: string;
 }
 
+export interface ScallopSuppliedPayload {
+  pmId: string;
+  coinType: string;
+  depositAmount: bigint;
+  marketCoinMinted: bigint;
+}
+
+export interface ScallopRedeemedPayload {
+  pmId: string;
+  coinType: string;
+  marketCoinRedeemed: bigint;
+  redeemedAmount: bigint;
+  principalPortion: bigint;
+  interest: bigint;
+  feeAmount: bigint;
+}
+
+export interface KaiSuppliedPayload {
+  pmId: string;
+  coinType: string;
+  ytType: string;
+  depositAmount: bigint;
+  ytMinted: bigint;
+}
+
+export interface KaiRedeemedPayload {
+  pmId: string;
+  coinType: string;
+  ytType: string;
+  ytBurned: bigint;
+  redeemedAmount: bigint;
+  principalPortion: bigint;
+  interest: bigint;
+  feeAmount: bigint;
+}
+
 export type CdpmEventName =
   | "PositionManagerCreated"
   | "AgentAdded"
@@ -87,7 +123,11 @@ export type CdpmEventName =
   | "AgentLiquidityAdded"
   | "AgentLiquidityRemoved"
   | "AgentFeeCollected"
-  | "AgentRewardCollected";
+  | "AgentRewardCollected"
+  | "ScallopSupplied"
+  | "ScallopRedeemed"
+  | "KaiSupplied"
+  | "KaiRedeemed";
 
 export type CdpmEventPayload =
   | { name: "PositionManagerCreated"; data: PositionManagerCreatedPayload }
@@ -97,7 +137,11 @@ export type CdpmEventPayload =
   | { name: "AgentLiquidityAdded"; data: AgentLiquidityAddedPayload }
   | { name: "AgentLiquidityRemoved"; data: AgentLiquidityRemovedPayload }
   | { name: "AgentFeeCollected"; data: AgentFeeCollectedPayload }
-  | { name: "AgentRewardCollected"; data: AgentRewardCollectedPayload };
+  | { name: "AgentRewardCollected"; data: AgentRewardCollectedPayload }
+  | { name: "ScallopSupplied"; data: ScallopSuppliedPayload }
+  | { name: "ScallopRedeemed"; data: ScallopRedeemedPayload }
+  | { name: "KaiSupplied"; data: KaiSuppliedPayload }
+  | { name: "KaiRedeemed"; data: KaiRedeemedPayload };
 
 export type DecodedCdpmEvent = DecodedEventEnvelope<CdpmEventPayload>;
 

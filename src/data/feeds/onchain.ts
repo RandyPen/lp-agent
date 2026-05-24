@@ -20,8 +20,11 @@ import type { SuiEvent } from "@mysten/sui/jsonRpc";
 import type { PriceFeed } from "../priceFeed.ts";
 import type { PoolProfile } from "../../pools/types.ts";
 import type { PriceObservation } from "../../domain/types.ts";
+import type { OhlcvBar } from "../../forecast/types.ts";
+import { bucketToOhlcv } from "../../forecast/garch.ts";
 import { priceFromBinId } from "../../domain/binMath.ts";
 import { getSuiClient } from "../../sui/client.ts";
+import { getDb } from "../../db/client.ts";
 import { PriceFeedError } from "../../lib/errors.ts";
 import { log } from "../../lib/logger.ts";
 
@@ -34,6 +37,12 @@ const SPOT_CACHE_TTL_MS = 1_500;
 
 // How many events to fetch per page when building history.
 const PAGE_LIMIT = 50;
+
+// Hard cap on history pagination — prevents a runaway crawl on heavy pools
+// from consuming arbitrary RPC quota. At 50 events per page × 50 pages this
+// is up to 2,500 swap events per `getHistory()` call, which covers ~hours of
+// activity on the busiest mainnet pools.
+const HISTORY_MAX_PAGES = 50;
 
 // ---- internal types --------------------------------------------------------
 
@@ -113,6 +122,54 @@ function observationFromSwapEvent(
 
 // ---- factory ----------------------------------------------------------------
 
+function persistObservation(profile: PoolProfile, obs: PriceObservation): void {
+  let db;
+  try {
+    db = getDb();
+  } catch {
+    // DB not initialised yet (e.g. in unit tests). Skip silently.
+    return;
+  }
+  try {
+    db.prepare(
+      `INSERT INTO price_observations (pool_id, source, price, observed_ms) VALUES (?, ?, ?, ?)`,
+    ).run(profile.poolId, obs.source, obs.price, obs.timestampMs);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn("onchain-feed: failed to persist observation", { error: msg });
+  }
+}
+
+interface OhlcvRow {
+  price: string;
+  observed_ms: number;
+}
+
+function readOhlcvFromDb(
+  profile: PoolProfile,
+  bucketMs: number,
+  windowMs: number,
+): OhlcvBar[] {
+  let db;
+  try {
+    db = getDb();
+  } catch {
+    return [];
+  }
+  const cutoff = Date.now() - windowMs;
+  const rows = db
+    .query<OhlcvRow, [string, number]>(
+      `SELECT price, observed_ms FROM price_observations
+       WHERE pool_id = ? AND observed_ms >= ?
+       ORDER BY observed_ms ASC`,
+    )
+    .all(profile.poolId, cutoff);
+  return bucketToOhlcv(
+    rows.map((r) => ({ timestampMs: r.observed_ms, price: Number(r.price) })),
+    bucketMs,
+  );
+}
+
 export function createOnchainPriceFeed(profile: PoolProfile): PriceFeed {
   const source = `onchain:${profile.poolId}`;
 
@@ -148,6 +205,63 @@ export function createOnchainPriceFeed(profile: PoolProfile): PriceFeed {
     );
   }
 
+  async function getHistory(windowMs: number): Promise<PriceObservation[]> {
+    const client = getSuiClient();
+    const cutoff = Date.now() - windowMs;
+    const results: PriceObservation[] = [];
+
+    let cursor: { txDigest: string; eventSeq: string } | null | undefined = null;
+    let exhausted = false;
+    let pages = 0;
+
+    while (!exhausted) {
+      if (pages >= HISTORY_MAX_PAGES) {
+        log.warn(`${source}: getHistory hit pagination cap`, { pages, windowMs });
+        break;
+      }
+      pages += 1;
+      let page;
+      try {
+        page = await client.queryEvents({
+          query: { MoveEventType: `${DLMM_PACKAGE_MAINNET}::pool::SwapEvent` },
+          cursor,
+          limit: PAGE_LIMIT,
+          order: "descending",
+        });
+      } catch (err) {
+        throw new PriceFeedError(`${source}: queryEvents failed during history fetch`, err);
+      }
+
+      for (const event of page.data) {
+        // timestampMs may be null on some RPC nodes; fall back gracefully.
+        const tsRaw = event.timestampMs;
+        if (tsRaw == null) {
+          log.warn(`${source}: event missing timestampMs, skipping history entry`);
+          continue;
+        }
+        const ts = Number(tsRaw);
+        if (ts < cutoff) {
+          exhausted = true;
+          break;
+        }
+
+        const obs = observationFromSwapEvent(event, profile);
+        if (obs !== null) results.push(obs);
+      }
+
+      if (!page.hasNextPage || page.nextCursor == null) exhausted = true;
+      else cursor = page.nextCursor;
+    }
+
+    // Events were fetched descending; reverse so callers get oldest-first.
+    results.reverse();
+
+    // Best-effort persistence so future getOhlcv() calls have history to bucket.
+    for (const obs of results) persistObservation(profile, obs);
+
+    return results;
+  }
+
   return {
     source,
 
@@ -158,54 +272,22 @@ export function createOnchainPriceFeed(profile: PoolProfile): PriceFeed {
       const obs = await fetchLatestObservation();
       cachedSpot = obs;
       cacheExpiresAt = now + SPOT_CACHE_TTL_MS;
+      persistObservation(profile, obs);
       return obs;
     },
 
-    async getHistory(windowMs: number): Promise<PriceObservation[]> {
-      const client = getSuiClient();
-      const cutoff = Date.now() - windowMs;
-      const results: PriceObservation[] = [];
+    getHistory,
 
-      let cursor: { txDigest: string; eventSeq: string } | null | undefined = null;
-      let exhausted = false;
-
-      while (!exhausted) {
-        let page;
-        try {
-          page = await client.queryEvents({
-            query: { MoveEventType: `${DLMM_PACKAGE_MAINNET}::pool::SwapEvent` },
-            cursor,
-            limit: PAGE_LIMIT,
-            order: "descending",
-          });
-        } catch (err) {
-          throw new PriceFeedError(`${source}: queryEvents failed during history fetch`, err);
-        }
-
-        for (const event of page.data) {
-          // timestampMs may be null on some RPC nodes; fall back gracefully.
-          const tsRaw = event.timestampMs;
-          if (tsRaw == null) {
-            log.warn(`${source}: event missing timestampMs, skipping history entry`);
-            continue;
-          }
-          const ts = Number(tsRaw);
-          if (ts < cutoff) {
-            exhausted = true;
-            break;
-          }
-
-          const obs = observationFromSwapEvent(event, profile);
-          if (obs !== null) results.push(obs);
-        }
-
-        if (!page.hasNextPage || page.nextCursor == null) exhausted = true;
-        else cursor = page.nextCursor;
+    async getOhlcv(bucketMs: number, windowMs: number): Promise<OhlcvBar[]> {
+      // Lazy-fill: top up SQLite from chain so the first calls aren't empty.
+      // Tolerant of failures — returns whatever buckets are already available.
+      try {
+        await getHistory(windowMs);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.warn(`${source}: getHistory failed during getOhlcv top-up`, { error: msg });
       }
-
-      // Events were fetched descending; reverse so callers get oldest-first.
-      results.reverse();
-      return results;
+      return readOhlcvFromDb(profile, bucketMs, windowMs);
     },
   };
 }

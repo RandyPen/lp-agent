@@ -70,6 +70,115 @@ function saveCursor(stream: string, cursor: EventCursor, nowMs: number): void {
 // Track which non-matching pool PMs we've already warned about.
 const warnedPmIds = new Set<string>();
 
+interface LendingPosRow {
+  underlying_principal: string;
+  market_coin_amount: string;
+  yt_type: string;
+}
+
+function applyLendingSupply(
+  protocol: "scallop" | "kai",
+  pmId: string,
+  coinType: string,
+  ytType: string,
+  depositAmount: bigint,
+  marketCoinMinted: bigint,
+  txDigest: string,
+): void {
+  const db = getDb();
+  const existing = db
+    .query<LendingPosRow, [string, string, string]>(
+      `SELECT underlying_principal, market_coin_amount, yt_type FROM lending_positions
+       WHERE pm_id = ? AND protocol = ? AND coin_type = ?`,
+    )
+    .get(pmId, protocol, coinType);
+  const newPrincipal = (existing ? BigInt(existing.underlying_principal) : 0n) + depositAmount;
+  const newMarketCoin = (existing ? BigInt(existing.market_coin_amount) : 0n) + marketCoinMinted;
+  db.prepare(
+    `INSERT INTO lending_positions
+       (pm_id, protocol, coin_type, yt_type, underlying_principal, market_coin_amount, last_event_digest, updated_at_ms)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(pm_id, protocol, coin_type) DO UPDATE SET
+       yt_type              = excluded.yt_type,
+       underlying_principal = excluded.underlying_principal,
+       market_coin_amount   = excluded.market_coin_amount,
+       last_event_digest    = excluded.last_event_digest,
+       updated_at_ms        = excluded.updated_at_ms`,
+  ).run(pmId, protocol, coinType, ytType, newPrincipal.toString(), newMarketCoin.toString(), txDigest, Date.now());
+}
+
+function applyLendingRedeem(
+  protocol: "scallop" | "kai",
+  pmId: string,
+  coinType: string,
+  marketCoinBurned: bigint,
+  principalPortion: bigint,
+  txDigest: string,
+): void {
+  const db = getDb();
+  const existing = db
+    .query<LendingPosRow, [string, string, string]>(
+      `SELECT underlying_principal, market_coin_amount, yt_type FROM lending_positions
+       WHERE pm_id = ? AND protocol = ? AND coin_type = ?`,
+    )
+    .get(pmId, protocol, coinType);
+  if (!existing) {
+    // No row to update — log and continue; on-chain truth is authoritative.
+    log.warn("subscriptions: redeem event with no local lending_positions row", {
+      pmId, protocol, coinType,
+    });
+    return;
+  }
+  const remainPrincipal = clampNonNegative(BigInt(existing.underlying_principal) - principalPortion);
+  const remainMarketCoin = clampNonNegative(BigInt(existing.market_coin_amount) - marketCoinBurned);
+  if (remainMarketCoin === 0n && remainPrincipal === 0n) {
+    db.prepare(
+      `DELETE FROM lending_positions WHERE pm_id = ? AND protocol = ? AND coin_type = ?`,
+    ).run(pmId, protocol, coinType);
+    return;
+  }
+  db.prepare(
+    `UPDATE lending_positions
+     SET underlying_principal = ?, market_coin_amount = ?, last_event_digest = ?, updated_at_ms = ?
+     WHERE pm_id = ? AND protocol = ? AND coin_type = ?`,
+  ).run(remainPrincipal.toString(), remainMarketCoin.toString(), txDigest, Date.now(), pmId, protocol, coinType);
+}
+
+function clampNonNegative(v: bigint): bigint {
+  return v < 0n ? 0n : v;
+}
+
+async function pollLendingStream(stream: string): Promise<void> {
+  const db = getDb();
+  const cursor = loadCursor(stream);
+  const { events, nextCursor } = await pollEvents(stream, cursor);
+
+  for (const ev of events) {
+    const p = ev.payload;
+    switch (p.name) {
+      case "ScallopSupplied":
+        applyLendingSupply("scallop", p.data.pmId, p.data.coinType, "", p.data.depositAmount, p.data.marketCoinMinted, ev.txDigest);
+        break;
+      case "ScallopRedeemed":
+        applyLendingRedeem("scallop", p.data.pmId, p.data.coinType, p.data.marketCoinRedeemed, p.data.principalPortion, ev.txDigest);
+        break;
+      case "KaiSupplied":
+        applyLendingSupply("kai", p.data.pmId, p.data.coinType, p.data.ytType, p.data.depositAmount, p.data.ytMinted, ev.txDigest);
+        break;
+      case "KaiRedeemed":
+        applyLendingRedeem("kai", p.data.pmId, p.data.coinType, p.data.ytBurned, p.data.principalPortion, ev.txDigest);
+        break;
+      default:
+        continue;
+    }
+    saveCursor(stream, { txDigest: ev.txDigest, eventSeq: ev.eventSeq }, Date.now());
+  }
+
+  if (nextCursor) {
+    saveCursor(stream, nextCursor, Date.now());
+  }
+}
+
 export function createSubscriptionsService(): SubscriptionsService {
   return {
     async pollOnce(): Promise<{ added: number; removed: number; closed: number }> {
@@ -192,6 +301,12 @@ export function createSubscriptionsService(): SubscriptionsService {
           saveCursor(stream, nextCursor, Date.now());
         }
       }
+
+      // ---- Lending events: maintain lending_positions rows ----
+      await pollLendingStream(EVENT_TYPES.ScallopSupplied);
+      await pollLendingStream(EVENT_TYPES.ScallopRedeemed);
+      await pollLendingStream(EVENT_TYPES.KaiSupplied);
+      await pollLendingStream(EVENT_TYPES.KaiRedeemed);
 
       return { added, removed, closed };
     },

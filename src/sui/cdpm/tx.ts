@@ -56,6 +56,18 @@ function assertNonNegative(value: bigint, label: string): void {
   }
 }
 
+/**
+ * Bin IDs are signed I32 on the Move side, sent as their two's-complement u32
+ * bit pattern. JS `Number` clamping: `(n | 0) >>> 0` reinterprets a 32-bit
+ * signed int as u32.
+ */
+function binIdToU32Bits(binId: number): number {
+  if (!Number.isInteger(binId)) {
+    throw new OnchainFailureError(`bin id must be an integer, got ${binId}`);
+  }
+  return (binId | 0) >>> 0;
+}
+
 function assertParallelArrays(
   bins: number[],
   amountsA: bigint[],
@@ -104,7 +116,7 @@ export function buildAddLiquidityTx(
       tx.object(args.poolId),
       tx.pure.u64(args.amountA),
       tx.pure.u64(args.amountB),
-      tx.pure.vector("u32", args.bins),
+      tx.pure.vector("u32", args.bins.map(binIdToU32Bits)),
       tx.pure.vector("u64", args.amountsA),
       tx.pure.vector("u64", args.amountsB),
       tx.object(globalConfigId),
@@ -151,7 +163,7 @@ export function buildRemoveLiquidityTx(
     arguments: [
       tx.object(args.pmId),
       tx.object(args.poolId),
-      tx.pure.vector("u32", args.bins),
+      tx.pure.vector("u32", args.bins.map(binIdToU32Bits)),
       tx.pure.vector("u128", args.liquidityShares),
       tx.object(globalConfigId),
       tx.object(versionedId),

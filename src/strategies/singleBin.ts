@@ -1,5 +1,4 @@
-import type { Strategy, StrategyInput } from "./types.ts";
-import type { RebalancePlan } from "../domain/types.ts";
+import type { Strategy, StrategyInput, StrategyOutput } from "./types.ts";
 
 /**
  * P0 single-bin strategy: keep all liquidity in the pool's current active bin.
@@ -9,19 +8,22 @@ export function createSingleBinStrategy(): Strategy {
   return {
     name: "singleBin",
 
-    plan({ pm, pool }: StrategyInput): RebalancePlan | null {
-      // Nothing to do if no balance and no position.
-      if (
-        pm.balance.a === 0n &&
-        pm.balance.b === 0n &&
-        pm.positionBins.length === 0
-      ) {
-        return null;
+    plan({ pm, pool }: StrategyInput): StrategyOutput {
+      const hasBalance = pm.balance.a > 0n || pm.balance.b > 0n;
+      const hasPosition = pm.positionBins.length > 0;
+      const hasFees = pm.feeBag.a > 0n || pm.feeBag.b > 0n;
+
+      if (!hasBalance && !hasPosition && !hasFees) {
+        return { kind: "quiet", reason: "singleBin: no balance, no position, no fees" };
       }
 
-      // Still in range: any open bin covers the active bin.
+      // Still in range: any open bin covers the active bin. If fees are in
+      // the bag we let the reconciler step deploy them; otherwise nothing to do.
       if (pm.positionBins.some((bin) => bin.binId === pool.activeBinId)) {
-        return null;
+        if (hasFees) {
+          return { kind: "reconcile_only", reason: "singleBin: in range, fees-only sweep" };
+        }
+        return { kind: "quiet", reason: "singleBin: in range, no fees" };
       }
 
       // Out of range (or no position but has balance): drain everything and
@@ -33,19 +35,19 @@ export function createSingleBinStrategy(): Strategy {
         }
       }
 
-      // Collect fees before rebalancing if there is anything in the fee bag.
-      const collectFees = pm.feeBag.a > 0n || pm.feeBag.b > 0n;
-
       return {
-        pmId: pm.pmId,
-        removeShares,
-        addAmountA: pm.balance.a,
-        addAmountB: pm.balance.b,
-        addBins: [pool.activeBinId],
-        addAmountsA: [pm.balance.a],
-        addAmountsB: [pm.balance.b],
-        collectFees,
-        reason: `singleBin: drift, recenter at active bin ${pool.activeBinId}`,
+        kind: "plan_and_reconcile",
+        plan: {
+          pmId: pm.pmId,
+          removeShares,
+          addAmountA: pm.balance.a,
+          addAmountB: pm.balance.b,
+          addBins: [pool.activeBinId],
+          addAmountsA: [pm.balance.a],
+          addAmountsB: [pm.balance.b],
+          collectFees: hasFees,
+          reason: `singleBin: drift, recenter at active bin ${pool.activeBinId}`,
+        },
       };
     },
   };

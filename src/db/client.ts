@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 
 let cached: Database | null = null;
 
-const MIGRATIONS = ["0001_init.sql"];
+const SCHEMA_FILE = "schema.sql";
 
 export function openDb(path: string): Database {
   mkdirSync(dirname(resolve(path)), { recursive: true });
@@ -13,7 +13,7 @@ export function openDb(path: string): Database {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA synchronous = NORMAL");
-  runMigrations(db);
+  applySchema(db);
   cached = db;
   return db;
 }
@@ -28,23 +28,18 @@ export function resetDbCacheForTests(): void {
   cached = null;
 }
 
-function runMigrations(db: Database): void {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS schema_migrations (
-      filename TEXT PRIMARY KEY,
-      applied_ms INTEGER NOT NULL
-    );
-  `);
+/**
+ * Apply the canonical schema. The file is one big `CREATE TABLE IF NOT EXISTS`
+ * + `CREATE INDEX IF NOT EXISTS` block, so re-running on every startup is a
+ * cheap no-op once tables exist. No version tracking — adding a table is a
+ * one-line edit at the bottom of `schema.sql` and a restart.
+ *
+ * Non-goal: in-place ALTER for production data. Until the project ships, the
+ * DB is considered disposable; `rm ./data/app.db` is the recovery path for any
+ * incompatible schema change.
+ */
+function applySchema(db: Database): void {
   const here = dirname(fileURLToPath(import.meta.url));
-  const applied = new Set<string>(
-    db.query<{ filename: string }, []>("SELECT filename FROM schema_migrations").all().map((r) => r.filename),
-  );
-  for (const file of MIGRATIONS) {
-    if (applied.has(file)) continue;
-    const sql = readFileSync(resolve(here, "migrations", file), "utf8");
-    db.transaction(() => {
-      db.exec(sql);
-      db.prepare("INSERT INTO schema_migrations (filename, applied_ms) VALUES (?, ?)").run(file, Date.now());
-    })();
-  }
+  const sql = readFileSync(resolve(here, SCHEMA_FILE), "utf8");
+  db.exec(sql);
 }

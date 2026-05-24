@@ -6,14 +6,35 @@ import {
   buildRemoveLiquidityTx,
   buildAddLiquidityTx,
 } from "../sui/cdpm/tx.ts";
+import {
+  buildScallopSupplyTx,
+  buildScallopRedeemTx,
+  buildKaiSupplyTx,
+  buildKaiRedeemTx,
+} from "../sui/cdpm/tx_lending.ts";
+import {
+  buildUnifiedRebalanceTx,
+  type UnifiedRebalanceInput,
+} from "../sui/cdpm/txUnified.ts";
 import { decodeEvent } from "../sui/cdpm/events.ts";
 import { log } from "../lib/logger.ts";
 import type { PMState, RebalancePlan, ExecutionResult } from "../domain/types.ts";
+import type { LendingDecision } from "../sui/lending/types.ts";
+import type { Transaction } from "@mysten/sui/transactions";
 
 export interface ExecutorService {
   collectAndTransferFees(pmId: string, pm: PMState): Promise<ExecutionResult>;
   removeLiquidity(plan: RebalancePlan, pm: PMState): Promise<ExecutionResult>;
   addLiquidity(plan: RebalancePlan, pm: PMState): Promise<ExecutionResult>;
+  supplyToLending(decision: Extract<LendingDecision, { kind: "supply" }>): Promise<ExecutionResult>;
+  redeemFromLending(decision: Extract<LendingDecision, { kind: "redeem" }>): Promise<ExecutionResult>;
+  /**
+   * Submit a single PTB that bundles fee collection, remove, transfer,
+   * lending redeems, add, and lending supplies in the canonical order.
+   * Atomic on success; reverts everything on failure. Returns the digest and
+   * any decoded agent events.
+   */
+  submitUnifiedRebalance(input: UnifiedRebalanceInput): Promise<ExecutionResult>;
 }
 
 /** Extract the Move event types that were emitted by our agent address (or for this PM). */
@@ -50,6 +71,32 @@ function extractAgentEvents(
 export function createExecutorService(): ExecutorService {
   const client = getSuiClient();
   const agentAddress = getAgentAddress();
+
+  async function runLendingTx(
+    pmId: string,
+    op: "supply" | "redeem",
+    built: { tx: Transaction; description: string },
+  ): Promise<ExecutionResult> {
+    log.info(`executor: ${op}ToLending`, { pmId, description: built.description });
+    try {
+      const result = await client.signAndExecuteTransaction({
+        transaction: built.tx,
+        signer: getAgentKeypair(),
+        options: { showEvents: true },
+      });
+      log.info(`executor: ${op}ToLending executed`, { pmId, digest: result.digest });
+      return {
+        pmId,
+        digest: result.digest,
+        status: "succeeded",
+        emittedAgentEvents: extractAgentEvents(result, agentAddress, pmId),
+      };
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.error(`executor: ${op}ToLending failed`, { pmId, error: msg });
+      return { pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
+    }
+  }
 
   return {
     async collectAndTransferFees(pmId: string, pm: PMState): Promise<ExecutionResult> {
@@ -179,6 +226,100 @@ export function createExecutorService(): ExecutorService {
         const msg = err instanceof Error ? err.message : String(err);
         log.error("executor: removeLiquidity failed", { pmId: plan.pmId, error: msg });
         return { pmId: plan.pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
+      }
+    },
+
+    async supplyToLending(
+      decision: Extract<LendingDecision, { kind: "supply" }>,
+    ): Promise<ExecutionResult> {
+      try {
+        const built =
+          decision.protocol === "scallop"
+            ? await buildScallopSupplyTx({
+                pmId: decision.pmId,
+                coinType: decision.coinType,
+                amount: decision.amount,
+              })
+            : buildKaiSupplyTx({
+                pmId: decision.pmId,
+                coinType: decision.coinType,
+                ytType: decision.ytType,
+                amount: decision.amount,
+              });
+        return await runLendingTx(decision.pmId, "supply", built);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error("executor: supplyToLending failed (pre-flight)", { pmId: decision.pmId, error: msg });
+        return { pmId: decision.pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
+      }
+    },
+
+    async redeemFromLending(
+      decision: Extract<LendingDecision, { kind: "redeem" }>,
+    ): Promise<ExecutionResult> {
+      try {
+        const built =
+          decision.protocol === "scallop"
+            ? await buildScallopRedeemTx({
+                pmId: decision.pmId,
+                coinType: decision.coinType,
+                marketCoinAmount: decision.marketCoinAmount,
+              })
+            : buildKaiRedeemTx({
+                pmId: decision.pmId,
+                coinType: decision.coinType,
+                ytType: decision.ytType,
+                ytAmount: decision.marketCoinAmount,
+              });
+        return await runLendingTx(decision.pmId, "redeem", built);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error("executor: redeemFromLending failed (pre-flight)", { pmId: decision.pmId, error: msg });
+        return { pmId: decision.pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
+      }
+    },
+
+    async submitUnifiedRebalance(input: UnifiedRebalanceInput): Promise<ExecutionResult> {
+      const pmId = input.plan.pmId;
+      let built;
+      try {
+        built = await buildUnifiedRebalanceTx(input);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error("executor: submitUnifiedRebalance build failed", { pmId, error: msg });
+        return { pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
+      }
+      if (built.commandCount === 0) {
+        // No-op rebalance — strategy + lending decisions resolved to nothing.
+        return { pmId, digest: "", status: "succeeded", emittedAgentEvents: [] };
+      }
+
+      log.info("executor: submitUnifiedRebalance", {
+        pmId,
+        commandCount: built.commandCount,
+        description: built.description,
+      });
+
+      try {
+        const result = await client.signAndExecuteTransaction({
+          transaction: built.tx,
+          signer: getAgentKeypair(),
+          options: { showEvents: true },
+        });
+        log.info("executor: submitUnifiedRebalance executed", {
+          pmId,
+          digest: result.digest,
+        });
+        return {
+          pmId,
+          digest: result.digest,
+          status: "succeeded",
+          emittedAgentEvents: extractAgentEvents(result, agentAddress, pmId),
+        };
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        log.error("executor: submitUnifiedRebalance failed", { pmId, error: msg });
+        return { pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
       }
     },
 

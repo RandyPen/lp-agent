@@ -1,3 +1,5 @@
+import type { LendingCoinPolicy } from "../strategies/lendingPolicy.ts";
+
 /**
  * Pool-specific configuration. v0 ships only one of these (sui-usdc).
  * Forking to a new asset = add a new file in this directory and switch POOL_PROFILE.
@@ -24,6 +26,17 @@ export interface PoolProfile {
     /** Hint for fee modeling: typical pool fee in bps. Read from pool at runtime; this is a fallback. */
     expectedFeeBps: number;
   };
+  /**
+   * Per-coin lending policy keyed by coin type tag (tuning knobs:
+   * minIdleBuffer / supplyThreshold / redeemHeadroom / apySwitchDeltaBps).
+   *
+   * **Lendability** (whether a coin can be lent at all) is **NOT** owned by
+   * the pool profile any more — see `src/sui/lending/lendingConfig.ts`
+   * (`LENDING_OPPORTUNITIES` + `canLend(coinType)`). The pool profile only
+   * carries the per-coin tuning knobs for the coins it cares about.
+   * Entries here for coins NOT in `LENDING_OPPORTUNITIES` are simply unused.
+   */
+  lendingPolicy: Record<string, LendingCoinPolicy>;
   /** Network this profile targets. */
   network: "mainnet" | "testnet" | "devnet";
 }

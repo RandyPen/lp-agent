@@ -1,14 +1,24 @@
 /**
- * Thin wrappers over the Cetus DLMM SDK's BinUtils.
+ * Bin ↔ price math for Cetus DLMM, pure TypeScript implementation.
  *
- * All BinUtils methods that accept amounts expect strings; the SDK internally
- * uses arbitrary-precision arithmetic (BN.js). Methods that return a price or
- * Q64x64 value return strings from the SDK — we re-expose them as-is where the
- * contract type is string, and convert to bigint where the contract says bigint.
+ * Formula (matches the DLMM constant-sum pricing scheme):
+ *   rawPrice(binId) = (1 + binStep / BASIS_POINT_MAX)^binId
+ *   humanPrice(binId) = rawPrice × 10^(decimalsA - decimalsB)
  *
- * Import note: the SDK has a single package export, no "/utils" sub-path.
+ * The DLMM SDK (`@cetusprotocol/dlmm-sdk` v1.2.6) currently fails to load under
+ * Bun due to an upstream `@cetusprotocol/common-sdk` API drift — using pure JS
+ * here also removes a transitive runtime dependency from the read path. The
+ * functions that *do* need bigint precision (e.g. `getLiquidity`) only matter
+ * inside transaction-building paths, which already build raw move calls
+ * without going through the SDK.
+ *
+ * Precision: JS Number gives ~15 significant digits which is far more than
+ * the forecaster, strategy, or price-feed code paths require. For tx-building
+ * paths that need Q64x64 precision, build them on-chain via `BinUtils` in the
+ * Move runtime — never round-trip through JS Number.
  */
-import { BinUtils } from "@cetusprotocol/dlmm-sdk";
+
+const BASIS_POINT_MAX = 10_000;
 
 /**
  * CDPM agents are capped at 70 bins per position NFT (the Cetus protocol
@@ -16,17 +26,18 @@ import { BinUtils } from "@cetusprotocol/dlmm-sdk";
  */
 export const MAX_BINS_PER_POSITION = 70;
 
-/**
- * Human-readable decimal-adjusted price (coinB per coinA) for a given bin.
- * Delegates to BinUtils.getPriceFromBinId which returns a decimal string.
- */
+/** Human-readable decimal-adjusted price (coinB per coinA) for a given bin. */
 export function priceFromBinId(
   binId: number,
   binStep: number,
   decimalsA: number,
   decimalsB: number,
 ): string {
-  return BinUtils.getPriceFromBinId(binId, binStep, decimalsA, decimalsB);
+  const ratio = Math.pow(1 + binStep / BASIS_POINT_MAX, binId);
+  const decimalShift = Math.pow(10, decimalsA - decimalsB);
+  const human = ratio * decimalShift;
+  // Use enough digits to preserve precision for downstream string consumers.
+  return human.toPrecision(15).replace(/\.?0+$/, "");
 }
 
 /**
@@ -41,44 +52,19 @@ export function binIdFromPrice(
   decimalsA: number,
   decimalsB: number,
 ): number {
-  return BinUtils.getBinIdFromPrice(price, binStep, useFloor, decimalsA, decimalsB);
-}
-
-/**
- * Raw Q64x64 price for a bin, as a bigint.
- * BinUtils.getQPriceFromId returns a string; we normalise to bigint here so
- * callers never accidentally round-trip through Number.
- */
-export function qPriceFromBinId(binId: number, binStep: number): bigint {
-  const raw = BinUtils.getQPriceFromId(binId, binStep);
-  return BigInt(raw);
-}
-
-/**
- * Liquidity L under the constant-sum formula: L = price·amountA + amountB.
- * `qPrice` is Q64x64 (the output of `qPriceFromBinId`); amounts are raw lamports.
- *
- * The SDK's getLiquidity accepts strings, so we convert and convert back.
- */
-export function liquidityForAmounts(
-  amountA: bigint,
-  amountB: bigint,
-  qPrice: bigint,
-): bigint {
-  const raw = BinUtils.getLiquidity(
-    amountA.toString(),
-    amountB.toString(),
-    qPrice.toString(),
-  );
-  return BigInt(raw);
+  const p = Number(price);
+  if (!Number.isFinite(p) || p <= 0) {
+    throw new Error(`binIdFromPrice: invalid price '${price}'`);
+  }
+  const decimalShift = Math.pow(10, decimalsA - decimalsB);
+  const ratio = p / decimalShift;
+  const id = Math.log(ratio) / Math.log(1 + binStep / BASIS_POINT_MAX);
+  return useFloor ? Math.floor(id) : Math.ceil(id);
 }
 
 /**
  * How many CDPM position NFTs are required to cover [lowerBinId, upperBinId]
  * given the CDPM agent's 70-bin-per-position limit.
- *
- * Uses the SDK's getPositionCount which knows the same arithmetic, then clamps
- * to our MAX_BINS_PER_POSITION rather than the protocol max of 1000.
  */
 export function positionsRequired(lowerBinId: number, upperBinId: number): number {
   const totalBins = upperBinId - lowerBinId + 1;
