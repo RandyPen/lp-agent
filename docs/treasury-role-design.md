@@ -42,18 +42,18 @@
   # agent 角色(已落地)
   MNEMONICS=<agent phrase>           # 调仓 0xf3f8feeba6... 用
   AGENT_DERIVATION_PATH=m/44'/784'/1'/0'/0'
-  EXPECTED_AGENT_ADDRESS=0xf3f8feeba6...
-  
+  EXPECTED_AGENT_ADDRESS=0xf3f8feeba6...   # 必填,loadConfig 强制校验
+
   # treasury 角色(本设计新增)
   TREASURY_MNEMONICS=<完全不同的 phrase>
   TREASURY_MASTER_DERIVATION_PATH=m/44'/784'/0'/0'/0'   # 主地址(运营 sweep 用)
   TREASURY_USER_BASE_PATH=m/44'/784'/0'/0'             # 每用户 = TREASURY_USER_BASE_PATH/{index}'
-  EXPECTED_TREASURY_MASTER_ADDRESS=0x...               # 主地址守卫,强烈建议
+  EXPECTED_TREASURY_MASTER_ADDRESS=0x...               # 可选 — 设了就强制校验格式 + 派生匹配
 ```
 
 **关键不变量**:agent 模块不 import treasury 模块,treasury 模块不 import agent 模块。两个角色在 process 里共享 `loadConfig()`、共享 `getDb()`,但**密钥派生 / 缓存完全隔离**。每个角色读自己的 env,出错时错误消息明确包含 role 名(已实现的 `resolveKeypair` 已经这样做)。
 
-**与 rebalancer 的唯一耦合点**:rebalancer 在调度 PM 时调用 `treasury.consumeCreditsForRebalance(ownerAddress, planSize)`,余额不足则跳过这个 PM 这一 tick。鉴权由签名消息保护,但消息可由 agent 自己签 — 设计稍后展开。
+**与 rebalancer 的耦合点(已实现)**:rebalancer 在 `tickOne` 里直接 `import { attemptCharge, refundCharge } from "../treasury/charges.ts"`。PM owner 没注册 → 按 `TREASURY_REQUIRE_REGISTRATION` 决定跳过或免费;注册了 → 预扣 credits(nonce = `${tickId}:${pmId}`),PTB 失败时同 nonce 退款。v1 内部扣减无需 user 签名(PM 的 `AgentAdded` 链上事件就是默示授权)。
 
 ---
 
@@ -414,7 +414,8 @@ TREASURY_PRIVATE_KEY=suiprivkey1...      # master keypair 的显式覆盖
 # 可选(有默认值)
 TREASURY_MASTER_DERIVATION_PATH=m/44'/784'/0'/0'/0'
 TREASURY_USER_BASE_PATH=m/44'/784'/0'/0'   # per-user 地址在 BASE_PATH/{index}'
-EXPECTED_TREASURY_MASTER_ADDRESS=0x...     # master 地址守卫,生产强烈建议
+EXPECTED_TREASURY_MASTER_ADDRESS=0x...     # 可选 — 设了就强制校验 (64-hex + 派生匹配)。生产强烈建议
+TREASURY_IDENTITY_FILE=                    # 可选 — 覆盖 TOFU 文件路径 (默认 <dbDir>/treasury.identity.json)
 TREASURY_ENABLED=true                       # 总开关
 TREASURY_WATCHER_INTERVAL_MS=15000
 TREASURY_REBALANCE_BASE_COST=10            # credits,固定底价,每次调仓必收

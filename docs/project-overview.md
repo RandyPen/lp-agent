@@ -33,7 +33,7 @@ The agent loop:
     7. record outcome in SQLite + emit JSON log lines
 ```
 
-The template ships **two strategies** (`singleBin`, `multiBinSpot`) and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, and post-v1 Treasury features — see §4.
+The template ships **three strategies** (`singleBin`, `multiBinSpot`, `emaTrend`), **two price feeds** (`onchain`, `binance`), and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, post-v1 Treasury features, and the v2 per-user Seal encrypted-research-report layer — see §4.
 
 ---
 
@@ -46,10 +46,10 @@ The template ships **two strategies** (`singleBin`, `multiBinSpot`) and **one op
                     │
          ┌──────────┼──────────────┬─────────────────┐
          ↓          ↓              ↓                 ↓
-  ┌────────────┐ ┌────────────┐ ┌──────────────┐ ┌─────────────┐
-  │ subscription│ │ rebalancer │ │  treasury    │ │ priceFeed   │
-  │  service    │ │  service   │ │  service     │ │ (onchain)   │
-  └────────────┘ └─────┬──────┘ └──────┬───────┘ └──────┬──────┘
+  ┌────────────┐ ┌────────────┐ ┌──────────────┐ ┌──────────────────┐
+  │ subscription│ │ rebalancer │ │  treasury    │ │ priceFeed        │
+  │  service    │ │  service   │ │  service     │ │ (onchain|binance)│
+  └────────────┘ └─────┬──────┘ └──────┬───────┘ └──────┬───────────┘
                        │                │                │
                        ↓                ↓                ↓
                 ┌────────────┐  ┌──────────────┐  ┌──────────────┐
@@ -58,7 +58,7 @@ The template ships **two strategies** (`singleBin`, `multiBinSpot`) and **one op
                 └─────┬──────┘  └──────────────┘
                       ↓
                 ┌─────────────────────────────────────────────┐
-                │  forecast layer (garch • binWeights)        │
+                │  forecast layer (volatility • binWeights)   │
                 └────────────────────┬────────────────────────┘
                                      ↓
                               ┌─────────────┐
@@ -84,15 +84,21 @@ The template ships **two strategies** (`singleBin`, `multiBinSpot`) and **one op
 ## 3. What's actually built
 
 ### Strategy & rebalancing
-- Two registered strategies (`src/strategies/registry.ts`):
+- Three registered strategies (`src/strategies/registry.ts`):
   - `singleBin` — P0 baseline: all liquidity in the active bin, re-centre on drift.
   - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights.
+  - `emaTrend` — dual-EMA (12/26) trend classifier; tent-shaped weights, range center offset by ±halfWidth/2 toward trend side, ×1.5 skew on the trend side.
 - `StrategyOutput` 4-state union (`plan_and_reconcile | plan_only | reconcile_only | quiet`).
 - `fillBoundary` persistence in `position_state` (table exists; only consumed by future bid-ask-style strategies — v0 strategies don't write it).
 - **Unified rebalance PTB** behind `UNIFIED_TX=true` flag — atomic DLMM ops, single gas envelope. I32 → u32 two's-complement bit serialisation handled correctly in both legacy and unified paths.
 
+### Price feeds (two implementations)
+- `src/data/feeds/onchain.ts` — Cetus DLMM `SwapEvent` poll, derives spot + history + OHLCV. Default.
+- `src/data/feeds/binance.ts` — Public Binance REST (`/api/v3/ticker/price` + `/api/v3/klines`); CEX side-channel for fuller history and cross-source detrending. Switch via `PRICE_FEED=binance` + `BINANCE_SYMBOL=SUIUSDC`.
+- Both write to the shared `price_observations` table (`source` column distinguishes), so `getOhlcv` from either is composable.
+
 ### Forecast layer
-- EWMA / Parkinson / Garman-Klass σ estimators with sqrt-time scaling (`src/forecast/garch.ts`).
+- EWMA / Parkinson / Garman-Klass σ estimators with sqrt-time scaling (`src/forecast/volatility.ts`). All closed-form; no training. Upgrade path to GARCH-MLE / LightGBM-quantile / LSTM documented in `forecasting-approach.md` §"Upgrading to a learned model".
 - Log-normal bin-mass integral with fee dead-zone derate + uniform fallback + `pickBinRange` (`src/forecast/binWeights.ts`).
 
 ### Lending integration
@@ -108,10 +114,13 @@ The template ships **two strategies** (`singleBin`, `multiBinSpot`) and **one op
 - v1 does **not** require user signatures on charges — the on-chain `AgentAdded` event is the implicit authorisation. v2 will add HTTP-API + signature-verified charges (see `treasury-role-design.md` §"What's next").
 - Feature-flagged off by default (`TREASURY_ENABLED=false`).
 
-### Identity guards
-- `EXPECTED_AGENT_ADDRESS` startup guard for the rebalancing keypair.
-- `EXPECTED_TREASURY_MASTER_ADDRESS` startup guard for the treasury keypair (when treasury is enabled).
-- Both roles share `src/sui/keypairs/resolve.ts` but never share cache or env reads. Error messages are role-tagged.
+### Identity guards (three layers)
+- **L1 — `EXPECTED_AGENT_ADDRESS` is REQUIRED env**. `loadConfig` collects every missing / malformed env field into a single `ConfigError` (one launch attempt surfaces all gaps).
+- **L2 — `resolveKeypair` address-match**. Derives address from the configured source, compares against EXPECTED, throws on mismatch.
+- **L3 — TOFU identity file** (`<dbDir>/<role>.identity.json`, `src/sui/keypairs/identityFile.ts`). First run writes the derived address + timestamps; subsequent runs verify. Mismatch aborts startup. Kill-switch: `IDENTITY_FILES_DISABLED=true` (tests / dev).
+- All three layers run independently — any one of them refusing is enough to stop the process.
+- `EXPECTED_TREASURY_MASTER_ADDRESS` remains optional (format-checked when set) since treasury is opt-in via `TREASURY_ENABLED=true`.
+- Agent + treasury roles share `src/sui/keypairs/resolve.ts` but never share cache or env reads. Error messages are role-tagged.
 
 ### Backtest harness
 - `bun run backtest --strategy=… --from=… --to=…` reads `price_observations`, replays through any registered strategy, prints a summary grouped by `StrategyOutput` kind.
@@ -130,6 +139,8 @@ The template is intentionally small. Pieces that were prototyped and then remove
 - **HTTP API for Treasury.** v1 charges are in-process. Forks that want client-facing top-up + signed-message charging add an HTTP layer (Bun.serve) + ALTER TABLE `treasury_service_charges` ADD `signature`, `message_b64`.
 - **Cetus-aggregator sweep.** Operator scripts include `treasury-list-balances` and `treasury-update-rate`, but no auto-swap to a single consolidation asset. The `treasury_ops` table is shaped for this (op_kind `swap`).
 - **Encrypted seed-file loading.** Both roles still consume `.env` mnemonics. Forks running this in less-trusted environments should plug in encrypted-at-rest secret resolution behind `src/sui/keypairs/resolve.ts`.
+- **Seal encrypted research-report layer (v2).** Per-user model: each user's treasury deposit address (`m/44'/784'/0'/0'/N'`) doubles as their Seal authorised-reader identity. Move contract gates access (Subscription / Allowlist patterns); treasury runtime signs `SessionKey` requests on the user's behalf. Full design in `docs/seal-integration.md`. Env placeholders (`SEAL_*`) are commented-out in `.env.example`.
+- **Pyth price feed.** `onchain` and `binance` ship; `pyth` env value is accepted by config parser but startup aborts at the price-feed factory until a fork implements it.
 
 ---
 
@@ -197,11 +208,11 @@ The agent mnemonic lives in `.env` as `AGENT_MNEMONICS` (or legacy `MNEMONICS`);
 
 ### Env (agent role)
 - **Required (one of)**: `AGENT_MNEMONICS` (or `MNEMONICS`) + optional `AGENT_DERIVATION_PATH` (default `m/44'/784'/1'/0'/0'`); or `AGENT_PRIVATE_KEY` (`suiprivkey1…` bech32, takes precedence).
-- **Strongly recommended**: `EXPECTED_AGENT_ADDRESS`.
-- **Optional**: `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot`.
+- **Required**: `EXPECTED_AGENT_ADDRESS` (64-hex Sui address). `loadConfig` collects every missing / malformed env field into one error.
+- **Optional**: `AGENT_IDENTITY_FILE` (override TOFU file path), `IDENTITY_FILES_DISABLED=true` (disable TOFU), `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot|emaTrend`, `PRICE_FEED=onchain|binance`, `BINANCE_SYMBOL=SUIUSDC`.
 
 ### Env (treasury role — when `TREASURY_ENABLED=true`)
-- `TREASURY_MNEMONICS` (or `TREASURY_PRIVATE_KEY`), `TREASURY_MASTER_DERIVATION_PATH`, `TREASURY_USER_BASE_PATH`, `EXPECTED_TREASURY_MASTER_ADDRESS`.
+- `TREASURY_MNEMONICS` (or `TREASURY_PRIVATE_KEY`), `TREASURY_MASTER_DERIVATION_PATH`, `TREASURY_USER_BASE_PATH`, `EXPECTED_TREASURY_MASTER_ADDRESS` (optional but format-checked when set), `TREASURY_IDENTITY_FILE` (TOFU file path override).
 - Pricing knobs: `TREASURY_REBALANCE_BASE_COST` (credits), `TREASURY_REBALANCE_FEE_RATE` (credits per USDC-atomic), `TREASURY_WATCHER_INTERVAL_MS`, `TREASURY_REQUIRE_REGISTRATION`.
 
 ### Skills referenced (live, not vendored)

@@ -125,15 +125,17 @@ src/
 
 - `docs/project-overview.md` — 当前实现状态 + 已知局限 + 优化路线图
 - `docs/module-and-testing.md` — 6 大模块的"做什么 / 怎么测"
-- `docs/treasury-role-design.md` — Treasury 层设计(数据模型、charge 公式、运营 runbook)
-- `docs/forecasting-approach.md` — GARCH / Parkinson / log-normal 数学背景
+- `docs/treasury-role-design.md` — Treasury 层设计(数据模型、charge 公式、Seal 阅读身份与 deposit 地址三合一约定、运营 runbook)
+- `docs/seal-integration.md` — v2 Seal 加密研报集成(per-user 模型、Move 合约骨架、SessionKey 生命周期)
+- `docs/forecasting-approach.md` — EWMA / Parkinson / Garman-Klass 数学背景 + 升级到 ML 模型的扩展点
 
 ## 安全约定
 
 - **不要把 `.env` 提交到 git**(默认 gitignored)
 - **不要把 `MNEMONICS` 写入日志**(代码已经避免)
 - **`AGENT_MNEMONICS` 和 `TREASURY_MNEMONICS` 必须用不同的助记词** — agent 被攻破不能波及 treasury
-- 生产部署强烈建议设 `EXPECTED_AGENT_ADDRESS` + `EXPECTED_TREASURY_MASTER_ADDRESS` 守卫
+- **`EXPECTED_AGENT_ADDRESS` 是必填字段**(在 `.env` 没设或格式错误,`loadConfig` 会一次性列出所有缺失项再退出)
+- **TOFU 身份文件**(`./data/agent.identity.json` / `./data/treasury.identity.json`)首次运行写入,后续启动自动比对 — 助记词被换会立即 fail-fast;主动轮换时 `rm ./data/*.identity.json` 重启
 
 ## `.gitignore` 量子坑
 

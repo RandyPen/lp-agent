@@ -212,16 +212,16 @@ export function createRebalancerService(
         }
       }
 
-      // Authorization check.
+      // Authorization check. If we missed an AgentRemoved event (RPC hiccup),
+      // hard-delete the row here too — matches subscriptions.ts behaviour so
+      // we never carry a stale "active" subscription forward.
       const authorized = await isAgentAuthorized(pmId, agentAddress);
       if (!authorized) {
-        log.warn("rebalancer: agent no longer authorized, revoking subscription", {
+        log.warn("rebalancer: agent no longer authorized, dropping subscription", {
           tickId,
           pmId,
         });
-        db.prepare(
-          `UPDATE subscriptions SET status = 'revoked', removed_at_ms = ? WHERE pm_id = ?`,
-        ).run(Date.now(), pmId);
+        db.prepare(`DELETE FROM subscriptions WHERE pm_id = ?`).run(pmId);
         return;
       }
 

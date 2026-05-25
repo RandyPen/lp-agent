@@ -7,15 +7,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 LiquidityManager is an **open-source template** for building DLMM auto-rebalance agents on **Sui**. It operates through the **CDPM (LeafSheep) agent interface** — users own custodied `PositionManager` objects on-chain, and this agent is an authorized operator with a constrained permission set (see *Agent Permission Model* below).
 
 **What the template ships** (the core skeleton — see `README.md` for the open-source-friendly intro):
-1. **Algorithm-driven rebalancing** — multi-bin probabilistic strategy (GARCH+log-normal), strategy registry, atomic unified PTB
-2. **Idle assets → lending** — Scallop + Kai SAV integration, APY-aware router with tie-break + dust filter
-3. **User top-up records** — per-user derivation addresses + watcher + credit ledger + APY rates (Treasury layer)
-4. **Extension points** — `Strategy`, `PoolProfile`, lending adapter pattern, `kaiVaults` config — all explicit seams documented in `README.md`
+1. **Algorithm-driven rebalancing** — three registered strategies (`singleBin`, `multiBinSpot` log-normal-based, `emaTrend` dual-EMA trend-biased), strategy registry, atomic unified PTB
+2. **Two price feeds** — on-chain Cetus `SwapEvent` (`onchain`) + public Binance REST (`binance`), shared `price_observations` table
+3. **Idle assets → lending** — Scallop + Kai SAV integration, APY-aware router with tie-break + dust filter
+4. **User top-up records** — per-user derivation addresses + watcher + credit ledger + APY rates (Treasury layer)
+5. **Identity guards (3 layers)** — required `EXPECTED_*_ADDRESS` env (with batched `loadConfig` error reporting), in-resolve address-match, TOFU `<dbDir>/<role>.identity.json` file persisted on first run
+6. **Auto PM discovery** — `AgentAdded` on-chain events push PMs into the monitor; `AgentRemoved` / `PositionManagerClosed` (or runtime ACL re-check failure) hard-delete the subscription row
+7. **Extension points** — `Strategy`, `PoolProfile`, `PriceFeed`, lending adapter pattern, `kaiVaults` config, per-user Seal reader (v2) — all explicit seams documented in `README.md` / `docs/`
 
 **What the template intentionally does NOT ship** (downstream forks bring their own alpha):
 - LLM-driven news ingestion / σ-jump / Strategic Brief — these existed in earlier phases and were stripped during the template extraction
 - Cross-chain support — single-chain Sui only
 - HTTP API surface — direct CLI + SQLite only; v2 adds HTTP
+- Encrypted research-report layer via Seal — design is in `docs/seal-integration.md` (per-user model, AGENT keypair NOT involved), env placeholders in `.env.example`; SDK + Move contracts land in v2 forks
 
 Design directions captured from `项目.md`:
 - Price prediction is probabilistic → place liquidity across **multiple bins weighted by probability**, not a single range.
@@ -25,7 +29,7 @@ Design directions captured from `项目.md`:
 
 ## Repository Status
 
-Open-source template (~7 kLOC TypeScript, 160 tests). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the 6-module layout. `README.md` is the entry point for fork users.
+Open-source template (~7 kLOC TypeScript, 172 tests / 14 files). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the 6-module layout. `README.md` is the entry point for fork users.
 
 - Runtime preference: **Bun**. Prefer `bun` over `node`/`npm`.
 - **`.gitignore` quirks** — read this carefully, several directories are intentionally untracked:

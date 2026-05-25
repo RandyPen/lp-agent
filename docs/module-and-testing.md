@@ -1,7 +1,7 @@
 # LiquidityManager — 模块划分与测试指南
 
 > 与 `project-overview.md` 互补:`project-overview` 回答"现状与下一步",本文档回答"系统由哪几大块组成,每一块怎么验证"。
-> 最后更新:2026-05-24。配套测试套件 **160 tests / 13 files**,全部通过。代码量约 7 kLOC。
+> 最后更新:2026-05-25。配套测试套件 **172 tests / 14 files**,全部通过。代码量约 7 kLOC。
 
 ---
 
@@ -25,7 +25,7 @@
       ↓                                       ↓                  ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │         模块 3 — 行情与预测 (Market Data & Forecasting)             │
-│         priceFeed / GARCH / binWeights                              │
+│         priceFeed (onchain | binance) / volatility / binWeights     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -46,7 +46,8 @@
 | `src/sui/keypair.ts` | 旧的 agent-only keypair 入口(向后兼容)|
 | `src/sui/keypairs/resolve.ts` | 纯解析器:`KeyRoleEnvConfig` → `{ keypair, address, source }`,做 expected-address 校验 |
 | `src/sui/keypairs/agent.ts` | Agent 角色 singleton + 缓存,优先读 `AGENT_PRIVATE_KEY`,fallback `AGENT_MNEMONICS` |
-| `src/sui/keypairs/treasury.ts` | Treasury master singleton + per-user 派生(模块 5 用)|
+| `src/sui/keypairs/treasury.ts` | Treasury master singleton + per-user 派生(模块 5 用,N ∈ [1, 2³¹))|
+| `src/sui/keypairs/identityFile.ts` | TOFU 身份固化 — `<dbDir>/<role>.identity.json` 首次写、后续比对;mismatch 抛错 |
 | `src/sui/pool.ts` | Cetus DLMM Pool 对象的读取 (active bin, binStep, fee) |
 | `src/sui/cdpm/package.ts` | CDPM 包地址、Move 目标、Cetus DLMM 共享对象 ID |
 | `src/sui/cdpm/read.ts` | PositionManager 状态读取 + Bag 枚举 |
@@ -84,7 +85,8 @@ deriveUserDepositAddress(index) → string       // 不缓存
 | ✅ bin↔price 单调与往返 | `tests/forecast.test.ts` | priceFromBinId(0)=1000,正负方向单调 |
 | ✅ Agent keypair 解析 | `tests/keypairAgent.test.ts` (10) | 优先级、derivation、expected-address 守卫 |
 | ✅ 通用 resolveKeypair | `tests/keypairResolve.test.ts` (13) | 缺失输入、坏 bech32、role 错误消息 |
-| ✅ Treasury master / per-user 派生 | `tests/treasury/keypair.test.ts` (10) | 确定性、master vs user 不冲突、index < 1 拒绝、与 agent 不冲突 |
+| ✅ Treasury master / per-user 派生 | `tests/treasury/keypair.test.ts` (11) | 确定性、master vs user 不冲突、index < 1 / ≥ 2³¹ 拒绝、与 agent 不冲突 |
+| ✅ TOFU identity 文件 | `tests/identityFile.test.ts` (9) | 首次写、再次读、地址不匹配 throw、坏 JSON throw、缺 address 字段 throw、disable 开关 |
 | ❌ `tx.ts` 旧版 builder | — | 仅靠集成路径间接验证 |
 | ❌ `read.ts` / `events.ts` / `pool.ts` | — | 无 |
 
@@ -175,9 +177,10 @@ capRedeemBurnRaw(exact, wrapperRaw) → bigint | null
 | 文件 | 作用 |
 |---|---|
 | `src/data/priceFeed.ts` | PriceFeed 接口 (`getSpot`、`getHistory(windowMs)`、`getOhlcv(bucketMs, windowMs)`) |
-| `src/data/feeds/onchain.ts` | Cetus SwapEvent → PriceObservation 实现 + SQLite 持久化 + OHLCV 桶化 |
+| `src/data/feeds/onchain.ts` | Cetus SwapEvent → PriceObservation,SQLite 持久化 + OHLCV 桶化 |
+| `src/data/feeds/binance.ts` | Binance REST(`/api/v3/ticker/price` + `/api/v3/klines`),共享 price_observations 表 |
 | `src/forecast/types.ts` | PriceDistribution、OhlcvBar、BinWeight |
-| `src/forecast/garch.ts` | **σ 估计** — EWMA(λ=0.94)、Parkinson、Garman-Klass、sqrt-time scaling、`bucketToOhlcv` |
+| `src/forecast/volatility.ts` | **σ 估计**(闭式,无训练) — EWMA(λ=0.94)、Parkinson、Garman-Klass、sqrt-time scaling、`bucketToOhlcv` |
 | `src/forecast/binWeights.ts` | log-normal CDF 区间积分 + fee dead-zone derate + uniform fallback + `pickBinRange` |
 
 ### 对外接口
@@ -200,6 +203,7 @@ computeBinWeights({ bins, distribution, feeRateBps, ... }) → { bins, rawMass }
 |---|---|---|
 | ✅ σ 估计器 + scaling + binWeights | `tests/forecast.test.ts` (22) | EWMA 常价 = MIN_SIGMA;Parkinson/GK 输出 > 0;sqrt-time scaling 精确;bucketToOhlcv 桶对齐 + 乱序;权重和=1;tight σ 集中在 active;feeRateBps>0 降低 active 权重;uniform fallback |
 | ❌ onchain.ts (价格 feed) | — | 无 (需 RPC mock) |
+| ❌ binance.ts (价格 feed) | — | 无 (需 HTTP mock) |
 
 ### 如何测试
 - **单元** (已强):上述测试已覆盖大部分。
@@ -219,16 +223,17 @@ computeBinWeights({ bins, distribution, feeRateBps, ... }) → { bins, rawMass }
 ### 职责
 所有策略的实现 + 命名注册表 + 持仓状态 (fillBoundary)。策略消费 PMState/PoolState/PriceObservation,返回 `StrategyOutput`(4 态联合)。
 
-> 模板只保留 `singleBin` 与 `multiBinSpot`。早期分支的骨架策略(`curve` / `bidAsk` / `onlyBid` / `onlySell`)已删除 — 新增策略走 `src/strategies/registry.ts` 一行注册即可(`Strategy` 接口契约见 `types.ts`)。
+> 模板保留 3 个内置策略:`singleBin`、`multiBinSpot`、`emaTrend`。早期分支的骨架(`curve` / `bidAsk` / `onlyBid` / `onlySell`)已删除 — 新增策略走 `src/strategies/registry.ts` 一行注册即可(`Strategy` 接口契约见 `types.ts`)。
 
 ### 关键文件
 
 | 文件 | 作用 |
 |---|---|
 | `src/strategies/types.ts` | `Strategy` 接口、`StrategyOutput` (`plan_and_reconcile`/`plan_only`/`reconcile_only`/`quiet`) |
-| `src/strategies/registry.ts` | `buildStrategy(name)`、`isStrategyName()`、`listStrategyNames()` — 当前仅 `singleBin` 和 `multiBinSpot` |
+| `src/strategies/registry.ts` | `buildStrategy(name)`、`isStrategyName()`、`listStrategyNames()` — 当前 `singleBin` / `multiBinSpot` / `emaTrend` |
 | `src/strategies/singleBin.ts` | P0 — 全部入 active bin,漂出范围重新对中 |
 | `src/strategies/multiBinSpot.ts` | **v0** — log-normal 分布、out-of-range/drift/fees-only 触发 |
+| `src/strategies/emaTrend.ts` | 双 EMA(12/26)趋势分类 → tent 曲线偏侧布仓;趋势侧权重 ×1.5 |
 | `src/strategies/positionState.ts` | `saveFillBoundary` / `loadPositionState` — 留给将来 bid-ask 类策略;v0 不写 |
 | `src/strategies/lendingPolicy.ts` | per-coin 借贷策略类型定义 |
 
@@ -460,7 +465,7 @@ bun run scripts/treasury-update-rate.ts --coin <type> --num <n> --den <d>
 |---|---|---|---|---|
 | 1. 核心交易层 | 强 (txUnified + binMath + keypair 全套) | 无 | events:print,devInspect | `tx.ts` 旧版、`read.ts`、`events.ts`、`pool.ts` |
 | 2. 借贷集成 | 强 (math + shortfall + lendingConfig) | 无 | lending:bootstrap + 小额循环 | **`router.decide()`** — 关键 |
-| 3. 行情与预测 | 强 (garch + binWeights) | 无 | 长跑 agent + SQL 检查 | `onchain.ts` 价格 feed |
+| 3. 行情与预测 | 强 (volatility + binWeights) | 无 | 长跑 agent + SQL 检查 | `onchain.ts` / `binance.ts` 价格 feed |
 | 4. 策略引擎 | 部分 (经 backtest) | backtest 回放 | `STRATEGY=…` 切换观察 | `multiBinSpot.plan()` 直接单测 |
 | 5. Treasury | 强 (51 tests / 5 files,覆盖 keypair+credits+store+watcher+registration) | 无 | 小额充值 + 调仓扣减全链路 | rebalancer 集成路径(算在模块 6)|
 | 6. 编排与持久化 | 部分 (backtest) | 无 | `bun start` 30 min | **`rebalancer.tickOne()`、`executor.*`、`locks`、`subscriptions`** |
