@@ -27,7 +27,7 @@ LiquidityManager is an **open-source quantitative liquidity-custody agent** for 
 - HTTP API surface — direct CLI + SQLite only; v2 adds HTTP
 - Encrypted research-report layer via Seal — design is in `docs/seal-integration.md` (per-user model, AGENT keypair NOT involved), env placeholders in `.env.example`; SDK + Move contracts land in v2 forks
 
-Design directions captured from `项目.md`:
+Design directions captured from the operator's internal design notes (a Chinese-named markdown file at the repo root, kept local and untracked):
 - Price prediction is probabilistic → place liquidity across **multiple bins weighted by probability**, not a single range.
 - Trading-fee–aware rebalancing: a 0.4 % pool fee means an LP order at price P only fills once the market crosses P × (1 + fee). Strategy logic must price this in, and may intentionally hold liquidity through volatility to harvest swap fees.
 - Inputs: historical prices first; the architecture leaves room for downstream forks to plug in macro / news feeds.
@@ -37,9 +37,12 @@ Design directions captured from `项目.md`:
 
 Open-source quant agent (~16 kLOC TypeScript, 572 tests / 31 files; plus the `ml/` Python pipeline, ~100 pytest tests). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`, ML pipeline under `ml/`. The v1 rewrite landed: `src/prediction` (PredictionProvider + sidecar client), `src/state` (three-state machine), `src/risk` (L1/L2/L3), `src/decision`, `src/data/feeds/{binanceMulti,derivatives,cetusEvents}` + `src/data/marketAggregator`, `src/strategies/mlAgent`, `src/services/shadowRunner`, and the uv-managed `ml/` sidecar (LightGBM quantile training + FastAPI serving). `Strategy.plan` is now async. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the module layout. `README.md` is the entry point for fork users.
 
+**Note on doc references**: the detailed design documents under `docs/` (implementation plan, data sources, prediction/decision/backtest/risk designs, treasury, Seal, module-and-testing) are operator-local Chinese notes — gitignored, NOT in the public repo. References to them throughout this file are kept for the operator; in a fresh clone only `docs/README.md` and `docs/project-overview.md` exist.
+
 - Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo.
-- **`.gitignore` layout** (the §2.1 open-source整改 landed — `tests/`, `docs/`, and the reusable scripts are now tracked):
-  - Markdown is tracked. Only `/项目.md` (internal Chinese design notes) stays local.
+- **`.gitignore` layout** (the §2.1 open-source cleanup landed — `tests/`, the public docs, and the reusable scripts are now tracked):
+  - Root markdown (`README.md`, `CLAUDE.md`) is tracked; the operator's Chinese-named internal notes file at the repo root stays local (ignored via an ASCII-only pattern).
+  - `docs/` — only the English docs are tracked (`docs/README.md`, `docs/project-overview.md`). The detailed Chinese design documents (`implementation-plan-v1.md`, `data-sources.md`, `forecasting-approach.md`, `prediction-service-design.md`, `decision-engine-design.md`, `backtest-framework-design.md`, `risk-monitoring-design.md`, `module-and-testing.md`, `treasury-role-design.md`, `seal-integration.md`, `project-background.md`, `x-article.md`) are ignored per-file and exist only on the operator's machine — they are NOT in the public repo. References to them elsewhere in this file remain valid for the operator but will not resolve in a fresh clone.
   - `/tests` — tracked (first trust signal for an open-source repo).
   - `/scripts/*` is ignored with a whitelist: `verify-agent-address.ts`, `verify-treasury-address.ts`, `collect-historical.ts`, `backfill-cetus-events.ts`, `verify-data-coverage.ts` are tracked; operator-local scripts (`bootstrap-agent-key.ts`, `lending-bootstrap.ts`, `print-events.ts`, `treasury-*.ts`) stay untracked.
   - `/data` — SQLite database directory, ignored.
@@ -111,7 +114,7 @@ Both `EXPECTED_*_ADDRESS` and the identity file run; if either fails the role re
 
 ## Multi-role keys (forward-looking)
 
-This project will eventually grow a second on-chain identity: the **treasury / deposit-handling address** for the SuiAgentsTopUp-style monetization layer (per `项目.md` and `src/data/feeds` / future treasury module). That address is operationally and cryptographically **independent** of the agent — different mnemonic, different derivation path, different `EXPECTED_*_ADDRESS` guard.
+This project will eventually grow a second on-chain identity: the **treasury / deposit-handling address** for the SuiAgentsTopUp-style monetization layer (per the internal design notes and `src/data/feeds` / future treasury module). That address is operationally and cryptographically **independent** of the agent — different mnemonic, different derivation path, different `EXPECTED_*_ADDRESS` guard.
 
 The codebase is structured so adding the treasury role is a one-file addition, not a refactor:
 

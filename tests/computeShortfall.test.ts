@@ -55,7 +55,7 @@ describe("computeShortfall", () => {
   });
 
   it("returns 0 when the coin type is not in LENDING_OPPORTUNITIES", () => {
-    // 用一个不在 lendingConfig 白名单的 coin type — canLend() 应返回 false
+    // Use a coin type not on the lendingConfig whitelist — canLend() should return false
     const UNKNOWN_COIN = "0xdeadbeef::unknown::TOKEN";
     expect(computeShortfall(5_000_000n, 1_000_000_000n, profile(), UNKNOWN_COIN)).toBe(0n);
   });

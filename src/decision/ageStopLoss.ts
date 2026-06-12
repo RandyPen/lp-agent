@@ -1,5 +1,5 @@
 /**
- * Position-age stop-loss (老化库存止损).
+ * Position-age stop-loss (stale inventory liquidation).
  *
  * Tracks per-bin (or per-lot) age from PM state + persisted timestamps passed
  * in by the caller. Emits "should liquidate stale one-sided position" decisions

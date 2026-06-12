@@ -14,7 +14,7 @@
  * - Reset is intentionally manual-only: the operator must call `reset()` with
  *   an explicit acknowledgment reason, which also logs the reset.
  *
- * See docs/risk-monitoring-design.md §四.4.2 (L3) and §九.
+ * See docs/risk-monitoring-design.md §4.4.2 (L3) and §9.
  */
 
 import type { Database } from "bun:sqlite";

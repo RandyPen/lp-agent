@@ -9,12 +9,12 @@
  * in-memory for speed; the `summarize()` output is intended for reports and
  * the shadow-mode diagnostic log, not direct DB persistence.
  *
- * Component breakdown per risk-monitoring-design.md §七:
+ * Component breakdown per risk-monitoring-design.md §7:
  *   feeIncome       — swap fees collected from the pool position
  *   rebalanceCost   — estimated gas + treasury service cost per rebalance
  *   inventoryDelta  — mark-to-market change in position inventory value
  *
- * See docs/risk-monitoring-design.md §七.2 and implementation-plan-v1.md §W7.
+ * See docs/risk-monitoring-design.md §7.2 and implementation-plan-v1.md §W7.
  */
 
 // ---------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 /**
- * Inventory correction (库存修正).
+ * Inventory correction.
  *
  * Given PM balances + target weights computed by the diff planner, computes
  * the inventory skew (SUI vs USDC imbalance) and adjusts target weights /

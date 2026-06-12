@@ -5,8 +5,26 @@ node_modules/
 *.log
 .DS_Store
 
-# Internal design notes (Chinese) stay local.
-/项目.md
+# Internal design notes (Chinese) — kept local, not published.
+# Root level: any markdown whose name does not start with an ASCII letter
+# (covers the operator's Chinese-named notes file).
+/[!A-Za-z]*.md
+
+# Internal design documents (Chinese) — kept local, not published.
+# Ignored per-file on purpose: future English docs under docs/ stay tracked
+# by default (no blanket docs/* rule).
+docs/backtest-framework-design.md
+docs/data-sources.md
+docs/decision-engine-design.md
+docs/forecasting-approach.md
+docs/implementation-plan-v1.md
+docs/module-and-testing.md
+docs/prediction-service-design.md
+docs/project-background.md
+docs/risk-monitoring-design.md
+docs/seal-integration.md
+docs/treasury-role-design.md
+docs/x-article.md
 
 # Operator-local scripts stay untracked; the reusable subset is whitelisted.
 /scripts/*

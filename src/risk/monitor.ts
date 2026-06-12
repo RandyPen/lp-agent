@@ -3,7 +3,7 @@
  *
  * Risk monitor: rolling-window observation + pre-tick veto checks.
  *
- * Layer mapping (risk-monitoring-design.md §一.2 / §十.1):
+ * Layer mapping (risk-monitoring-design.md §1.2 / §10.1):
  *   L1 soft circuit  — spread in [l1SpreadSoftBandLow, l1SpreadSoftBandHigh)
  *                      → reduce exposure (lendingPctBonusPp=10, halfWidthFactor=0.7)
  *   L2 hard circuit  — EXTREME triggers per §5.3 of implementation-plan-v1.md:

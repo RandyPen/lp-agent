@@ -10,7 +10,7 @@
  * - Deterministic: inject `nowMs` where timing matters.
  * - Each L2 condition is a separate function for isolated testability.
  *
- * See docs/risk-monitoring-design.md §四 and implementation-plan-v1.md §5.3.
+ * See docs/risk-monitoring-design.md §4 and implementation-plan-v1.md §5.3.
  */
 
 // ---------------------------------------------------------------------------
