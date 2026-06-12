@@ -6,6 +6,7 @@ import { getPoolState } from "../sui/pool.ts";
 import { withLock } from "../lib/locks.ts";
 import { log } from "../lib/logger.ts";
 import { buildStrategy } from "../strategies/registry.ts";
+import type { MlAgentDeps } from "../strategies/registry.ts";
 import { saveFillBoundary } from "../strategies/positionState.ts";
 import type { Strategy } from "../strategies/types.ts";
 import { decide as routeLending } from "../sui/lending/router.ts";
@@ -18,6 +19,7 @@ import type { SubscriptionsService } from "./subscriptions.ts";
 import type { ExecutorService } from "./executor.ts";
 import type { PriceFeed } from "../data/priceFeed.ts";
 import type { RebalancePlan, PMState } from "../domain/types.ts";
+import type { StateContext } from "../prediction/types.ts";
 
 export interface RebalancerService {
   start(): () => void;
@@ -80,6 +82,24 @@ function recordLendingAction(
 }
 
 /**
+ * Compute the effective cooldown for this strategy configuration. The mlAgent
+ * strategy has a shorter default interval because the state machine drives
+ * evaluation timing.
+ */
+export function getEffectiveCooldownMs(
+  cfg: ReturnType<typeof loadConfig>,
+  mlDeps?: MlAgentDeps,
+): number {
+  // When mlAgent is active, the state machine drives evaluation timing.
+  // `current()` is always callable — before the first `advance()` it returns
+  // the machine's minimum viable NORMAL context.
+  if (cfg.strategy === "mlAgent" && mlDeps) {
+    return mlDeps.stateMachine.current().evalIntervalMs;
+  }
+  return cfg.perPmCooldownMs;
+}
+
+/**
  * Redeem from lending if the next bin add needs more underlying than what's
  * left in `pm.balance` after honouring `minIdleBuffer`. Returns the digest of
  * the last successful redeem (or empty string when nothing was needed).
@@ -88,6 +108,7 @@ async function coverShortfallViaLending(
   pm: PMState,
   plan: RebalancePlan,
   executor: ExecutorService,
+  stateBias?: StateContext,
 ): Promise<string> {
   const cfg = loadConfig();
   const profile = cfg.poolProfile;
@@ -97,10 +118,15 @@ async function coverShortfallViaLending(
 
   if (shortfallA === 0n && shortfallB === 0n) return "";
 
+  const routerStateBias = stateBias
+    ? { targetLendingPct: stateBias.lendingPct }
+    : undefined;
+
   const { decisions } = await routeLending({
     pm,
     profile,
     shortfall: { a: shortfallA, b: shortfallB },
+    stateBias: routerStateBias,
   });
 
   let digest = "";
@@ -127,13 +153,20 @@ async function coverShortfallViaLending(
 async function deployIdleViaLending(
   pm: PMState,
   executor: ExecutorService,
+  stateBias?: StateContext,
 ): Promise<string> {
   const cfg = loadConfig();
   const profile = cfg.poolProfile;
+
+  const routerStateBias = stateBias
+    ? { targetLendingPct: stateBias.lendingPct }
+    : undefined;
+
   const { decisions } = await routeLending({
     pm,
     profile,
     shortfall: { a: 0n, b: 0n },
+    stateBias: routerStateBias,
   });
 
   let digest = "";
@@ -176,9 +209,10 @@ export function createRebalancerService(
   subscriptions: SubscriptionsService,
   executor: ExecutorService,
   priceFeed: PriceFeed,
+  mlDeps?: MlAgentDeps,
 ): RebalancerService {
   const cfg = loadConfig();
-  const strategy: Strategy = buildStrategy(cfg.strategy);
+  const strategy: Strategy = buildStrategy(cfg.strategy, mlDeps);
   log.info("rebalancer: strategy selected", { name: strategy.name });
   const agentAddress = getAgentAddress();
 
@@ -188,6 +222,9 @@ export function createRebalancerService(
     const tickId = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
     await withLock(pmId, async () => {
       const db = getDb();
+
+      // Effective cooldown — for mlAgent the state machine provides the interval.
+      const effectiveCooldown = getEffectiveCooldownMs(cfg, mlDeps);
 
       // Cooldown check: look at the most recent succeeded rebalance.
       const lastRow = db
@@ -202,11 +239,11 @@ export function createRebalancerService(
 
       if (lastRow && lastRow.submitted_at_ms !== null) {
         const elapsed = Date.now() - lastRow.submitted_at_ms;
-        if (elapsed < cfg.perPmCooldownMs) {
+        if (elapsed < effectiveCooldown) {
           log.debug("rebalancer: cooldown active, skipping tick", {
             tickId,
             pmId,
-            remainingMs: cfg.perPmCooldownMs - elapsed,
+            remainingMs: effectiveCooldown - elapsed,
           });
           return;
         }
@@ -232,7 +269,7 @@ export function createRebalancerService(
       const history = await priceFeed.getHistory(5 * 60 * 1000); // 5-minute window
 
       // Strategy decision.
-      const output = strategy.plan({
+      const output = await strategy.plan({
         pm,
         pool,
         spot,
@@ -254,7 +291,11 @@ export function createRebalancerService(
           reason: output.reason,
         });
         if (cfg.lending.enabled) {
-          await deployIdleViaLending(pm, executor);
+          // For mlAgent, thread the state machine context so the router respects lendingPct.
+          const stateBias = cfg.strategy === "mlAgent" && mlDeps
+            ? mlDeps.stateMachine.current()
+            : undefined;
+          await deployIdleViaLending(pm, executor, stateBias);
         }
         return;
       }
@@ -340,6 +381,11 @@ export function createRebalancerService(
 
       const rebalanceId = insertResult.lastInsertRowid;
 
+      // Snapshot the state machine context once for this tick (mlAgent only).
+      const stateBias = cfg.strategy === "mlAgent" && mlDeps
+        ? mlDeps.stateMachine.current()
+        : undefined;
+
       let finalStatus: "succeeded" | "failed" = "succeeded";
       let finalDigest = "";
       let finalError: string | undefined;
@@ -361,7 +407,7 @@ export function createRebalancerService(
 
           if (cfg.lending.enabled && !skipReconcile) {
             const postPm = await getPositionManager(pmId);
-            const supplyDigest = await deployIdleViaLending(postPm, executor);
+            const supplyDigest = await deployIdleViaLending(postPm, executor, stateBias);
             if (supplyDigest) finalDigest = supplyDigest;
           }
         } else {
@@ -391,7 +437,7 @@ export function createRebalancerService(
 
           // Step 3.5: cover any shortfall for the planned add by redeeming from lending.
           if (cfg.lending.enabled) {
-            const redeemDigest = await coverShortfallViaLending(freshPm, plan, executor);
+            const redeemDigest = await coverShortfallViaLending(freshPm, plan, executor, stateBias);
             if (redeemDigest) {
               finalDigest = redeemDigest;
               freshPm = await getPositionManager(pmId);
@@ -410,7 +456,7 @@ export function createRebalancerService(
           // idle balance free this tick).
           if (cfg.lending.enabled && !skipReconcile) {
             const postAddPm = await getPositionManager(pmId);
-            const supplyDigest = await deployIdleViaLending(postAddPm, executor);
+            const supplyDigest = await deployIdleViaLending(postAddPm, executor, stateBias);
             if (supplyDigest) finalDigest = supplyDigest;
           }
         }

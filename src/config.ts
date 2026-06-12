@@ -52,6 +52,86 @@ export interface TreasuryAppConfig {
   requireRegistration: boolean;
 }
 
+/**
+ * Configuration for the Python prediction sidecar (v1 ML layer).
+ * See `docs/prediction-service-design.md §4` and `implementation-plan-v1.md §9`.
+ */
+export interface PredictionAppConfig {
+  /** Base URL of the local Python inference sidecar. Default: http://127.0.0.1:8377 */
+  sidecarUrl: string;
+  /** HTTP request timeout in ms. After this, SidecarPredictionProvider returns fallback="timeout". */
+  timeoutMs: number;
+}
+
+/**
+ * ML pipeline runtime switches.
+ */
+export interface MlAppConfig {
+  /**
+   * When true, `mlAgent` records predictions and state transitions but does NOT
+   * submit any on-chain PTBs. The production strategy (cfg.strategy) continues
+   * to execute normally. Shadow mode allows 14-day validation before live trading.
+   */
+  shadowMode: boolean;
+}
+
+/**
+ * L1/L2/L3 risk thresholds.
+ * See `docs/risk-monitoring-design.md §5.3` and `implementation-plan-v1.md §5.3`.
+ *
+ * All percentage values are fractional (0.10 = 10%, not "10").
+ */
+export interface RiskThresholds {
+  /**
+   * L2 trigger: 5-minute price volatility threshold.
+   * If |Δprice| / price over 5 min exceeds this, enter EXTREME.
+   * Default 0.10 (10%).
+   */
+  extremeVolatility5m: number;
+  /**
+   * L2 trigger: 5-minute TVL drop threshold.
+   * If TVL drops by more than this fraction over 5 min, enter EXTREME.
+   * Default 0.50 (50%).
+   */
+  tvlDrop5m: number;
+  /**
+   * L2 trigger: cross-market spread threshold (Cetus vs Binance).
+   * If |(cetus_price − binance_price) / binance_price| exceeds this, start timer.
+   * Default 0.05 (5%).
+   */
+  spreadExtreme: number;
+  /**
+   * L2 trigger: how long (ms) the spread must stay above `spreadExtreme`
+   * before entering EXTREME. Default 30_000 (30 s).
+   */
+  spreadSustainMs: number;
+  /**
+   * L2 trigger: if pAbove + pBelow exceeds this, enter EXTREME.
+   * Signals the model sees high probability of crossing the active bin on both
+   * sides (i.e. extreme uncertainty). Default 0.7.
+   */
+  pBreakSum: number;
+  /**
+   * L2 trigger: 24-hour PnL threshold. If 24h PnL / NAV < this (negative),
+   * enter EXTREME. Default -0.05 (-5%).
+   */
+  pnl24hPct: number;
+  /**
+   * L1 soft circuit-breaker: lower bound of the spread band that triggers a
+   * soft circuit (increase lending %, narrow half-width). Default 0.005 (0.5%).
+   */
+  l1SpreadSoftBandLow: number;
+  /**
+   * L1 soft circuit-breaker: upper bound. Spread above this triggers L1
+   * (below spreadExtreme which triggers L2). Default 0.01 (1%).
+   */
+  l1SpreadSoftBandHigh: number;
+}
+
+export interface RiskAppConfig {
+  thresholds: RiskThresholds;
+}
+
 export interface AppConfig {
   network: Network;
   grpcUrl: string;
@@ -78,6 +158,18 @@ export interface AppConfig {
   unifiedTx: boolean;
   lending: LendingAppConfig;
   treasury: TreasuryAppConfig;
+  /** Python prediction sidecar config (v1 ML layer). */
+  prediction: PredictionAppConfig;
+  /** ML runtime switches (shadow mode, etc.). */
+  ml: MlAppConfig;
+  /**
+   * Strategy to fall back to when `mlAgent` cannot use the prediction provider
+   * (sidecar down, PSI drift, timeout). Defaults to `emaTrend`.
+   * Set via `FALLBACK_STRATEGY` env var.
+   */
+  fallbackStrategy: StrategyName;
+  /** Risk monitor thresholds for L1/L2/L3 circuit breakers. */
+  risk: RiskAppConfig;
 }
 
 function required(name: string): string {
@@ -280,6 +372,72 @@ export function loadConfig(): AppConfig {
     }
   }
 
+  // Prediction sidecar config (v1 ML layer).
+  const predictionTimeoutMs = Number(optional("PREDICTION_TIMEOUT_MS", "2000"));
+  if (!Number.isFinite(predictionTimeoutMs) || predictionTimeoutMs <= 0) {
+    errs.push(`PREDICTION_TIMEOUT_MS must be a positive number, got '${process.env.PREDICTION_TIMEOUT_MS ?? ""}'`);
+  }
+  const prediction: PredictionAppConfig = {
+    sidecarUrl: optional("PREDICTION_SIDECAR_URL", "http://127.0.0.1:8377"),
+    timeoutMs: predictionTimeoutMs,
+  };
+
+  // ML shadow mode.
+  const ml: MlAppConfig = {
+    shadowMode: optional("ML_SHADOW_MODE", "false").toLowerCase() === "true",
+  };
+
+  // Fallback strategy for mlAgent Tier 0 degradation.
+  const fallbackStrategyRaw = optional("FALLBACK_STRATEGY", "emaTrend");
+  if (!isStrategyName(fallbackStrategyRaw)) {
+    errs.push(
+      `FALLBACK_STRATEGY must be one of [${listStrategyNames().join(", ")}], got '${fallbackStrategyRaw}'`,
+    );
+  }
+  const fallbackStrategy = isStrategyName(fallbackStrategyRaw)
+    ? fallbackStrategyRaw
+    : ("emaTrend" as StrategyName);
+
+  // Risk thresholds (L1/L2/L3 circuit breakers).
+  const extremeVolatility5m = Number(optional("RISK_EXTREME_VOLATILITY_5M", "0.10"));
+  const tvlDrop5m = Number(optional("RISK_TVL_DROP_5M", "0.50"));
+  const spreadExtreme = Number(optional("RISK_SPREAD_EXTREME", "0.05"));
+  const spreadSustainMs = Number(optional("RISK_SPREAD_SUSTAIN_MS", "30000"));
+  const pBreakSum = Number(optional("RISK_P_BREAK_SUM", "0.7"));
+  const pnl24hPct = Number(optional("RISK_PNL_24H_PCT", "-0.05"));
+  const l1SpreadSoftBandLow = Number(optional("RISK_L1_SPREAD_SOFT_BAND_LOW", "0.005"));
+  const l1SpreadSoftBandHigh = Number(optional("RISK_L1_SPREAD_SOFT_BAND_HIGH", "0.01"));
+
+  for (const [name, value] of [
+    ["RISK_EXTREME_VOLATILITY_5M", extremeVolatility5m],
+    ["RISK_TVL_DROP_5M", tvlDrop5m],
+    ["RISK_SPREAD_EXTREME", spreadExtreme],
+    ["RISK_SPREAD_SUSTAIN_MS", spreadSustainMs],
+    ["RISK_P_BREAK_SUM", pBreakSum],
+    ["RISK_L1_SPREAD_SOFT_BAND_LOW", l1SpreadSoftBandLow],
+    ["RISK_L1_SPREAD_SOFT_BAND_HIGH", l1SpreadSoftBandHigh],
+  ] as const) {
+    if (!Number.isFinite(value)) {
+      errs.push(`${name} must be a finite number, got '${process.env[name] ?? ""}'`);
+    }
+  }
+  if (!Number.isFinite(pnl24hPct)) {
+    errs.push(`RISK_PNL_24H_PCT must be a finite number, got '${process.env.RISK_PNL_24H_PCT ?? ""}'`);
+  }
+
+  const risk: RiskAppConfig = {
+    thresholds: {
+      extremeVolatility5m,
+      tvlDrop5m,
+      spreadExtreme,
+      spreadSustainMs,
+      pBreakSum,
+      pnl24hPct,
+      l1SpreadSoftBandLow,
+      l1SpreadSoftBandHigh,
+    },
+  };
+
   // Surface every gap in one shot.
   if (errs.hasIssues()) throw errs.toError();
 
@@ -317,6 +475,10 @@ export function loadConfig(): AppConfig {
     unifiedTx: optional("UNIFIED_TX", "false").toLowerCase() === "true",
     lending,
     treasury,
+    prediction,
+    ml,
+    fallbackStrategy,
+    risk,
   };
 
   return cached;

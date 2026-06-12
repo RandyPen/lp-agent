@@ -1,0 +1,354 @@
+/**
+ * Three-state market-making state machine (NORMAL / TREND / EXTREME).
+ *
+ * Design: implementation-plan-v1.md §5 and decision-engine-design.md §2–§8.
+ *
+ * Usage:
+ *   const sm = createStateMachine({ poolId: "0x...", db });
+ *   const ctx = sm.advance(snapshot, pred, input, extremeSignal);
+ *
+ * Each `advance()` call:
+ *   1. Evaluates transition predicates (min-dwell enforced).
+ *   2. If a transition fires: closes the current DB row (sets exited_at_ms),
+ *      inserts a new row, updates internal state.
+ *   3. Derives continuous parameters (halfWidth, trendBias, lendingPct, …).
+ *   4. Returns a fully populated StateContext.
+ *
+ * Persistence contract:
+ *   - Every state entry inserts a new row into `market_state_history` with
+ *     `exited_at_ms = NULL`.
+ *   - Every exit updates the previous row's `exited_at_ms`.
+ *   - Pool-level: one open row per pool at a time.
+ *
+ * Determinism: callers inject `now?: () => number` so tests are deterministic.
+ *
+ * Degradation (§5.4): the machine does NOT handle fallback predictions.
+ * `mlAgent` is responsible for detecting `pred.fallback !== false` and routing
+ * to Tier 0 before calling `advance`.  The machine assumes `pred.fallback` is
+ * `false` on every call.
+ *
+ * "Uncertainty high" semantics: when `pred.featureCompleteness < U_HIGH`, only
+ * `maxCenterOffset` is tightened (to 1 bin).  `halfWidth`, `toleranceBins`,
+ * and `lendingPct` are unaffected.  `maxCenterOffset` is not part of
+ * `StateContext` (it is consumed by `diffPlanner`) — see docs.
+ */
+
+import type { Database } from "bun:sqlite";
+import type {
+  MarketState,
+  MarketSnapshot,
+  PredictionResponse,
+  StateContext,
+} from "../prediction/types.ts";
+import type { StrategyInput } from "../strategies/types.ts";
+import { log } from "../lib/logger.ts";
+import {
+  EVAL_INTERVAL_MS,
+  MIN_DWELL_MS,
+  U_HIGH,
+  deriveHalfWidth,
+  deriveLendingPct,
+  deriveTrendBias,
+  deriveToleranceBins,
+} from "./params.ts";
+import {
+  type ExtremeSignal,
+  computeDriftStrength,
+  dwellElapsed,
+  shouldEnterExtreme,
+  shouldEnterTrend,
+  shouldExitExtreme,
+  shouldExitTrend,
+} from "./transitions.ts";
+
+// ---------------------------------------------------------------------------
+// Public interface
+// ---------------------------------------------------------------------------
+
+export interface StateMachine {
+  /**
+   * Evaluate the next state given the latest market snapshot and prediction.
+   *
+   * @param snapshot    Latest multi-source market snapshot.
+   * @param pred        Latest prediction response (must have fallback=false).
+   * @param input       Current strategy input (for pool context).
+   * @param extremeSignal  Optional L2 risk signal.  null/undefined = no signal.
+   * @returns A fully populated StateContext for this evaluation tick.
+   */
+  advance(
+    snapshot: MarketSnapshot,
+    pred: PredictionResponse,
+    input: StrategyInput,
+    extremeSignal?: ExtremeSignal | null,
+  ): StateContext;
+
+  /** Return the current StateContext without evaluating transitions. */
+  current(): StateContext;
+}
+
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
+
+interface InternalState {
+  state: MarketState;
+  enteredAtMs: number;
+  currentRowId: number | null;
+  /** State before the current one (null on first entry). */
+  prevState: MarketState | null;
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a per-pool state machine instance.
+ *
+ * @param deps.poolId  Pool identifier (key for `market_state_history`).
+ * @param deps.db      SQLite database (must have `market_state_history` table).
+ * @param deps.now     Injectable clock.  Defaults to `() => Date.now()`.
+ */
+export function createStateMachine(deps: {
+  poolId: string;
+  db: Database;
+  now?: () => number;
+}): StateMachine {
+  const { poolId, db } = deps;
+  const now = deps.now ?? (() => Date.now());
+
+  // Prepared statements — created once, reused on every advance() call.
+  const insertRow = db.prepare<
+    unknown,
+    [string, number, string, string, string | null]
+  >(`
+    INSERT INTO market_state_history
+      (pool_id, entered_at_ms, state, trigger, prev_state)
+    VALUES
+      (?, ?, ?, ?, ?)
+  `);
+
+  const closeRow = db.prepare<unknown, [number, number]>(`
+    UPDATE market_state_history
+    SET    exited_at_ms = ?
+    WHERE  id = ?
+  `);
+
+  // Bootstrap: start in NORMAL, enter at "now", persist the initial row.
+  const bootMs = now();
+
+  const initialRowId = (
+    insertRow.run(poolId, bootMs, "NORMAL", "init", null) as { lastInsertRowid: number }
+  ).lastInsertRowid;
+
+  const internalState: InternalState = {
+    state: "NORMAL",
+    enteredAtMs: bootMs,
+    currentRowId: initialRowId,
+    prevState: null,
+  };
+
+  // -------------------------------------------------------------------------
+  // Internal helpers
+  // -------------------------------------------------------------------------
+
+  function buildContext(
+    state: MarketState,
+    enteredAtMs: number,
+    pred: PredictionResponse,
+  ): StateContext {
+    const trendBias =
+      state === "TREND"
+        ? deriveTrendBias(pred.pAbove, pred.pBelow)
+        : 0;
+
+    const l1Bonus = false; // L1 bonus is determined by risk module, not state machine
+    const lendingPct = deriveLendingPct(state, trendBias, l1Bonus);
+    const halfWidth = deriveHalfWidth(pred.widthSigma);
+    const toleranceBins = deriveToleranceBins(pred.widthSigma);
+
+    return {
+      state,
+      enteredAtMs,
+      evalIntervalMs: EVAL_INTERVAL_MS[state],
+      halfWidth,
+      trendBias,
+      lendingPct,
+      toleranceBins,
+      minDwellMs: MIN_DWELL_MS[state],
+    };
+  }
+
+  /**
+   * Perform a state transition: close the current row, insert the new row,
+   * update internal state.
+   */
+  function transition(
+    to: MarketState,
+    trigger: string,
+    nowMs: number,
+  ): void {
+    const from = internalState.state;
+
+    // Close the current row
+    if (internalState.currentRowId !== null) {
+      closeRow.run(nowMs, internalState.currentRowId);
+    }
+
+    // Insert the new row
+    const result = insertRow.run(
+      poolId,
+      nowMs,
+      to,
+      trigger,
+      from,
+    ) as { lastInsertRowid: number };
+
+    log.info("state_machine: transition", {
+      pool_id: poolId,
+      from,
+      to,
+      trigger,
+      now_ms: nowMs,
+    });
+
+    internalState.state = to;
+    internalState.enteredAtMs = nowMs;
+    internalState.currentRowId = result.lastInsertRowid;
+    internalState.prevState = from;
+  }
+
+  // -------------------------------------------------------------------------
+  // Public methods
+  // -------------------------------------------------------------------------
+
+  function advance(
+    snapshot: MarketSnapshot,
+    pred: PredictionResponse,
+    _input: StrategyInput,
+    extremeSignal?: ExtremeSignal | null,
+  ): StateContext {
+    const nowMs = now();
+    const { state, enteredAtMs } = internalState;
+    const dwellOk = dwellElapsed(state, enteredAtMs, nowMs);
+
+    const uncertaintyHigh = pred.featureCompleteness < U_HIGH;
+
+    if (uncertaintyHigh) {
+      log.debug("state_machine: uncertainty high, tightening maxCenterOffset", {
+        pool_id: poolId,
+        featureCompleteness: pred.featureCompleteness,
+      });
+    }
+
+    if (dwellOk) {
+      // Evaluate transitions in priority order:
+      //   Any state → EXTREME
+      //   NORMAL → TREND
+      //   TREND → NORMAL
+      //   EXTREME → (prevState or NORMAL)
+
+      if (state !== "EXTREME") {
+        const { enter, trigger } = shouldEnterExtreme(pred, extremeSignal);
+        if (enter) {
+          transition("EXTREME", trigger, nowMs);
+          return buildContext("EXTREME", internalState.enteredAtMs, pred);
+        }
+      }
+
+      if (state === "NORMAL") {
+        if (shouldEnterTrend(snapshot, pred)) {
+          const driftStrength = computeDriftStrength(snapshot);
+          const trigger = buildTrendEntryTrigger(snapshot, pred, driftStrength);
+          transition("TREND", trigger, nowMs);
+          return buildContext("TREND", internalState.enteredAtMs, pred);
+        }
+      }
+
+      if (state === "TREND") {
+        // Check for EXTREME escalation first (already handled above for any state)
+        if (shouldExitTrend(snapshot, pred)) {
+          transition("NORMAL", "trend_exit: drift_strength and p_break both cleared", nowMs);
+          return buildContext("NORMAL", internalState.enteredAtMs, pred);
+        }
+      }
+
+      if (state === "EXTREME") {
+        // volRecovered: checked conservatively — if no external signal and
+        // p-sum is low and dwell elapsed, we treat vol as recovered unless
+        // the external signal explicitly says otherwise.
+        // The risk module can inject `extremeSignal.active = true` to block exit.
+        const volRecovered =
+          !extremeSignal?.active &&
+          pred.pAbove + pred.pBelow <= 0.7 * (1 + 0.07); // 7% hysteresis margin
+
+        if (
+          shouldExitExtreme(
+            pred,
+            extremeSignal,
+            volRecovered,
+            enteredAtMs,
+            nowMs,
+          )
+        ) {
+          // Return to previous state if known, otherwise NORMAL
+          const returnState: MarketState =
+            internalState.prevState !== null && internalState.prevState !== "EXTREME"
+              ? internalState.prevState
+              : "NORMAL";
+          transition(
+            returnState,
+            "extreme_exit: all conditions cleared + stability + vol_recovery",
+            nowMs,
+          );
+          return buildContext(returnState, internalState.enteredAtMs, pred);
+        }
+      }
+    }
+
+    // No transition — return the context for the current state
+    return buildContext(state, enteredAtMs, pred);
+  }
+
+  function current(): StateContext {
+    // Build a minimal context without a prediction (uses zero-defaults).
+    // Callers that need an accurate context should call advance() first.
+    return {
+      state: internalState.state,
+      enteredAtMs: internalState.enteredAtMs,
+      evalIntervalMs: EVAL_INTERVAL_MS[internalState.state],
+      halfWidth: 2,           // minimum; real value requires widthSigma
+      trendBias: 0,
+      lendingPct: internalState.state === "EXTREME" ? 1.0
+                : internalState.state === "TREND"   ? 0.50
+                : 0.35,
+      toleranceBins: 1,
+      minDwellMs: MIN_DWELL_MS[internalState.state],
+    };
+  }
+
+  return { advance, current };
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+function buildTrendEntryTrigger(
+  snapshot: MarketSnapshot,
+  pred: PredictionResponse,
+  driftStrength: number,
+): string {
+  const parts: string[] = [];
+  if (driftStrength > 2.0) {
+    parts.push(`drift_strength=${driftStrength.toFixed(4)}>2.0`);
+  }
+  const pBreak = Math.max(pred.pAbove, pred.pBelow);
+  if (pBreak > 0.6) {
+    parts.push(`p_break=${pBreak.toFixed(4)}>0.6`);
+  }
+  if (parts.length === 0) {
+    parts.push(`drift_strength=${driftStrength.toFixed(4)}`);
+  }
+  return `trend_entry: ${parts.join(", ")}`;
+}

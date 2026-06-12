@@ -45,6 +45,10 @@ export interface Strategy {
    * Given a PM snapshot + pool state + price observations, decide what to do.
    * v0 strategies should return a `StrategyOutput`. `null` is no longer
    * accepted; emit `{ kind: "quiet" }` instead.
+   *
+   * The signature is async so that v1 mlAgent can await the prediction sidecar
+   * without needing a synchronous cache layer. v0 rule-based strategies
+   * implement this with `async plan(...)` and bodies that remain synchronous.
    */
-  plan(input: StrategyInput): StrategyOutput;
+  plan(input: StrategyInput): Promise<StrategyOutput>;
 }

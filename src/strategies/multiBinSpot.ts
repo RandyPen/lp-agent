@@ -128,7 +128,7 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
   return {
     name: "multiBinSpot",
 
-    plan(input: StrategyInput): StrategyOutput {
+    async plan(input: StrategyInput): Promise<StrategyOutput> {
       const { pm, pool, spot, history, profile } = input;
 
       // Nothing to do when there is no capital and no position.

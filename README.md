@@ -1,12 +1,12 @@
 # LiquidityManager
 
-> Sui DLMM 自动调仓 agent 模板:算法化重置仓位、闲置资产存借贷协议获利、用户充值与按次扣费。Bun + TypeScript + SQLite,~7K LOC,160 tests。
+> Sui DLMM 量化流动性托管 agent(开源):算法化重置仓位、闲置资产存借贷协议获利、用户充值与按次扣费。Bun + TypeScript + SQLite,~16K LOC,572 bun tests + 100 pytest tests。
 
-**这是一个模板**,不是即开即用的产品。带着自己的策略、自己的池子、自己的智能层接进来 — 模板提供链路、扩展点和参考实现。
+**v1 已落地**(`docs/implementation-plan-v1.md`):ML 预测管线在 tree 里——Python 训练 + 推理 sidecar(`ml/`,uv 管理)、`mlAgent` 策略、三态状态机(`src/state`)、分层熔断风控(`src/risk`)、影子模式(`src/services/shadowRunner`)。**仓库交付管线与框架,不交付训练好的模型**(模型产物不入库,fork 用同一条管线自己训练)。带着自己的策略、自己的池子、自己的模型接进来。
 
 ## 它能做什么
 
-- **算法调节仓位** — 三种内置策略(`singleBin` / `multiBinSpot` / `emaTrend`),概率分布 + 趋势偏侧两种范式,原子单 PTB 提交
+- **算法调节仓位** — 四种内置策略(`singleBin` / `multiBinSpot` / `emaTrend` / `mlAgent`),概率分布、趋势偏侧、ML 预测驱动三种范式,原子单 PTB 提交;`mlAgent` 在 sidecar 不可用时显式降级到 Tier 0 规则策略
 - **闲置资产借贷** — Scallop + Kai SAV 集成,APY-aware router (Scallop tie-break 25 bps),per-coin dust 阈值
 - **多源价格 feed** — 链上 Cetus SwapEvent 与 Binance REST 两路实现,统一 `PriceFeed` 接口 + 共享 `price_observations` 历史表
 - **PM 自动发现** — 用 `MNEMONICS` 派生 agent 地址 → 监听链上 `AgentAdded` → 自动加入监控库;`AgentRemoved` / `PositionManagerClosed` → 自动从监控库删除
@@ -15,7 +15,8 @@
 
 ## 它**不**做什么(故意留给二次开发者)
 
-- ❌ 没有 LLM 信号层 / 新闻摄取 / σ-jump 智能 — 这些是 alpha,你带自己的
+- ❌ 不交付训练好的模型 — ML 管线在 tree 里(v1,`ml/`),模型产物(alpha)你自己训练
+- ❌ 没有 LLM 信号层 / 新闻摄取 — 将来经 `PredictionProvider` 装饰器或 sidecar 内部接入,不改框架
 - ❌ 没有跨链(只 Sui 主网)
 - ❌ 没有 HTTP API(只 SQLite + CLI scripts;v2 加 HTTP)
 - ❌ 没有用户主动退款(运营手工 sweep)
@@ -33,12 +34,15 @@ cp .env.example .env                     # 编辑填密钥
                                          #   - EXPECTED_AGENT_ADDRESS(防止换错助记词)
                                          #   - SUI_USDC_POOL_ID(mainnet 池 id)
                                          # 没填会在启动时一次性列出所有缺失字段
+                                         # ML / 风控相关的新 env(sidecar URL、
+                                         # shadow mode、risk 阈值)见 .env.example 注释
 
 # 3. 验证密钥派生
 bun run scripts/verify-agent-address.ts  # ✅ 应该 match
 
 # 4. 静态完整性
-bun run typecheck && bun test            # 应该 160 pass
+bun run typecheck && bun test            # 应该 572 pass
+cd ml && uv sync && uv run pytest        # (可选)ML 管线 ~100 pass
 
 # 5. 跑起来
 bun start
@@ -46,7 +50,7 @@ bun start
 
 ## 扩展点(模板的核心价值)
 
-模板已经划好的 4 个清晰扩展点 — 每个都有现成的接口,加一行注册或一个文件就能用:
+模板已经划好的 5 个清晰扩展点 — 每个都有现成的接口,加一行注册或一个文件就能用:
 
 ### 1. 加新策略 (strategy)
 
@@ -57,7 +61,7 @@ import type { Strategy } from "./types.ts";
 export function createMyStrategy(): Strategy {
   return {
     name: "myStrategy",
-    plan(input) {
+    async plan(input) {
       // 返回 { kind: "plan_and_reconcile", plan } | { kind: "quiet" } | ...
     },
   };
@@ -89,6 +93,19 @@ export function buildEthUsdcProfile(): PoolProfile { /* ... */ }
 
 不改代码、不改 schema、不重启 service。详见 `docs/module-and-testing.md` Module 2。
 
+### 5. 换预测模型 (prediction provider)
+
+```ts
+// src/prediction/provider.ts — fork 替换模型的唯一接口
+export interface PredictionProvider {
+  readonly name: string;
+  predict(snapshot, ctx): Promise<PredictionResponse>;
+  health(): Promise<ProviderHealth>;
+}
+```
+
+实现 `PredictionProvider`,换你自己的 sidecar / 远端服务 / 本地实现 — 框架不动。参考 `src/prediction/sidecarProvider.ts`(HTTP → Python sidecar)与 `nullProvider.ts`(规则兜底)。训练管线在 `ml/`(uv 管理,LightGBM quantile),fork 用 `bun run scripts/collect-historical.ts` 重建训练集自己训练。
+
 ## 你需要带进来的
 
 | 你想加 | 模板提供 | 你要做 |
@@ -111,14 +128,21 @@ src/
 │   ├── keypairs/             # 多角色密钥(agent + treasury)
 │   ├── cdpm/                 # CDPM PTB 构造器(unified + legacy)
 │   └── lending/              # 借贷整合(Scallop + Kai + router + math + config)
-├── data/                     # 价格 feed
+├── data/                     # 价格 / 市场数据 feed(onchain / binance / binanceMulti / derivatives / cetusEvents)+ marketAggregator
 ├── forecast/                 # σ 估计 (volatility.ts: EWMA/Parkinson/GK) + bin 权重映射
-├── strategies/               # 策略实现 + registry
+├── prediction/               # PredictionProvider 接口 + sidecar / null 实现
+├── state/                    # 三态状态机(NORMAL / TREND / EXTREME)
+├── risk/                     # 分层熔断(L1/L2/L3)+ monitor + PnL attribution
+├── decision/                 # diff planner / inventory / age stop-loss
+├── strategies/               # 策略实现 + registry(含 mlAgent)
 ├── treasury/                 # 用户充值 + credit ledger + watcher + charges
-├── services/                 # 编排层(rebalancer / executor / subscriptions / treasuryService)
+├── services/                 # 编排层(rebalancer / executor / subscriptions / treasuryService / shadowRunner)
 ├── db/                       # SQLite 单文件 schema (CREATE IF NOT EXISTS,无 migration)
 ├── lib/                      # 工具:logger / locks / errors
 └── backtest/                 # 离线策略回放工具
+
+ml/                           # Python 管线(uv 管理):data / features / training / serving / backtest / tests
+                              # 模型产物 ml/artifacts/ 不入库;uv.lock 入库保证可复现
 ```
 
 ## 详细文档
@@ -137,17 +161,16 @@ src/
 - **`EXPECTED_AGENT_ADDRESS` 是必填字段**(在 `.env` 没设或格式错误,`loadConfig` 会一次性列出所有缺失项再退出)
 - **TOFU 身份文件**(`./data/agent.identity.json` / `./data/treasury.identity.json`)首次运行写入,后续启动自动比对 — 助记词被换会立即 fail-fast;主动轮换时 `rm ./data/*.identity.json` 重启
 
-## `.gitignore` 量子坑
+## `.gitignore` 说明
 
-仓库的 `.gitignore` 故意把 `*.md`, `/scripts`, `/tests` 全忽略 — 历史原因。**模板用户克隆后注意**:
-
-- `README.md` 要用 `git add -f README.md` 才进新仓
-- `docs/*.md` 同上(详细文档要 `-f` 才能跟踪)
-- `tests/` 和 `scripts/` 整目录被 ignore — fork 模板后请按需调整 `.gitignore` 把它们加回 git
+- `tests/`、`docs/`、根目录 markdown 都已入库;只有 `项目.md`(内部中文笔记)保持本地。
+- `scripts/` 默认忽略,白名单放行可复用脚本:`verify-agent-address.ts`、`verify-treasury-address.ts`、`collect-historical.ts`、`backfill-cetus-events.ts`、`verify-data-coverage.ts`。操作者本机脚本(bootstrap、treasury 运维)不入库。
+- `ml/artifacts/`(模型产物)、`ml/data/parquet/`、`ml/reports/` 不入库;`ml/uv.lock` 入库保证训练环境可复现。
+- `/data/`(SQLite)、`.env`、`.env.local` 永不入库。
 
 ## 许可证
 
-`LICENSE` 是占位文件,**在公开 fork 前请敲定真实许可证**(MIT / Apache-2.0 / GPL 等)。
+Apache-2.0,见 `LICENSE`。
 
 ## 致谢
 

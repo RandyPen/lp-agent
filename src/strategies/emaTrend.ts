@@ -116,7 +116,7 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
   return {
     name: "emaTrend",
 
-    plan(input: StrategyInput): StrategyOutput {
+    async plan(input: StrategyInput): Promise<StrategyOutput> {
       const { pm, pool, history } = input;
 
       const hasBalance = pm.balance.a > 0n || pm.balance.b > 0n;

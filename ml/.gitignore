@@ -1,0 +1,10 @@
+# Model artifacts are never committed — forks train their own (plan §2.1).
+artifacts/
+# Raw market data (parquet) is rebuilt via the collectors.
+data/parquet/
+# Walk-forward / economics reports are run outputs.
+reports/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

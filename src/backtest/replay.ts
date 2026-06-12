@@ -150,7 +150,7 @@ function applyPlan(pm: PMState, pool: PoolState, plan: RebalancePlan): PMState {
   };
 }
 
-export function runBacktest(input: BacktestInput): BacktestResult {
+export async function runBacktest(input: BacktestInput): Promise<BacktestResult> {
   if (!isStrategyName(input.strategyName)) {
     throw new Error(`unknown strategy: ${input.strategyName}`);
   }
@@ -171,7 +171,7 @@ export function runBacktest(input: BacktestInput): BacktestResult {
     const pool = buildPool(input.profile, obs);
     const history = historyFor(input.observations, i, input.historyWindowMs);
 
-    const output = strategy.plan({
+    const output = await strategy.plan({
       pm,
       pool,
       spot: obs,
@@ -218,19 +218,19 @@ export function runBacktest(input: BacktestInput): BacktestResult {
  * and call the strategy once. Returns the strategy output without mutating
  * any persistent state.
  */
-export function singleTick(args: {
+export async function singleTick(args: {
   profile: PoolProfile;
   strategyName: string;
   pm: PMState;
   observation: PriceObservation;
   history: PriceObservation[];
-}): { output: StrategyOutput; pool: PoolState } {
+}): Promise<{ output: StrategyOutput; pool: PoolState }> {
   if (!isStrategyName(args.strategyName)) {
     throw new Error(`singleTick: unknown strategy '${args.strategyName}'`);
   }
   const strategy = buildStrategy(args.strategyName);
   const pool = buildPool(args.profile, args.observation);
-  const output = strategy.plan({
+  const output = await strategy.plan({
     pm: args.pm,
     pool,
     spot: args.observation,

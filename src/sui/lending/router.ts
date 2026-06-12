@@ -33,11 +33,21 @@ import type {
  *   - `shortfall`: amount of each coin the *next* bin op will need beyond
  *      what's left in `pm.balance` after `minIdleBuffer`. 0n when unknown —
  *      the router will then only consider supply / switch.
+ *   - `stateBias` (optional): when provided, supply decisions cap the
+ *      supplyable amount at `Math.floor(idle * stateBias.targetLendingPct)`.
+ *      Used by mlAgent to respect the state machine's `lendingPct` parameter.
+ *      Only applies to SUPPLY decisions; redeem decisions are unaffected.
  */
 export interface RouterInput {
   pm: PMState;
   profile: PoolProfile;
   shortfall: { a: bigint; b: bigint };
+  /**
+   * Optional state-machine bias. When set, supply decisions are capped at
+   * `floor(idle * targetLendingPct)` so that the router honours the three-state
+   * machine's target lending fraction rather than supplying all idle balance.
+   */
+  stateBias?: { targetLendingPct: number };
 }
 
 export interface RouterOutput {
@@ -69,6 +79,7 @@ export async function decide(input: RouterInput): Promise<RouterOutput> {
       shortfall: side.shortfall,
       policy,
       pm: input.pm,
+      stateBias: input.stateBias,
     });
     if (decision.kind !== "noop") {
       decisions.push(decision);
@@ -92,6 +103,7 @@ interface DecideForCoinArgs {
     apySwitchDeltaBps: number;
   };
   pm: PMState;
+  stateBias?: { targetLendingPct: number };
 }
 
 async function decideForCoin(args: DecideForCoinArgs): Promise<LendingDecision> {
@@ -151,7 +163,15 @@ async function decideForCoin(args: DecideForCoinArgs): Promise<LendingDecision> 
   }
 
   // 2) Supply when idle balance is significantly above the minimum buffer.
-  const supplyable = idle > policy.minIdleBuffer ? idle - policy.minIdleBuffer : 0n;
+  //    When stateBias is provided, cap supplyable at floor(idle * targetLendingPct)
+  //    so the router honours the state machine's target lending fraction.
+  let supplyable = idle > policy.minIdleBuffer ? idle - policy.minIdleBuffer : 0n;
+  if (args.stateBias !== undefined && args.stateBias.targetLendingPct >= 0) {
+    const biasedCap = BigInt(Math.floor(Number(idle) * args.stateBias.targetLendingPct));
+    if (biasedCap < supplyable) {
+      supplyable = biasedCap;
+    }
+  }
 
   // Dust filter (mirrors cdpm_web LENDING_OPPORTUNITIES + MIN_LENDING_DELTA_RAW):
   // even if `supplyable >= policy.supplyThreshold`, skip when below the

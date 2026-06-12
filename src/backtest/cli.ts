@@ -134,7 +134,7 @@ function formatDate(ms: number): string {
   return ms ? new Date(ms).toISOString() : "—";
 }
 
-function printSummary(summary: ReturnType<typeof runBacktest>["summary"]): void {
+function printSummary(summary: import("./types.ts").BacktestSummary): void {
   console.log("");
   console.log(`Backtest summary`);
   console.log(`  pool:               ${summary.poolName}`);
@@ -183,7 +183,7 @@ async function main(): Promise<void> {
     `Loaded ${observations.length} observations from ${formatDate(observations[0]!.timestampMs)} to ${formatDate(observations[observations.length - 1]!.timestampMs)}`,
   );
 
-  const result = runBacktest({
+  const result = await runBacktest({
     profile,
     strategyName: args.strategy,
     observations,

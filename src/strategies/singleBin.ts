@@ -8,7 +8,7 @@ export function createSingleBinStrategy(): Strategy {
   return {
     name: "singleBin",
 
-    plan({ pm, pool }: StrategyInput): StrategyOutput {
+    async plan({ pm, pool }: StrategyInput): Promise<StrategyOutput> {
       const hasBalance = pm.balance.a > 0n || pm.balance.b > 0n;
       const hasPosition = pm.positionBins.length > 0;
       const hasFees = pm.feeBag.a > 0n || pm.feeBag.b > 0n;

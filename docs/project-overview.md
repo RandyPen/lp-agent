@@ -1,9 +1,16 @@
 # LiquidityManager — Project Overview
 
 > Companion to `module-and-testing.md`, `treasury-role-design.md`, and `forecasting-approach.md`.
-> Last updated: 2026-05-24. ~7 kLOC TypeScript/Bun + SQLite. 160 tests across 13 files, typecheck clean.
+> Last updated: 2026-06-11 (v1 rewrite landed). ~16 kLOC TypeScript/Bun + SQLite, plus the `ml/` Python pipeline (uv-managed). 572 bun tests across 31 files + 100 pytest tests, typecheck clean.
 
 This document answers four questions: what this project is, what's actually built, what's intentionally left out (so forks know where to extend), and what's still on the punch list before this template is mainnet-validated.
+
+> **Positioning update (2026-06-11):** the project pivoted from "bare template, alpha
+> deferred to forks" to an **open-source quantitative liquidity-custody agent** — the v1 plan
+> (`docs/implementation-plan-v1.md`) has **landed**: an in-tree ML pipeline (Python sidecar
+> behind a `PredictionProvider` interface), the `mlAgent` strategy, a three-state machine,
+> layered risk controls, and a shadow-mode runner. Trained model artifacts stay out of git;
+> the repo ships the pipeline, not the alpha. See §3 "v1 modules" for the new modules.
 
 ---
 
@@ -33,7 +40,7 @@ The agent loop:
     7. record outcome in SQLite + emit JSON log lines
 ```
 
-The template ships **three strategies** (`singleBin`, `multiBinSpot`, `emaTrend`), **two price feeds** (`onchain`, `binance`), and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, post-v1 Treasury features, and the v2 per-user Seal encrypted-research-report layer — see §4.
+The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `mlAgent`), **multiple market-data feeds** (`onchain`, `binance`, plus the v1 `binanceMulti` / `derivatives` / `cetusEvents` feeds behind `marketAggregator`), and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, prediction providers (`PredictionProvider`), post-v1 Treasury features, and the v2 per-user Seal encrypted-research-report layer — see §4.
 
 ---
 
@@ -76,26 +83,29 @@ The template ships **three strategies** (`singleBin`, `multiBinSpot`, `emaTrend`
 - Core: `subscriptions`, `event_cursor`, `rebalances`, `price_observations`, `position_state`
 - Lending: `lending_positions`, `lending_actions`
 - Treasury: `treasury_users`, `treasury_credit_rates`, `treasury_address_balances`, `treasury_deposits`, `treasury_service_charges`, `treasury_ops`
+- ML / risk (v1): `predictions`, `market_state_history`, `risk_events`, `shadow_decisions`
 
-**Toolchain commitment:** single Bun/TS process. No background services, no Rust components, no Python notebooks in the runtime path.
+**Toolchain commitment:** one Bun/TS process plus one optional uv-managed Python sidecar (`ml/serving`, consumed only via HTTP behind `PredictionProvider`; the agent degrades to Tier 0 rule strategies when it is down). No Rust components, no notebooks in the runtime path.
 
 ---
 
 ## 3. What's actually built
 
 ### Strategy & rebalancing
-- Three registered strategies (`src/strategies/registry.ts`):
+- Four registered strategies (`src/strategies/registry.ts`; `Strategy.plan` is async as of v1):
   - `singleBin` — P0 baseline: all liquidity in the active bin, re-centre on drift.
   - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights.
   - `emaTrend` — dual-EMA (12/26) trend classifier; tent-shaped weights, range center offset by ±halfWidth/2 toward trend side, ×1.5 skew on the trend side.
+  - `mlAgent` — v1 main strategy: consumes `PredictionProvider` output (quantile-derived center/width/probabilities) + the three-state machine's parameters; explicit Tier 0 fallback to rule strategies when the sidecar is unavailable (built via `buildStrategy("mlAgent", mlDeps)`).
 - `StrategyOutput` 4-state union (`plan_and_reconcile | plan_only | reconcile_only | quiet`).
 - `fillBoundary` persistence in `position_state` (table exists; only consumed by future bid-ask-style strategies — v0 strategies don't write it).
 - **Unified rebalance PTB** behind `UNIFIED_TX=true` flag — atomic DLMM ops, single gas envelope. I32 → u32 two's-complement bit serialisation handled correctly in both legacy and unified paths.
 
-### Price feeds (two implementations)
+### Price feeds
 - `src/data/feeds/onchain.ts` — Cetus DLMM `SwapEvent` poll, derives spot + history + OHLCV. Default.
 - `src/data/feeds/binance.ts` — Public Binance REST (`/api/v3/ticker/price` + `/api/v3/klines`); CEX side-channel for fuller history and cross-source detrending. Switch via `PRICE_FEED=binance` + `BINANCE_SYMBOL=SUIUSDC`.
 - Both write to the shared `price_observations` table (`source` column distinguishes), so `getOhlcv` from either is composable.
+- v1 adds richer market-data feeds feeding the ML snapshot (not the `PriceFeed` interface): `binanceMulti.ts` (multi-stream klines/trades), `derivatives.ts` (funding / OI), `cetusEvents.ts` (pool swap-event collector), composed by `src/data/marketAggregator.ts` into the `MarketSnapshot` consumed by `mlAgent` / shadow mode.
 
 ### Forecast layer
 - EWMA / Parkinson / Garman-Klass σ estimators with sqrt-time scaling (`src/forecast/volatility.ts`). All closed-form; no training. Upgrade path to GARCH-MLE / LightGBM-quantile / LSTM documented in `forecasting-approach.md` §"Upgrading to a learned model".
@@ -124,7 +134,15 @@ The template ships **three strategies** (`singleBin`, `multiBinSpot`, `emaTrend`
 
 ### Backtest harness
 - `bun run backtest --strategy=… --from=… --to=…` reads `price_observations`, replays through any registered strategy, prints a summary grouped by `StrategyOutput` kind.
-- Decision log only — no fee/IL/gas accounting yet.
+- Decision log only — no fee/IL/gas accounting yet (the `ml/backtest` L1 runner covers fee-aware evaluation on the Python side).
+
+### v1 modules (landed per `implementation-plan-v1.md`)
+- **Prediction layer** (`src/prediction/`) — `PredictionProvider` interface (`provider.ts`), `SidecarPredictionProvider` (HTTP POST to the local Python sidecar, bounded timeout, explicit `fallback` marking — never throws into the tick), `NullPredictionProvider` (closed-form log-normal; final fallback semantics reference).
+- **Three-state machine** (`src/state/`) — `NORMAL` / `TREND` / `EXTREME` with continuous width/bias parameters (`params.ts`), hysteresis + minimum-dwell transitions (`transitions.ts`), history persisted to `market_state_history`.
+- **Risk controls** (`src/risk/`) — layered L1/L2/L3 circuits (`circuits.ts`), pre-tick monitor (`monitor.ts`), emergency handling (`emergency.ts`), PnL attribution (`pnlAttribution.ts`); events persisted to `risk_events`.
+- **Decision helpers** (`src/decision/`) — diff planner (minimal bin moves), inventory tracking, age-based stop-loss.
+- **Shadow mode** (`src/services/shadowRunner.ts`) — runs the full decision path without submitting PTBs; decisions land in `shadow_decisions` for calibration.
+- **ML pipeline** (`ml/`, uv-managed Python) — `data/` collectors + parquet store, `features/` (shared by training and serving), `training/` (LightGBM quantile q10/q50/q90 + vol, walk-forward, `models_meta.json` with data window + seed + git sha), `serving/` (FastAPI sidecar), `backtest/` (fee model + L1 runner), 100 pytest tests. Artifacts (`ml/artifacts/`) never committed — forks rebuild the dataset via `scripts/collect-historical.ts` / `scripts/backfill-cetus-events.ts` and train their own.
 
 ---
 
@@ -134,7 +152,7 @@ The template is intentionally small. Pieces that were prototyped and then remove
 
 - **News / LLM σ-jump layer.** An earlier branch shipped Anthropic Haiku-driven news extraction that bumped σ via a `news_events` table. Removed. Forks that want this re-introduce `src/news/` + a `JumpSource` that the strategy can consume via `StrategyInput`.
 - **Strategic Brief / macro meta-controller.** A 12h Sonnet-produced "regime" signal that biased bin placement. Removed as out-of-scope for a template; if you want it, build it as a separate service that writes into a side table the strategy reads.
-- **Quantile / LightGBM forecasting.** The skeleton tree-walker was removed; today's σ is purely statistical (EWMA / Parkinson / GK). Forks that want quantile regression train a model offline (Rust / Python) and add a `forecast/quantile/` module behind a strategy flag.
+- **Quantile / LightGBM forecasting.** **→ Superseded: now in-tree** as a Python training + inference sidecar (`ml/`) consumed through `src/prediction/provider.ts → PredictionProvider`; see §3 "v1 modules", `implementation-plan-v1.md` and `prediction-service-design.md`. Rule strategies stay as Tier 0 fallback; the rule-based σ layer (EWMA / Parkinson / GK) remains in `src/forecast/`.
 - **Skeleton strategies (`curve`, `bidAsk`, `onlyBid`, `onlySell`).** The registry shipped four stub-quiet placeholders; they've been removed. Add new strategies through `src/strategies/registry.ts` — a one-line registration.
 - **HTTP API for Treasury.** v1 charges are in-process. Forks that want client-facing top-up + signed-message charging add an HTTP layer (Bun.serve) + ALTER TABLE `treasury_service_charges` ADD `signature`, `message_b64`.
 - **Cetus-aggregator sweep.** Operator scripts include `treasury-list-balances` and `treasury-update-rate`, but no auto-swap to a single consolidation asset. The `treasury_ops` table is shaped for this (op_kind `swap`).
@@ -209,7 +227,7 @@ The agent mnemonic lives in `.env` as `AGENT_MNEMONICS` (or legacy `MNEMONICS`);
 ### Env (agent role)
 - **Required (one of)**: `AGENT_MNEMONICS` (or `MNEMONICS`) + optional `AGENT_DERIVATION_PATH` (default `m/44'/784'/1'/0'/0'`); or `AGENT_PRIVATE_KEY` (`suiprivkey1…` bech32, takes precedence).
 - **Required**: `EXPECTED_AGENT_ADDRESS` (64-hex Sui address). `loadConfig` collects every missing / malformed env field into one error.
-- **Optional**: `AGENT_IDENTITY_FILE` (override TOFU file path), `IDENTITY_FILES_DISABLED=true` (disable TOFU), `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot|emaTrend`, `PRICE_FEED=onchain|binance`, `BINANCE_SYMBOL=SUIUSDC`.
+- **Optional**: `AGENT_IDENTITY_FILE` (override TOFU file path), `IDENTITY_FILES_DISABLED=true` (disable TOFU), `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot|emaTrend|mlAgent`, `PRICE_FEED=onchain|binance`, `BINANCE_SYMBOL=SUIUSDC`; ML/risk knobs (sidecar URL, timeout, shadow mode, risk thresholds) documented in `.env.example`.
 
 ### Env (treasury role — when `TREASURY_ENABLED=true`)
 - `TREASURY_MNEMONICS` (or `TREASURY_PRIVATE_KEY`), `TREASURY_MASTER_DERIVATION_PATH`, `TREASURY_USER_BASE_PATH`, `EXPECTED_TREASURY_MASTER_ADDRESS` (optional but format-checked when set), `TREASURY_IDENTITY_FILE` (TOFU file path override).

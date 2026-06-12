@@ -196,3 +196,95 @@ CREATE TABLE IF NOT EXISTS treasury_ops (
   initiated_by     TEXT NOT NULL,
   created_at_ms    INTEGER NOT NULL
 );
+
+------------------------------------------------------------------------------
+-- ML 预测 + 状态机 + 风控事件(v1 — §6)
+--
+-- 键形状说明:predictions / market_state_history 按 pool_id 键(预测与状态是
+-- 池级别事实,多 PM 同池不重复落行)。risk_events 加 pm_id(熔断可能针对单个 PM)。
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS predictions (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool_id         TEXT NOT NULL,
+  ts_ms           INTEGER NOT NULL,
+  model_version   TEXT NOT NULL,
+  active_bin      INTEGER NOT NULL,
+  center_q10      REAL NOT NULL,
+  center_q50      REAL NOT NULL,
+  center_q90      REAL NOT NULL,
+  width_sigma     REAL NOT NULL,
+  p_above         REAL NOT NULL,
+  p_below         REAL NOT NULL,
+  feature_completeness REAL NOT NULL,
+  psi             REAL NOT NULL,
+  fallback        TEXT,
+  infer_ms        INTEGER NOT NULL,
+  snapshot_digest TEXT              -- 6 个关键字段的压缩摘要;完整特征行落 parquet,不进 SQLite
+);
+CREATE INDEX IF NOT EXISTS predictions_pool_ts ON predictions(pool_id, ts_ms DESC);
+
+CREATE TABLE IF NOT EXISTS market_state_history (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool_id         TEXT NOT NULL,
+  entered_at_ms   INTEGER NOT NULL,
+  exited_at_ms    INTEGER,
+  state           TEXT NOT NULL CHECK(state IN ('NORMAL','TREND','EXTREME')),
+  trigger         TEXT NOT NULL,
+  prev_state      TEXT
+);
+CREATE INDEX IF NOT EXISTS state_pool_entered
+  ON market_state_history(pool_id, entered_at_ms DESC);
+
+CREATE TABLE IF NOT EXISTS risk_events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool_id         TEXT,
+  pm_id           TEXT,              -- 可空:池级事件无 pm
+  ts_ms           INTEGER NOT NULL,
+  level           TEXT NOT NULL CHECK(level IN ('L1','L2','L3')),
+  kind            TEXT NOT NULL,
+  metric          TEXT NOT NULL,
+  threshold       REAL NOT NULL,
+  observed        REAL NOT NULL,
+  action          TEXT NOT NULL,
+  resolved_at_ms  INTEGER
+);
+CREATE INDEX IF NOT EXISTS risk_events_ts ON risk_events(ts_ms DESC);
+
+------------------------------------------------------------------------------
+-- Shadow mode decisions (v1 ML validation — see src/services/shadowRunner.ts)
+--
+-- Records what mlAgent WOULD have done without executing it. Enables 14-day
+-- side-by-side comparison of the ML strategy vs the live rule-based strategy.
+--
+-- `strategy_output_json`: the full StrategyOutput serialised (kind + plan if
+--   applicable + fillBoundary). RebalancePlan.removeShares is stored as a
+--   plain object (string keys).
+-- `rule_output_json`: the fallback strategy's output for the same tick, used
+--   as the comparison baseline in shadow reports.
+-- `state`: the StateContext at the time of the shadow decision.
+-- `prediction_id`: FK to predictions (nullable — populated when the inference
+--   was persisted in the same tick).
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS shadow_decisions (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool_id               TEXT NOT NULL,
+  pm_id                 TEXT NOT NULL,
+  ts_ms                 INTEGER NOT NULL,
+  market_state          TEXT NOT NULL CHECK(market_state IN ('NORMAL','TREND','EXTREME')),
+  strategy_output_kind  TEXT NOT NULL CHECK(strategy_output_kind IN ('plan_and_reconcile','plan_only','reconcile_only','quiet')),
+  strategy_output_json  TEXT NOT NULL,
+  rule_output_kind      TEXT,
+  rule_output_json      TEXT,
+  lending_pct           REAL,
+  half_width            INTEGER,
+  trend_bias            REAL,
+  model_version         TEXT,
+  prediction_id         INTEGER REFERENCES predictions(id),
+  created_at_ms         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS shadow_decisions_pool_ts
+  ON shadow_decisions(pool_id, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS shadow_decisions_pm_ts
+  ON shadow_decisions(pm_id, ts_ms DESC);

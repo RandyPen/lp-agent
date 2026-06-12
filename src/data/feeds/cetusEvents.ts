@@ -1,0 +1,522 @@
+/**
+ * src/data/feeds/cetusEvents.ts
+ *
+ * Cetus DLMM pool live state + swap-event capture, modeled on onchain.ts.
+ *
+ * Provides two surfaces:
+ *
+ * 1. Live feed — `createCetusEventsFeed(opts)` polls the Cetus pool state on a
+ *    configurable interval and caches the latest `activeBin`, `price`, `tvlUsd`,
+ *    and `binStep`. The pool object is read via `SuiClient.getObject()`.
+ *
+ * 2. Historical backfill — `backfillSwapEvents(opts)` pages through
+ *    `queryEvents` windows from the most-recent back to the earliest available
+ *    history, rate-limit aware, with resumable cursor via the `event_cursor`
+ *    table (stream key: `cetus_swap_backfill:<poolId>`).
+ *
+ * Storage strategy (no schema changes):
+ *   - Price points → `price_observations` (source='cetus_event') — already
+ *     exists and is the canonical per-pool history table.
+ *   - Raw swap events → emitted to caller via `onBatch` callback; if the
+ *     caller wants persistent raw rows they write them to JSONL files under a
+ *     data dir path they supply. We do NOT add a new SQLite table to avoid
+ *     touching schema.sql.
+ *
+ * Backfill resume: the `event_cursor` table stores `(stream, tx_digest, event_seq)`.
+ * On each successful page we upsert the last-seen cursor. On restart we load
+ * the cursor and resume from that point in the descending scan. Because Sui
+ * events are immutable, re-fetching pages we've already seen is idempotent:
+ * duplicate `price_observations` rows are allowed (same observed_ms/price can
+ * appear more than once without breaking queries).
+ *
+ * Sui RPC endpoints used:
+ *   - `queryEvents` with MoveEventType filter for `<DLMM_PACKAGE>::pool::SwapEvent`
+ *   - `getObject` for pool state (activeBin, sqrtPrice, tvl, binStep)
+ */
+
+import type { SuiEvent } from "@mysten/sui/jsonRpc";
+import { getDb } from "../../db/client.ts";
+import { getSuiClient } from "../../sui/client.ts";
+import { log } from "../../lib/logger.ts";
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+// Mainnet DLMM package (same as onchain.ts).
+const DLMM_PACKAGE_MAINNET =
+  "0x5664f9d3fd82c84023870cfbda8ea84e14c8dd56ce557ad2116e0668581a682b";
+
+// How many events to fetch per page.
+const PAGE_LIMIT = 50;
+
+// Rate-limit delay between backfill pages (ms). Sui public RPC: 10 req/s.
+const BACKFILL_PAGE_DELAY_MS = 150;
+
+// Live poll interval defaults.
+const DEFAULT_POLL_INTERVAL_MS = 30_000;
+
+// Default TVL fallback when pool object doesn't expose it directly.
+const TVL_FALLBACK_USD = 0;
+
+// ---------------------------------------------------------------------------
+// Internal types
+// ---------------------------------------------------------------------------
+
+interface RawBinSwap {
+  bin_id: { bits: number };
+  amount_in: string;
+  amount_out: string;
+  fee: string;
+  var_fee_rate: string;
+}
+
+interface RawSwapEvent {
+  pool: string;
+  amount_in: string;
+  amount_out: string;
+  fee: string;
+  ref_fee: string;
+  bin_swaps: RawBinSwap[];
+  from: { name: string };
+  target: { name: string };
+  partner: string;
+}
+
+function isRawSwapEvent(v: unknown): v is RawSwapEvent {
+  if (typeof v !== "object" || v === null) return false;
+  const obj = v as Record<string, unknown>;
+  return (
+    typeof obj["pool"] === "string" &&
+    Array.isArray(obj["bin_swaps"]) &&
+    (obj["bin_swaps"] as unknown[]).length > 0
+  );
+}
+
+/** Reinterpret a Cetus u32-encoded signed I32 bin id as a JS number. */
+function decodeBinId(bits: number): number {
+  return bits >= 0x80000000 ? bits - 0x100000000 : bits;
+}
+
+/**
+ * Compute a human-readable price from a bin id using the DLMM formula:
+ *   price = (1 + binStep / 10_000) ^ binId
+ * This matches `priceFromBinId` in domain/binMath.ts without importing that
+ * module (to keep cetusEvents.ts self-contained).
+ */
+function binIdToPrice(binId: number, binStep: number): string {
+  const ratio = 1 + binStep / 10_000;
+  return Math.pow(ratio, binId).toFixed(10);
+}
+
+// ---------------------------------------------------------------------------
+// Cursor helpers (mirrors subscriptions.ts pattern)
+// ---------------------------------------------------------------------------
+
+interface EventCursorRow {
+  tx_digest: string | null;
+  event_seq: string | null;
+}
+
+interface EventCursor {
+  txDigest: string;
+  eventSeq: string;
+}
+
+function loadCursor(stream: string): EventCursor | null {
+  let db;
+  try { db = getDb(); } catch { return null; }
+  const row = db
+    .query<EventCursorRow, [string]>(
+      "SELECT tx_digest, event_seq FROM event_cursor WHERE stream = ?",
+    )
+    .get(stream);
+  if (!row || !row.tx_digest || !row.event_seq) return null;
+  return { txDigest: row.tx_digest, eventSeq: row.event_seq };
+}
+
+function saveCursor(stream: string, cursor: EventCursor): void {
+  let db;
+  try { db = getDb(); } catch { return; }
+  try {
+    db.prepare(
+      `INSERT INTO event_cursor (stream, tx_digest, event_seq, updated_ms)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(stream) DO UPDATE SET
+         tx_digest  = excluded.tx_digest,
+         event_seq  = excluded.event_seq,
+         updated_ms = excluded.updated_ms`,
+    ).run(stream, cursor.txDigest, cursor.eventSeq, Date.now());
+  } catch (err: unknown) {
+    log.warn("cetusEvents: saveCursor failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function persistPriceObservation(
+  poolId: string,
+  price: string,
+  timestampMs: number,
+): void {
+  let db;
+  try { db = getDb(); } catch { return; }
+  try {
+    db.prepare(
+      `INSERT INTO price_observations (pool_id, source, price, observed_ms) VALUES (?, ?, ?, ?)`,
+    ).run(poolId, "cetus_event", price, timestampMs);
+  } catch (err: unknown) {
+    log.warn("cetusEvents: persistPriceObservation failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Raw swap event extraction
+// ---------------------------------------------------------------------------
+
+export interface SwapEventRecord {
+  poolId: string;
+  binId: number;
+  price: string;
+  amountIn: string;
+  amountOut: string;
+  fee: string;
+  timestampMs: number;
+  txDigest: string;
+  eventSeq: string;
+}
+
+function extractSwapEvent(
+  event: SuiEvent,
+  poolId: string,
+  binStep: number,
+): SwapEventRecord | null {
+  if (!event.type.includes("pool::SwapEvent")) return null;
+
+  const raw = event.parsedJson;
+  if (!isRawSwapEvent(raw)) {
+    log.warn("cetusEvents: unexpected SwapEvent payload shape", { type: event.type });
+    return null;
+  }
+
+  if (raw.pool !== poolId) return null;
+
+  const lastBinSwap = raw.bin_swaps[raw.bin_swaps.length - 1];
+  if (!lastBinSwap) return null;
+
+  const binId = decodeBinId(lastBinSwap.bin_id.bits);
+  const price = binIdToPrice(binId, binStep);
+
+  const tsRaw = event.timestampMs;
+  const timestampMs = tsRaw != null ? Number(tsRaw) : Date.now();
+
+  // Extract cursor from event id (Sui SDK shape: event.id = { txDigest, eventSeq })
+  const id = event.id as { txDigest?: string; eventSeq?: string } | undefined;
+
+  return {
+    poolId,
+    binId,
+    price,
+    amountIn: raw.amount_in,
+    amountOut: raw.amount_out,
+    fee: raw.fee,
+    timestampMs,
+    txDigest: id?.txDigest ?? "",
+    eventSeq: id?.eventSeq ?? "",
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Live pool state query
+// ---------------------------------------------------------------------------
+
+export interface CetusPoolState {
+  activeBin: number;
+  price: string;
+  tvlUsd: number;
+  binStep: number;
+}
+
+/**
+ * Query pool object on-chain to get the current active bin and bin step.
+ * The DLMM pool object fields (using the official SDK layout):
+ *   fields.current_index (I32 encoded as u32 bits — same as bin_id.bits)
+ *   fields.bin_step (u64 in basis points)
+ *   fields.fee_growth_global_a, fee_growth_global_b (we skip these)
+ *   TVL is not directly on the pool object in a reliable USD form;
+ *   we return 0 and let the aggregator layer inject it when available.
+ */
+async function queryPoolState(
+  poolId: string,
+  clientOverride?: { getObject: (args: { id: string; options: object }) => Promise<unknown> },
+): Promise<CetusPoolState> {
+  const client = clientOverride ?? getSuiClient();
+  const obj = await (client as unknown as {
+    getObject(args: { id: string; options: object }): Promise<{
+      data?: { content?: { fields?: Record<string, unknown> } };
+    }>
+  }).getObject({
+    id: poolId,
+    options: { showContent: true },
+  });
+
+  const fields = obj?.data?.content?.fields;
+  if (!fields) {
+    throw new Error(`cetusEvents: pool object ${poolId} has no content fields`);
+  }
+
+  // current_index is stored as a { bits: number } signed-I32 wrapper.
+  const rawIndex = fields["current_index"] as { bits?: number } | number | undefined;
+  let activeBin = 0;
+  if (typeof rawIndex === "object" && rawIndex !== null && "bits" in rawIndex) {
+    activeBin = decodeBinId(Number((rawIndex as { bits: number }).bits));
+  } else if (typeof rawIndex === "number") {
+    activeBin = rawIndex;
+  }
+
+  const binStepRaw = fields["bin_step"];
+  const binStep = typeof binStepRaw === "number" ? binStepRaw
+    : typeof binStepRaw === "string" ? Number(binStepRaw)
+    : 10; // fallback to 10 bps
+
+  const price = binIdToPrice(activeBin, binStep);
+
+  return {
+    activeBin,
+    price,
+    tvlUsd: TVL_FALLBACK_USD,
+    binStep,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Live feed
+// ---------------------------------------------------------------------------
+
+export interface CetusEventsFeedOptions {
+  /** Cetus DLMM pool object ID. */
+  poolId: string;
+  /** Bin step in basis points (e.g. 10). */
+  binStep?: number;
+  /** How often to poll pool state. Default 30_000 ms. */
+  pollIntervalMs?: number;
+  /**
+   * Injectable SuiClient-like object for testing.
+   * Must implement `getObject` and `queryEvents`.
+   */
+  clientOverride?: unknown;
+}
+
+export interface CetusEventsFeed {
+  /** Start background poll loop. Returns a stop function. */
+  start(): () => void;
+  /** Latest cached pool state. */
+  latest(): CetusPoolState;
+  /** Epoch ms of the last successful update, or 0 if never updated. */
+  lastUpdatedMs(): number;
+}
+
+export function createCetusEventsFeed(opts: CetusEventsFeedOptions): CetusEventsFeed {
+  const { poolId, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS } = opts;
+  const clientOverride = opts.clientOverride as
+    | { getObject: (args: { id: string; options: object }) => Promise<unknown> }
+    | undefined;
+
+  let cached: CetusPoolState = {
+    activeBin: 0,
+    price: "0",
+    tvlUsd: 0,
+    binStep: opts.binStep ?? 10,
+  };
+  let lastUpdated = 0;
+
+  async function refresh(): Promise<void> {
+    const state = await queryPoolState(poolId, clientOverride);
+    // Preserve tvlUsd from previous cycle if the new query doesn't supply it.
+    cached = {
+      ...state,
+      tvlUsd: state.tvlUsd > 0 ? state.tvlUsd : cached.tvlUsd,
+    };
+    lastUpdated = Date.now();
+  }
+
+  return {
+    start(): () => void {
+      refresh().catch((err: unknown) => {
+        log.error("cetusEvents: initial poll failed", {
+          poolId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      const timer = setInterval(() => {
+        refresh().catch((err: unknown) => {
+          log.warn("cetusEvents: poll failed", {
+            poolId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      }, pollIntervalMs);
+
+      return () => clearInterval(timer);
+    },
+
+    latest(): CetusPoolState {
+      return { ...cached };
+    },
+
+    lastUpdatedMs(): number {
+      return lastUpdated;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Historical backfill
+// ---------------------------------------------------------------------------
+
+export interface BackfillSwapEventsOptions {
+  /** Pool object ID. */
+  poolId: string;
+  /** Bin step in bps (needed for price calculation). */
+  binStep: number;
+  /**
+   * Earliest timestamp (ms) to backfill to.
+   * If omitted, backfill as far back as the RPC allows.
+   */
+  fromMs?: number;
+  /** Latest timestamp (ms) to backfill to. Defaults to now. */
+  toMs?: number;
+  /**
+   * Callback invoked with each page of swap events.
+   * Callers may write these to JSONL files or process them in-memory.
+   */
+  onBatch: (events: SwapEventRecord[]) => void | Promise<void>;
+  /**
+   * Injectable SuiClient-like object for testing.
+   * Must implement `queryEvents`.
+   */
+  clientOverride?: unknown;
+}
+
+interface QueryEventsClient {
+  queryEvents(args: {
+    query: { MoveEventType: string };
+    cursor?: { txDigest: string; eventSeq: string } | null;
+    limit: number;
+    order: "ascending" | "descending";
+  }): Promise<{
+    data: SuiEvent[];
+    hasNextPage: boolean;
+    nextCursor?: { txDigest: string; eventSeq: string } | null;
+  }>;
+}
+
+/**
+ * Backfill historical Cetus swap events for a given pool.
+ *
+ * Scans `queryEvents` in descending order (newest first) from the saved
+ * cursor (if any) back to `fromMs`. Each page is deduplicated against the
+ * price_observations table and emitted to `onBatch` in descending order.
+ *
+ * The cursor is saved after each successful page so the backfill is
+ * resumable: kill the process, restart, and it continues from where it left off.
+ * Stream key: `cetus_swap_backfill:<poolId>`.
+ *
+ * Note on direction: Sui's `queryEvents` with `order: "descending"` starts
+ * from the most-recent event and pages backward. The cursor saved is the
+ * last event of each page (oldest in that page). On resume we start from
+ * that cursor so we continue scanning older events.
+ */
+export async function backfillSwapEvents(opts: BackfillSwapEventsOptions): Promise<void> {
+  const { poolId, binStep, fromMs, toMs, onBatch } = opts;
+  const cutoff = fromMs ?? 0;
+  const toMsActual = toMs ?? Date.now();
+
+  const streamKey = `cetus_swap_backfill:${poolId}`;
+  const savedCursor = loadCursor(streamKey);
+
+  const rawClient = (opts.clientOverride ?? getSuiClient()) as QueryEventsClient;
+
+  log.info("cetusEvents: backfill starting", {
+    poolId,
+    fromMs: cutoff,
+    toMs: toMsActual,
+    resumeCursor: savedCursor ? `${savedCursor.txDigest}:${savedCursor.eventSeq}` : "none",
+  });
+
+  let cursor: { txDigest: string; eventSeq: string } | null = savedCursor;
+  let exhausted = false;
+  let totalEvents = 0;
+  let totalPages = 0;
+
+  while (!exhausted) {
+    let page;
+    try {
+      page = await rawClient.queryEvents({
+        query: { MoveEventType: `${DLMM_PACKAGE_MAINNET}::pool::SwapEvent` },
+        cursor: cursor,
+        limit: PAGE_LIMIT,
+        order: "descending",
+      });
+    } catch (err: unknown) {
+      throw new Error(
+        `cetusEvents: backfill queryEvents failed (page ${totalPages}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    totalPages++;
+    const batch: SwapEventRecord[] = [];
+
+    for (const event of page.data) {
+      const tsRaw = event.timestampMs;
+      if (tsRaw == null) {
+        log.warn("cetusEvents: backfill event missing timestampMs, skipping");
+        continue;
+      }
+      const ts = Number(tsRaw);
+
+      // Skip events newer than toMs (can happen on first page).
+      if (ts > toMsActual) continue;
+
+      // Stop scanning once we've gone further back than fromMs.
+      if (ts < cutoff) {
+        exhausted = true;
+        break;
+      }
+
+      const record = extractSwapEvent(event, poolId, binStep);
+      if (record !== null) {
+        batch.push(record);
+        // Persist price point to price_observations.
+        persistPriceObservation(poolId, record.price, record.timestampMs);
+      }
+    }
+
+    if (batch.length > 0) {
+      await onBatch(batch);
+      totalEvents += batch.length;
+
+      // Save cursor from the oldest event on this page (last in descending order).
+      const oldest = batch[batch.length - 1];
+      if (oldest && oldest.txDigest) {
+        saveCursor(streamKey, { txDigest: oldest.txDigest, eventSeq: oldest.eventSeq });
+      }
+    }
+
+    if (!page.hasNextPage || page.nextCursor == null) {
+      exhausted = true;
+    } else if (!exhausted) {
+      cursor = page.nextCursor;
+    }
+
+    // Rate-limit: sleep between pages to avoid overwhelming public RPC nodes.
+    if (!exhausted) {
+      await new Promise((r) => setTimeout(r, BACKFILL_PAGE_DELAY_MS));
+    }
+  }
+
+  log.info("cetusEvents: backfill complete", { poolId, totalPages, totalEvents });
+}

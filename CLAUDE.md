@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Intent
 
-LiquidityManager is an **open-source template** for building DLMM auto-rebalance agents on **Sui**. It operates through the **CDPM (LeafSheep) agent interface** — users own custodied `PositionManager` objects on-chain, and this agent is an authorized operator with a constrained permission set (see *Agent Permission Model* below).
+LiquidityManager is an **open-source quantitative liquidity-custody agent** for DLMM market-making on **Sui** (it began life as a bare template; the v1 plan in `docs/implementation-plan-v1.md` pivots it to a full quant agent with an in-tree ML pipeline). It operates through the **CDPM (LeafSheep) agent interface** — users own custodied `PositionManager` objects on-chain, and this agent is an authorized operator with a constrained permission set (see *Agent Permission Model* below).
 
-**What the template ships** (the core skeleton — see `README.md` for the open-source-friendly intro):
-1. **Algorithm-driven rebalancing** — three registered strategies (`singleBin`, `multiBinSpot` log-normal-based, `emaTrend` dual-EMA trend-biased), strategy registry, atomic unified PTB
+**What the current code ships** (the core skeleton — see `README.md` for the open-source-friendly intro):
+1. **Algorithm-driven rebalancing** — four registered strategies (`singleBin`, `multiBinSpot` log-normal-based, `emaTrend` dual-EMA trend-biased, `mlAgent` prediction-driven with Tier 0 fallback), strategy registry, atomic unified PTB; `Strategy.plan` is async
 2. **Two price feeds** — on-chain Cetus `SwapEvent` (`onchain`) + public Binance REST (`binance`), shared `price_observations` table
 3. **Idle assets → lending** — Scallop + Kai SAV integration, APY-aware router with tie-break + dust filter
 4. **User top-up records** — per-user derivation addresses + watcher + credit ledger + APY rates (Treasury layer)
@@ -15,8 +15,14 @@ LiquidityManager is an **open-source template** for building DLMM auto-rebalance
 6. **Auto PM discovery** — `AgentAdded` on-chain events push PMs into the monitor; `AgentRemoved` / `PositionManagerClosed` (or runtime ACL re-check failure) hard-delete the subscription row
 7. **Extension points** — `Strategy`, `PoolProfile`, `PriceFeed`, lending adapter pattern, `kaiVaults` config, per-user Seal reader (v2) — all explicit seams documented in `README.md` / `docs/`
 
-**What the template intentionally does NOT ship** (downstream forks bring their own alpha):
-- LLM-driven news ingestion / σ-jump / Strategic Brief — these existed in earlier phases and were stripped during the template extraction
+**What v1 added in-tree** (per `docs/implementation-plan-v1.md` — pipeline yes, alpha no; landed):
+- ML prediction pipeline: Python training + inference **sidecar** (`ml/`, uv-managed; LightGBM quantile models; training and serving share the same `ml/features/` code). TS consumes it only through the `PredictionProvider` interface (`src/prediction/`). **No Rust / napi in v1** — decision cadence is minutes, sub-ms inference buys nothing; revisit via the same interface in v2 if cadence drops to seconds.
+- Three-state machine (`NORMAL` / `TREND` / `EXTREME`) with continuous width/bias parameters — deliberately NOT the six-state design from early drafts.
+- Layered risk controls (L1/L2/L3) + shadow mode, built **before** the model lands (W1–2): for a custody product, circuit breakers and audit logs are the product; the model is swappable alpha.
+- Trained model artifacts stay out of git — the repo ships the pipeline and reproducibility (data window + seed + git sha in `models_meta.json`); forks train their own.
+
+**What the project intentionally does NOT ship**:
+- LLM-driven news ingestion / σ-jump / Strategic Brief — stripped in the template phase; future external signals enter via a `PredictionProvider` decorator or inside the sidecar, never as framework changes
 - Cross-chain support — single-chain Sui only
 - HTTP API surface — direct CLI + SQLite only; v2 adds HTTP
 - Encrypted research-report layer via Seal — design is in `docs/seal-integration.md` (per-user model, AGENT keypair NOT involved), env placeholders in `.env.example`; SDK + Move contracts land in v2 forks
@@ -29,19 +35,21 @@ Design directions captured from `项目.md`:
 
 ## Repository Status
 
-Open-source template (~7 kLOC TypeScript, 172 tests / 14 files). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the 6-module layout. `README.md` is the entry point for fork users.
+Open-source quant agent (~16 kLOC TypeScript, 572 tests / 31 files; plus the `ml/` Python pipeline, ~100 pytest tests). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`, ML pipeline under `ml/`. The v1 rewrite landed: `src/prediction` (PredictionProvider + sidecar client), `src/state` (three-state machine), `src/risk` (L1/L2/L3), `src/decision`, `src/data/feeds/{binanceMulti,derivatives,cetusEvents}` + `src/data/marketAggregator`, `src/strategies/mlAgent`, `src/services/shadowRunner`, and the uv-managed `ml/` sidecar (LightGBM quantile training + FastAPI serving). `Strategy.plan` is now async. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the module layout. `README.md` is the entry point for fork users.
 
-- Runtime preference: **Bun**. Prefer `bun` over `node`/`npm`.
-- **`.gitignore` quirks** — read this carefully, several directories are intentionally untracked:
-  - `*.md` — all markdown is ignored (this file included). Use `git add -f` to track docs.
-  - `/scripts` — the entire scripts dir is untracked. Production utility scripts (`bootstrap-agent-key.ts`, `lending-bootstrap.ts`, `brief-latest.ts`, `print-events.ts`) live here and are kept local.
-  - `/tests` — the test suite is also untracked. CI / fresh-clone setups need an explicit re-checkout.
-  - `/data` — SQLite database directory.
+- Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo.
+- **`.gitignore` layout** (the §2.1 open-source整改 landed — `tests/`, `docs/`, and the reusable scripts are now tracked):
+  - Markdown is tracked. Only `/项目.md` (internal Chinese design notes) stays local.
+  - `/tests` — tracked (first trust signal for an open-source repo).
+  - `/scripts/*` is ignored with a whitelist: `verify-agent-address.ts`, `verify-treasury-address.ts`, `collect-historical.ts`, `backfill-cetus-events.ts`, `verify-data-coverage.ts` are tracked; operator-local scripts (`bootstrap-agent-key.ts`, `lending-bootstrap.ts`, `print-events.ts`, `treasury-*.ts`) stay untracked.
+  - `/data` — SQLite database directory, ignored.
   - `.env`, `.env.local` — never commit secrets.
+  - `ml/.gitignore` keeps `ml/artifacts/`, `ml/data/parquet/`, `ml/reports/`, `.venv` out of git; `ml/uv.lock` IS tracked for reproducibility.
+  - CI (`.github/workflows/ci.yml`) runs `bunx tsc --noEmit` + `bun test` and `uv run pytest` (in `ml/`) on every push / PR. License: Apache-2.0 (`LICENSE`).
 
 ## Verification scripts (convention)
 
-**One-off verification / probe / smoke-test code goes in `scripts/`, never in `src/` or `tests/`.** The scripts directory is gitignored, so this kind of code is intentionally local — it's for the operator running on this machine, not part of the agent's runtime surface.
+**One-off verification / probe / smoke-test code goes in `scripts/`, never in `src/` or `tests/`.** The scripts directory is ignored by default (`/scripts/*` with a whitelist for the reusable subset), so this kind of code is intentionally local — it's for the operator running on this machine, not part of the agent's runtime surface.
 
 Use cases that belong here:
 - Verifying a mnemonic derives an expected Sui address.
@@ -156,9 +164,8 @@ Any code that appears to bypass these constraints is wrong by construction — v
 
 ## Extension points for downstream forks
 
-The whole point of this template is that downstream forks add their own
-features without forking the framework. Four explicit seams,
-each with a one-line / one-file extension recipe:
+Downstream forks add their own features without forking the framework.
+Five explicit seams, each with a one-line / one-file extension recipe:
 
 | Extension | Interface | Recipe |
 |---|---|---|
@@ -166,16 +173,16 @@ each with a one-line / one-file extension recipe:
 | **New pool profile** | `src/pools/types.ts → PoolProfile` | New file `src/pools/<pair>.ts` exporting `build<Pair>Profile() → PoolProfile`; register in `src/pools/index.ts → BUILDERS`. Reference: `sui-usdc.ts`. |
 | **New lending protocol** | `src/sui/lending/types.ts → LendingProtocol` union + adapter pattern | Mirror `src/sui/lending/scallop.ts`; extend `LendingProtocol`; extend `pickHighestApy` in router; add entries to `LENDING_OPPORTUNITIES`. |
 | **New lendable coin** | `src/sui/lending/lendingConfig.ts → LENDING_OPPORTUNITIES` + `MIN_LENDING_DELTA_RAW` + `SCALLOP_RESERVES`; `kaiVaults.ts → KAI_VAULTS` if Kai-supported | Edit three (or four) lists — no code change. Operator runbook in `feedback_lending_whitelist.md` (memory). |
+| **New prediction model** (v1+) | `src/prediction/provider.ts → PredictionProvider` | Implement `predict(snapshot, ctx) → PredictionResponse`; swap your own sidecar / remote service / Rust impl behind it. Reference: `sidecarProvider.ts`. The framework never knows what model is behind the interface. |
 
-When extending the agent with LLM intelligence / news / external signals
-(features explicitly stripped during the template extraction), do NOT
-re-introduce them inside this repo. Prefer one of:
-- Independent process that POSTs signals to a local socket the agent reads
+When extending the agent with LLM intelligence / news / external signals,
+do NOT wire them into the framework. Prefer one of:
+- A `PredictionProvider` decorator that post-processes predictions (recommended start)
+- Signal generation inside the Python sidecar (it's yours to extend)
 - New `Strategy` impl that calls the LLM directly during `plan()`
-- Separate Route-B service (see earlier `service-extraction-analysis.md`
-  in git history) — agent calls it over signed HTTPS
 
-The template's value is that it stays small. Don't grow it back.
+The framework's value is that it stays small; the `ml/` pipeline and the
+strategies are the parts meant to grow. Keep the boundary at the seams above.
 
 ## External Integrations
 
@@ -197,12 +204,18 @@ These are loaded in this environment. Reach for them by name when their domain c
 - `sui-bcs` — BCS encoding when manually constructing on-chain payloads.
 - `cetus-aggregator` — multi-DEX swaps. Relevant only at the treasury / monetization layer (SuiAgentsTopUp pattern), not for DLMM liquidity ops.
 
-## Open Design Questions
+## Design Questions — resolved & open
 
-Unresolved at time of init — propose, don't assume:
+Resolved by the v1 plan (`docs/implementation-plan-v1.md`; don't re-litigate, but flag evidence that contradicts them):
 
-- **Price-history source**: on-chain pool events vs. external aggregator (e.g. Pyth, CoinGecko) vs. local cache.
-- **Probability model for bin weighting**: closed-form (e.g. log-normal around current price) or learned / sampled?
-- **Rebalance trigger**: time-based, drift-from-active-bin, fee-revenue-vs-IL, or hybrid?
-- **External-data plug-ins**: how macro / news feeds will be ingested and combined with price signals.
-- **Custody timing**: when does the SuiAgentsTopUp-style custody layer come in — v0 single-user, or first-class from day one?
+- **Probability model for bin weighting**: LightGBM quantile regression (q10/q50/q90 + vol) → normal-shaped weights; rule-based log-normal (`multiBinSpot`) stays as Tier 0 fallback.
+- **Rebalance trigger**: hybrid — state-machine eval intervals (20/15/1 min) + event-driven (active-bin drift ≥ tolerance, p_break jump, risk signals).
+- **Inference architecture**: Python sidecar behind `PredictionProvider`; no Rust in v1 (decision record in `docs/prediction-service-design.md` §1.2).
+- **Training data**: 6–12 months Binance backfill; Cetus-side features deferred to v1.1 (insufficient history).
+- **External-data plug-ins**: via `PredictionProvider` decorator or inside the sidecar — never framework changes.
+
+Still open — propose, don't assume:
+
+- **Price-history source for runtime**: on-chain pool events vs. external aggregator (e.g. Pyth, CoinGecko) vs. local cache.
+- **Custody scaling**: per-PM strategy preferences (`subscriptions.strategy_pref`), multi-pool state machines — v2 territory.
+- **Model retraining cadence**: manual after W8; when to automate and what gates an automated promotion.

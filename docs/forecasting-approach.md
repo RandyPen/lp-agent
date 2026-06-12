@@ -1,7 +1,11 @@
 # DLMM 价格分布预测方案
 
-> 日期：2026-05-17
+> 日期：2026-05-17(2026-06-11 更新尾部章节,对齐 v1 实施方案)
 > 目标：为 DLMM LP rebalancer 提供"未来 Δt 内价格在每个 bin 上的概率分布"的预测能力。
+> 实施状态:本文的 Tier 1(LightGBM 分位回归)即 `implementation-plan-v1.md` 的 v1 主线,
+> 工程形态见 `prediction-service-design.md`(Python sidecar)。Tier 0 对应现有规则策略
+> (Tier 0 兜底);Tier 2/3 与 LLM 各层为 v2+ 方向。本文"3–6 个月起步"的数据量要求
+> 已落实为 v1 计划的 6–12 个月 Binance 训练窗口。
 
 ## 问题重写
 
@@ -161,79 +165,37 @@ DLMM LP 不需要"下一时刻价格"，需要的是**未来 Δt 内价格的概
 | `src/data/feeds/onchain.ts` | Cetus SwapEvent → price_observations 表 | ❌ |
 | `src/data/feeds/binance.ts` | Binance REST → klines / ticker | ❌ |
 
-**所有路径都没有 training step。** 这是有意的:模板不带 alpha,只带骨架。
+**当前代码所有路径都没有 training step。** v1 实施方案改变了这一点:仓库定位从"不带 alpha 的模板"
+转为"量化流动性托管 Agent"——ML 训练与推理管线(`ml/`,Python/uv)进 tree,但**模型产物不入库**,
+fork 用同一条管线自己训练。
 
 ---
 
-## 升级到机器学习算法（Upgrading to a learned model）
+## 升级到机器学习算法(v1 主线,工程细节见配套文档)
 
-如果你 fork 这个模板,想把 σ 估计或方向预测换成 ML(LightGBM quantile / GARCH MLE / LSTM / Transformer),按以下结构走 — **不需要改框架,走 Strategy 扩展点**。
+ML 接入不再是"fork 自己想办法",而是 v1 的主线工程,分工如下:
 
-### 1. 数据流(已经够用)
-
-- 价格历史已经在 `price_observations` 表(由 `onchain.ts` / `binance.ts` 持续写入)
-- 用 `SELECT pool_id, source, price, observed_ms FROM price_observations WHERE pool_id = ? AND observed_ms >= ?` 导出训练集
-- 1 分钟 bar → `bucketToOhlcv()`(from `src/forecast/volatility.ts`)→ 特征工程
-
-### 2. 离线训练(放 fork 里,不并回模板)
-
-```
-src/ml/
-├── features.ts       # 从 SQLite 拉数据 + 滚窗特征(log returns、RSI、Parkinson σ、...)
-├── train.ts          # CLI: bun run src/ml/train.ts --out=./models/sigma.bin
-├── inference.ts      # 加载模型 + predict(features) → σ
-└── types.ts          # FeatureVector / Prediction 接口
-```
-
-- 模型物件存 `./models/<name>.bin`,加到 `.gitignore`(运营本地维护,不入仓)
-- 训练在你的开发机本地跑(LightGBM 几分钟,深度模型 GPU)
-- 验收:walk-forward backtest 跑 `src/backtest/cli.ts`(模板已有),对比 ML σ vs EWMA σ 的 `fee − IL − cost`
-
-### 3. 在线推断(运行时调用)
-
-新策略 `src/strategies/mlBinSpot.ts` 实现 `Strategy` 接口:
-
-```ts
-import { loadSigmaModel } from "../ml/inference.ts";
-import { computeBinWeights, pickBinRange } from "../forecast/binWeights.ts";
-
-export function createMlBinSpotStrategy(): Strategy {
-  const model = loadSigmaModel(process.env.SIGMA_MODEL_PATH || "./models/sigma.bin");
-  return {
-    name: "mlBinSpot",
-    plan(input) {
-      const features = buildFeatures(input.history, input.spot);
-      const sigma = model.predict(features);   // ← ML 在这里替换 ewmaSigma
-      // ...同 multiBinSpot.ts 的后续:log-normal → computeBinWeights → splitProportional
-    }
-  };
-}
-```
-
-### 4. 注册 + 切换
-
-```ts
-// src/strategies/registry.ts
-import { createMlBinSpotStrategy } from "./mlBinSpot.ts";
-export type StrategyName = "singleBin" | "multiBinSpot" | "emaTrend" | "mlBinSpot";
-const BUILDERS = { ..., mlBinSpot: () => createMlBinSpotStrategy() };
-```
-
-```bash
-STRATEGY=mlBinSpot bun start
-```
-
-### 5. 必须做对的几件事
-
-| 项 | 说明 |
+| 关注点 | 归属文档 |
 |---|---|
-| **冷启动兜底** | 模型加载失败 / 特征不足 → 回退 `ewmaSigma`,不要 throw |
-| **推断耗时预算** | 每 tick < 100ms。LightGBM 单棵树 < 1ms,深度模型必须 batched / pre-warmed |
-| **特征漂移监控** | 训练集 vs 在线 feature 分布偏移 → 定期重训。可写 `scripts/feature-drift.ts` |
-| **conformal 校准** | 直接吐 σ 容易出现 mis-calibration。包一层 conformal interval 在 walk-forward 上验证覆盖率 |
-| **回测 vs 实盘 gap** | 链上 fee/slippage、PTB 失败、subscription 中断会让实盘比回测差。先用小额 PM 跑 1 周再放量 |
-| **多源 feed 时校正 CEX-DEX 偏差** | Binance 价 ≠ Cetus 池价(几 bp 持续 gap + 短期套利漂移)。混合时先 detrend |
+| 八周路线、验收 gate、范围取舍 | `implementation-plan-v1.md` |
+| 训练管线、sidecar 推理、PredictionProvider 接缝 | `prediction-service-design.md` |
+| 预测 → 目标分布 → RebalancePlan | `decision-engine-design.md` |
+| 回测与 fee 模型标定 | `backtest-framework-design.md` |
 
-### 6. 与 EMA 策略并存
+要点(取代本节旧版的 TS `src/ml/` 方案):
 
-EMA 策略和 ML 策略**不冲突**,可以分别按 PM 启用(目前 `STRATEGY` env 是全局的,但 strategy 是 per-PM 调度的,改 rebalancer 让它根据 `subscriptions.strategy_pref` 列选 — 这是 v2 扩展点)。
+1. **训练与推理都在 Python**(`ml/features/` 共享同一份特征代码),不在 TS 里实现第二遍特征——
+   train/serve skew 是头号事故源。TS 侧只持有 `PredictionProvider` 接口。
+2. **数据流**:运行时 `price_observations`(SQLite)继续写;训练用 6–12 个月 Binance 历史
+   回填 parquet(`scripts/collect-historical.ts`),不依赖 Agent 在线攒数据。
+3. **降级语义是显式的**:模型加载失败 / 特征不足 / PSI 漂移 → `fallback` 字段留痕 →
+   mlAgent 整体让位 Tier 0 规则策略。**没有静默回退**——本文旧版"回退 ewmaSigma,不要 throw"
+   的提法修正为:回退必须落 `predictions.fallback` 并计入监控,fallback 占比 > 20% 告警。
+4. **conformal / 覆盖率校准**仍是硬要求:q10–q90 经验覆盖 76–84% 是上线 gate 之一。
+5. **回测 vs 实盘 gap**:L1 回测绝对 PnL 不作 gate(fill 模型有系统性偏差),只做相对排序;
+   实盘 canary ≤ $500 且 PnL 仅观察 ≥ 30 天。
+
+### 与规则策略并存
+
+`mlAgent` 与 `singleBin` / `multiBinSpot` / `emaTrend` 共存于 registry;后三者是 Tier 0 兜底,
+不删除。per-PM 策略分化(`subscriptions.strategy_pref`)仍是 v2 扩展点。

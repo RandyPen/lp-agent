@@ -10,7 +10,9 @@
     "events:print": "bun run scripts/print-events.ts",
     "key:bootstrap": "bun run scripts/bootstrap-agent-key.ts",
     "lending:bootstrap": "bun run scripts/lending-bootstrap.ts",
-    "backtest": "bun run src/backtest/cli.ts"
+    "backtest": "bun run src/backtest/cli.ts",
+    "backfill:cetus": "bun run scripts/backfill-cetus-events.ts",
+    "data:coverage": "bun run scripts/verify-data-coverage.ts"
   },
   "dependencies": {
     "@cetusprotocol/dlmm-sdk": "latest",

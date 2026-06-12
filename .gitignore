@@ -1,9 +1,17 @@
-*.md
 node_modules/
 /data/
 .env
 .env.local
 *.log
 .DS_Store
-/scripts
-/tests
+
+# Internal design notes (Chinese) stay local.
+/项目.md
+
+# Operator-local scripts stay untracked; the reusable subset is whitelisted.
+/scripts/*
+!/scripts/verify-agent-address.ts
+!/scripts/verify-treasury-address.ts
+!/scripts/collect-historical.ts
+!/scripts/backfill-cetus-events.ts
+!/scripts/verify-data-coverage.ts
