@@ -51,6 +51,19 @@ export interface WatcherClient {
   /**
    * Compatible subset of `SuiClient.getAllBalances({owner})`. Tests pass
    * a stub; production uses the real Sui client.
+   *
+   * Gasless deposit visibility: the @mysten/sui JSON-RPC `getAllBalances`
+   * response includes a `fundsInAddressBalance` field per coin type (see
+   * `node_modules/@mysten/sui/dist/jsonRpc/types/coins.d.mts`, `CoinBalance`).
+   * When a user pays via `0x2::balance::send_funds` (the gasless path), their
+   * stablecoin lands in the deposit address's *address balance accumulator*,
+   * not as a Coin object.  The SDK's `totalBalance` field reflects coin-object
+   * holdings only; `fundsInAddressBalance` is the address-balance amount.
+   *
+   * We surface the combined total (coin objects + address balance) as
+   * `totalBalance` in this interface so the watcher credits both sources.
+   * The `suiClientAsWatcherClient` adapter merges them; test stubs may omit
+   * `fundsInAddressBalance` (it defaults to "0").
    */
   getAllBalances(args: { owner: string }): Promise<
     Array<{ coinType: string; totalBalance: string }>
@@ -226,15 +239,30 @@ export function createTreasuryWatcher(opts: CreateWatcherOpts): WatcherService {
   };
 }
 
-/** Helper for production: adapt `@mysten/sui` SuiJsonRpcClient → WatcherClient. */
+/**
+ * Helper for production: adapt `@mysten/sui` SuiJsonRpcClient → WatcherClient.
+ *
+ * Gasless deposit handling: the Sui JSON-RPC `CoinBalance` type includes
+ * `fundsInAddressBalance` (optional string), which reports the amount held in
+ * the address-balance accumulator — the destination of gasless
+ * `0x2::balance::send_funds` transfers. `totalBalance` only counts Coin
+ * objects. We add both together so the watcher sees gasless deposits as
+ * positive deltas and credits them correctly.
+ *
+ * If `fundsInAddressBalance` is absent or "0", the addition is a no-op.
+ */
 export function suiClientAsWatcherClient(client: SuiJsonRpcClient): WatcherClient {
   return {
     async getAllBalances({ owner }) {
       const raw = await client.getAllBalances({ owner });
-      return raw.map((b: { coinType: string; totalBalance: string }) => ({
-        coinType: b.coinType,
-        totalBalance: b.totalBalance,
-      }));
+      return raw.map((b: { coinType: string; totalBalance: string; fundsInAddressBalance?: string }) => {
+        const coinBalance = BigInt(b.totalBalance);
+        const addrBalance = b.fundsInAddressBalance ? BigInt(b.fundsInAddressBalance) : 0n;
+        return {
+          coinType: b.coinType,
+          totalBalance: (coinBalance + addrBalance).toString(),
+        };
+      });
     },
   };
 }

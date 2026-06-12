@@ -10,7 +10,7 @@
 - **Idle-asset lending** — Scallop + Kai SAV integration, APY-aware router (25 bps Scallop tie-break), per-coin dust thresholds.
 - **Multi-source price feeds** — on-chain Cetus `SwapEvent` and Binance REST implementations behind one `PriceFeed` interface, sharing a `price_observations` history table.
 - **Automatic PM discovery** — the agent address is derived from `MNEMONICS`, the agent listens for on-chain `AgentAdded` events and adds the `PositionManager` to its monitor; `AgentRemoved` / `PositionManagerClosed` remove it automatically.
-- **User top-up accounting** — per-user derived deposit addresses, a SQLite credit ledger, a periodic watcher that credits inbound deposits, APY-aware conversion rates.
+- **User top-up accounting** — per-user derived deposit addresses, a SQLite credit ledger, a periodic watcher that credits inbound deposits, APY-aware conversion rates. Deposit addresses typically hold only stablecoins; operator sweep (`treasury-sweep.ts`) and refund (`treasury-refund.ts`) use Sui's protocol-level gasless stablecoin transfers (mainnet, 2026-05-20) for USDC and the other six allowlisted coins — the deposit address needs zero SUI for gas. The watcher merges coin-object balances and address-balance accumulator balances (from gasless deposits) into a single observed total, so both deposit paths are credited correctly. Non-allowlisted coins and the explicit `--force-gas` flag fall back to the legacy coin-object path.
 - **CDPM permission boundary** — all operations go through the LeafSheep `PositionManager`; user funds never leave the user's own vault.
 
 ## What it does **not** do (deliberately left to forks)

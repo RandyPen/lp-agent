@@ -34,9 +34,10 @@ import type { LendingProtocol } from "./types.ts";
 // Coin type constants
 // =============================================================================
 //
-// Pinned to the canonical (long-form, lowercased) representation that
-// `normalizeStructTag` would produce, so `canLend('0x2::sui::SUI')` matches
+// Pinned to the canonical (long-form, case-preserving) representation that
+// `normalizeStructTag` produces, so `canLend('0x2::sui::SUI')` matches
 // `canLend('0x0000…0002::sui::SUI')` via `canonicalType`.
+// Module and struct names retain their original casing (e.g. SUI, USDC, DEEP).
 
 const USDC_TYPE =
   "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
@@ -181,9 +182,9 @@ const UNCONFIGURED_MIN = (1n << 64n) - 1n;
 
 function canonical(coinType: string): string {
   try {
-    return normalizeStructTag(coinType).toLowerCase();
+    return normalizeStructTag(coinType);
   } catch {
-    return coinType.trim().toLowerCase();
+    return coinType.trim();
   }
 }
 

@@ -31,6 +31,7 @@ import {
   SUI_COIN_TYPE,
   GAS_RESERVE_MIST,
 } from "../../src/treasury/operator.ts";
+import { isGaslessEligible } from "../../src/treasury/gasless.ts";
 import {
   findUserBySuiAddress,
   getAddressBalance,
@@ -91,11 +92,18 @@ afterAll(() => {
 // ---- fake SuiClient builder ----------------------------------------------
 
 const SUI_TYPE = canonicalType(SUI_COIN_TYPE);
-const USDC_TYPE = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::usdc";
+const USDC_TYPE = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
+// A non-gasless coin type for tests that exercise the gas-required path.
+// This must NOT be in GASLESS_STABLECOINS — it's a fake arbitrary coin.
+const FAKE_NONGAS_COIN = "0x1111111111111111111111111111111111111111111111111111111111111111::fakecoin::FAKECOIN";
 
 interface TxRecord {
   from: string;
-  commands: string; // serialised summary for assertions
+  /** Placeholder — the field exists for historical reasons but no test reads it.
+   *  We no longer call JSON.stringify(transaction) because the gasless PTB now
+   *  uses a CoinWithBalance intent that requires an async client to resolve,
+   *  making synchronous JSON.stringify impossible for gasless transactions. */
+  commands: string;
 }
 
 interface CoinEntry {
@@ -126,9 +134,12 @@ function makeFakeClient(opts: {
       return { data, hasNextPage: false, nextCursor: null };
     },
     async signAndExecuteTransaction({ transaction, signer }) {
+      // Do NOT call JSON.stringify(transaction) — gasless PTBs use a
+      // CoinWithBalance intent that needs an async client to resolve, making
+      // synchronous stringification throw. We capture a static label instead.
       txSubmissions.push({
         from: signer.toSuiAddress(),
-        commands: JSON.stringify(transaction),
+        commands: `[Transaction@${Date.now()}]`,
       });
       const digest = opts.digest ?? `fake_digest_${Date.now()}`;
       if (opts.failTx) {
@@ -178,6 +189,20 @@ function usdcCoins(
       coinObjectId: objectId,
       version: "1",
       digest: "fakedigest2",
+      balance: totalAtomic.toString(),
+    },
+  ];
+}
+
+function fakeNonGasCoins(
+  totalAtomic: bigint,
+  objectId = "0x" + "03".repeat(32),
+): CoinEntry[] {
+  return [
+    {
+      coinObjectId: objectId,
+      version: "1",
+      digest: "fakedigest3",
       balance: totalAtomic.toString(),
     },
   ];
@@ -394,13 +419,14 @@ describe("sweepDepositAddress — SUI full balance leaves gas reserve", () => {
   });
 });
 
-describe("sweepDepositAddress — non-SUI without SUI gas → loud error + ops row failed", () => {
-  it("throws a clear error and records a failed ops row", async () => {
+describe("sweepDepositAddress — non-gasless coin without SUI gas → loud error + ops row failed", () => {
+  it("throws a clear error and records a failed ops row (non-allowlisted coin, no SUI)", async () => {
     seedUser1();
-    // Deposit address has USDC but NO SUI for gas.
+    // Deposit address has a non-gasless coin but NO SUI for gas.
+    // FAKE_NONGAS_COIN is not in GASLESS_STABLECOINS, so the gas-paid path is taken.
     const { client } = makeFakeClient({
       coins: {
-        [`${FAKE_DEPOSIT_ADDR_1}::${USDC_TYPE}`]: usdcCoins(1_000_000n),
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(FAKE_NONGAS_COIN)}`]: fakeNonGasCoins(1_000_000n),
         // No SUI coins.
       },
     });
@@ -408,7 +434,7 @@ describe("sweepDepositAddress — non-SUI without SUI gas → loud error + ops r
     await expect(
       sweepDepositAddress({
         derivationIndex: 1,
-        coinType: USDC_TYPE,
+        coinType: FAKE_NONGAS_COIN,
         to: FAKE_MASTER_ADDR,
         client,
         _keypairProvider: FAKE_KP,
@@ -420,6 +446,27 @@ describe("sweepDepositAddress — non-SUI without SUI gas → loud error + ops r
     expect(ops.length).toBe(1);
     expect(ops[0]!.status).toBe("failed");
     expect(ops[0]!.error).toMatch(/no SUI for gas/);
+  });
+
+  it("USDC with forceGas=true AND no SUI → throws no SUI for gas (legacy path chosen)", async () => {
+    seedUser1();
+    const { client } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(1_000_000n),
+        // No SUI coins.
+      },
+    });
+
+    await expect(
+      sweepDepositAddress({
+        derivationIndex: 1,
+        coinType: USDC_TYPE,
+        to: FAKE_MASTER_ADDR,
+        client,
+        forceGas: true, // force the legacy path even though USDC is gasless-eligible
+        _keypairProvider: FAKE_KP,
+      }),
+    ).rejects.toThrow(/no SUI for gas/);
   });
 });
 
@@ -727,26 +774,48 @@ describe("refundUser — unregistered user throws", () => {
   });
 });
 
-describe("refundUser — non-SUI without gas throws", () => {
-  it("throws when deposit address has USDC but no SUI for gas", async () => {
+describe("refundUser — non-gasless coin without gas throws", () => {
+  it("throws when deposit address has a non-allowlisted coin but no SUI for gas", async () => {
     registerUserTx(FAKE_USER1_ADDR, () => FAKE_DEPOSIT_ADDR_1);
 
     upsertAddressBalance({
       depositAddress: FAKE_DEPOSIT_ADDR_1,
-      coinType: USDC_TYPE,
+      coinType: canonicalType(FAKE_NONGAS_COIN),
       lastSeenBalance: 5_000_000n,
       lastSeenMs: Date.now(),
     });
 
     const { client } = makeFakeClient({
       coins: {
-        [`${FAKE_DEPOSIT_ADDR_1}::${USDC_TYPE}`]: usdcCoins(5_000_000n),
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(FAKE_NONGAS_COIN)}`]: fakeNonGasCoins(5_000_000n),
         // No SUI.
       },
     });
 
     await expect(
       refundUser({ suiAddress: FAKE_USER1_ADDR, client, _keypairProvider: FAKE_KP }),
+    ).rejects.toThrow(/insufficient SUI for gas/);
+  });
+
+  it("throws when deposit address has USDC with forceGas=true but no SUI for gas", async () => {
+    registerUserTx(FAKE_USER1_ADDR, () => FAKE_DEPOSIT_ADDR_1);
+
+    upsertAddressBalance({
+      depositAddress: FAKE_DEPOSIT_ADDR_1,
+      coinType: canonicalType(USDC_TYPE),
+      lastSeenBalance: 5_000_000n,
+      lastSeenMs: Date.now(),
+    });
+
+    const { client } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(5_000_000n),
+        // No SUI.
+      },
+    });
+
+    await expect(
+      refundUser({ suiAddress: FAKE_USER1_ADDR, client, forceGas: true, _keypairProvider: FAKE_KP }),
     ).rejects.toThrow(/insufficient SUI for gas/);
   });
 });
@@ -805,5 +874,298 @@ describe("refundUser — no --confirm guard in fn (CLI responsibility)", () => {
     const result = await refundUser({ suiAddress: FAKE_USER1_ADDR, client, _keypairProvider: FAKE_KP });
     expect(result.dryRun).toBe(false);
     expect(result.creditsAfter).toBe(0);
+  });
+});
+
+// ==========================================================================
+// Gasless sweep — USDC with zero SUI succeeds
+// ==========================================================================
+
+describe("sweepDepositAddress — USDC gasless path (zero SUI on address)", () => {
+  it("USDC sweep succeeds with zero SUI on deposit address", async () => {
+    seedUser1();
+    const usdcBalance = 1_000_000n; // 1 USDC (above 10_000 minimum)
+
+    // Deposit address has USDC but absolutely NO SUI — gasless should succeed.
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(usdcBalance),
+        // No SUI at all.
+      },
+    });
+
+    const result = await sweepDepositAddress({
+      derivationIndex: 1,
+      coinType: USDC_TYPE,
+      to: FAKE_MASTER_ADDR,
+      client,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.amountSwept).toBe(usdcBalance);
+    expect(result.dryRun).toBe(false);
+    expect(result.path).toBe("gasless");
+    expect(result.digest).toBeDefined();
+    expect(txSubmissions.length).toBe(1);
+    expect(txSubmissions[0]!.from).toBe(FAKE_DEPOSIT_ADDR_1);
+
+    // Op row should be succeeded, with path recorded in initiatedBy.
+    const ops = listOps({ opKind: "sweep" });
+    expect(ops.length).toBe(1);
+    expect(ops[0]!.status).toBe("succeeded");
+    expect(ops[0]!.initiatedBy).toContain("path:gasless");
+  });
+
+  it("USDC dry-run shows gasless path", async () => {
+    seedUser1();
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(500_000n),
+      },
+    });
+
+    const result = await sweepDepositAddress({
+      derivationIndex: 1,
+      coinType: USDC_TYPE,
+      to: FAKE_MASTER_ADDR,
+      client,
+      dryRun: true,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.dryRun).toBe(true);
+    expect(result.path).toBe("gasless");
+    expect(txSubmissions.length).toBe(0);
+    expect(listOps().length).toBe(0);
+  });
+
+  it("USDC isGaslessEligible returns true (sanity check for routing)", () => {
+    expect(isGaslessEligible(USDC_TYPE)).toBe(true);
+  });
+});
+
+// ==========================================================================
+// Gasless sweep — below minimum is skipped (not silently gas-paid)
+// ==========================================================================
+
+describe("sweepDepositAddress — USDC below gasless minimum is skipped", () => {
+  it("skips with path=skipped when USDC balance is below 10_000 atomic", async () => {
+    seedUser1();
+    const belowMin = 9_999n; // just below 10_000 minimum
+
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(belowMin),
+      },
+    });
+
+    const result = await sweepDepositAddress({
+      derivationIndex: 1,
+      coinType: USDC_TYPE,
+      to: FAKE_MASTER_ADDR,
+      client,
+      _keypairProvider: FAKE_KP,
+    });
+
+    // Must NOT silently fall back to gas path — must be skipped.
+    expect(result.amountSwept).toBe(0n);
+    expect(result.path).toBe("skipped");
+    expect(txSubmissions.length).toBe(0);
+    expect(listOps().length).toBe(0); // no ops row for a below-min skip
+  });
+
+  it("below-min USDC with forceGas=true AND SUI available → succeeds via gas-paid path", async () => {
+    seedUser1();
+    const belowMin = 9_999n;
+
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(belowMin),
+        // Provide SUI so the gas-paid path can proceed.
+        [`${FAKE_DEPOSIT_ADDR_1}::${SUI_TYPE}`]: suiCoins(GAS_RESERVE_MIST + 10_000_000n),
+      },
+    });
+
+    const result = await sweepDepositAddress({
+      derivationIndex: 1,
+      coinType: USDC_TYPE,
+      to: FAKE_MASTER_ADDR,
+      client,
+      forceGas: true,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.amountSwept).toBe(belowMin);
+    expect(result.path).toBe("gas");
+    expect(txSubmissions.length).toBe(1);
+  });
+});
+
+// ==========================================================================
+// Gasless sweep — forceGas routes through legacy gas path
+// ==========================================================================
+
+describe("sweepDepositAddress — USDC with forceGas uses gas-paid path", () => {
+  it("forceGas=true routes USDC through the gas-paid path (path=gas)", async () => {
+    seedUser1();
+    const usdcBalance = 1_000_000n;
+
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(usdcBalance),
+        [`${FAKE_DEPOSIT_ADDR_1}::${SUI_TYPE}`]: suiCoins(GAS_RESERVE_MIST + 20_000_000n),
+      },
+    });
+
+    const result = await sweepDepositAddress({
+      derivationIndex: 1,
+      coinType: USDC_TYPE,
+      to: FAKE_MASTER_ADDR,
+      client,
+      forceGas: true,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.amountSwept).toBe(usdcBalance);
+    expect(result.path).toBe("gas");
+    expect(txSubmissions.length).toBe(1);
+
+    // Op row should record gas path.
+    const ops = listOps({ opKind: "sweep" });
+    expect(ops[0]!.initiatedBy).toContain("path:gas");
+  });
+});
+
+// ==========================================================================
+// refundUser — USDC gasless + SUI gas mix
+// ==========================================================================
+
+describe("refundUser — gasless (USDC) + gas (SUI) mixed refund", () => {
+  it("refunds SUI via gas path and USDC via gasless path; both ops rows recorded", async () => {
+    registerUserTx(FAKE_USER1_ADDR, () => FAKE_DEPOSIT_ADDR_1);
+    const { getDb } = await import("../../src/db/client.ts");
+    getDb().prepare(`UPDATE treasury_users SET credits = 300 WHERE sui_address = '${FAKE_USER1_ADDR}'`).run();
+
+    const suiBalance = 300_000_000n;
+    const usdcBalance = 2_000_000n;
+
+    upsertAddressBalance({
+      depositAddress: FAKE_DEPOSIT_ADDR_1,
+      coinType: SUI_TYPE,
+      lastSeenBalance: suiBalance,
+      lastSeenMs: Date.now(),
+    });
+    upsertAddressBalance({
+      depositAddress: FAKE_DEPOSIT_ADDR_1,
+      coinType: canonicalType(USDC_TYPE),
+      lastSeenBalance: usdcBalance,
+      lastSeenMs: Date.now(),
+    });
+
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${SUI_TYPE}`]: suiCoins(suiBalance),
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(usdcBalance),
+      },
+    });
+
+    const result = await refundUser({
+      suiAddress: FAKE_USER1_ADDR,
+      client,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.dryRun).toBe(false);
+    expect(result.creditsAfter).toBe(0);
+    expect(result.transfers.length).toBe(2);
+
+    // Find SUI transfer.
+    const suiTransfer = result.transfers.find((t) => t.coinType === SUI_TYPE);
+    expect(suiTransfer).toBeDefined();
+    expect(suiTransfer!.path).toBe("gas");
+    expect(suiTransfer!.amount).toBe(suiBalance - GAS_RESERVE_MIST);
+
+    // Find USDC transfer.
+    const usdcTransfer = result.transfers.find(
+      (t) => t.coinType === canonicalType(USDC_TYPE),
+    );
+    expect(usdcTransfer).toBeDefined();
+    expect(usdcTransfer!.path).toBe("gasless");
+    expect(usdcTransfer!.amount).toBe(usdcBalance);
+
+    // Two txs submitted.
+    expect(txSubmissions.length).toBe(2);
+
+    // Ops rows: one 'transfer' for SUI (gas), one for USDC (gasless).
+    const ops = listOps({ opKind: "transfer" });
+    expect(ops.length).toBe(2);
+    const suiOp = ops.find((o) => o.coinTypeIn === SUI_TYPE);
+    const usdcOp = ops.find((o) => o.coinTypeIn === canonicalType(USDC_TYPE));
+    expect(suiOp!.initiatedBy).toContain("path:gas");
+    expect(usdcOp!.initiatedBy).toContain("path:gasless");
+  });
+
+  it("USDC-only refund succeeds with zero SUI on deposit address", async () => {
+    registerUserTx(FAKE_USER1_ADDR, () => FAKE_DEPOSIT_ADDR_1);
+
+    upsertAddressBalance({
+      depositAddress: FAKE_DEPOSIT_ADDR_1,
+      coinType: canonicalType(USDC_TYPE),
+      lastSeenBalance: 500_000n,
+      lastSeenMs: Date.now(),
+    });
+
+    const { client, txSubmissions } = makeFakeClient({
+      coins: {
+        // Only USDC — no SUI at all.
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(500_000n),
+      },
+    });
+
+    const result = await refundUser({
+      suiAddress: FAKE_USER1_ADDR,
+      client,
+      _keypairProvider: FAKE_KP,
+    });
+
+    expect(result.transfers.length).toBe(1);
+    expect(result.transfers[0]!.coinType).toBe(canonicalType(USDC_TYPE));
+    expect(result.transfers[0]!.path).toBe("gasless");
+    expect(txSubmissions.length).toBe(1);
+    expect(result.creditsAfter).toBe(0);
+  });
+});
+
+// ==========================================================================
+// refundUser — ops rows record path in initiatedBy
+// ==========================================================================
+
+describe("refundUser — ops row path field", () => {
+  it("ops row initiatedBy contains path:gasless for USDC refund", async () => {
+    registerUserTx(FAKE_USER1_ADDR, () => FAKE_DEPOSIT_ADDR_1);
+
+    upsertAddressBalance({
+      depositAddress: FAKE_DEPOSIT_ADDR_1,
+      coinType: canonicalType(USDC_TYPE),
+      lastSeenBalance: 100_000n,
+      lastSeenMs: Date.now(),
+    });
+
+    const { client } = makeFakeClient({
+      coins: {
+        [`${FAKE_DEPOSIT_ADDR_1}::${canonicalType(USDC_TYPE)}`]: usdcCoins(100_000n),
+      },
+    });
+
+    await refundUser({
+      suiAddress: FAKE_USER1_ADDR,
+      client,
+      initiatedBy: "test-operator",
+      _keypairProvider: FAKE_KP,
+    });
+
+    const ops = listOps({ opKind: "transfer" });
+    expect(ops.length).toBe(1);
+    expect(ops[0]!.initiatedBy).toBe("test-operator|path:gasless");
   });
 });

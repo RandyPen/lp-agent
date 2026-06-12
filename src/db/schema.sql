@@ -11,6 +11,13 @@
 -- column removal, etc.) are not supported by this approach. While the project
 -- has no production data, simply `rm ./data/app.db` and restart to rebuild.
 -- Introduce a proper migration tool when moving to prod.
+--
+-- coin_type casing: all coin_type values stored in this DB are canonicalised
+-- via canonicalType() from src/sui/lending/typeNorm.ts. As of the case-
+-- preserving fix (2026-06-12), canonical form pads addresses to 32 bytes and
+-- PRESERVES module/struct name casing (e.g. ::usdc::USDC, not ::usdc::usdc).
+-- Stale dev DBs written before this change may hold all-lowercase coin_type
+-- values; recreate with `rm ./data/app.db` before running.
 
 ------------------------------------------------------------------------------
 -- Subscriptions / event tracking (formerly 0001_init)

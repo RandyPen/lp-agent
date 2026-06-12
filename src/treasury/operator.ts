@@ -34,6 +34,11 @@ import {
 } from "./store.ts";
 import { recordOp, markOpResult } from "./opsStore.ts";
 import { getDb } from "../db/client.ts";
+import {
+  isGaslessEligible,
+  gaslessMinAtomic,
+  buildGaslessTransfer,
+} from "./gasless.ts";
 
 // ---- constants -----------------------------------------------------------
 
@@ -184,7 +189,8 @@ export interface SweepDepositAddressArgs {
   /**
    * Amount to sweep (atomic units). Omit to sweep the full spendable balance:
    *   - For SUI: full balance minus `GAS_RESERVE_MIST`
-   *   - For non-SUI: full balance (requires separate SUI gas coins on address)
+   *   - For non-SUI gasless: full balance (no SUI needed on address)
+   *   - For non-SUI gas-paid: full balance (requires separate SUI gas coins)
    */
   amount?: bigint;
   client: OperatorClient;
@@ -193,11 +199,20 @@ export interface SweepDepositAddressArgs {
   /** Label written to treasury_ops.initiated_by. */
   initiatedBy?: string;
   /**
+   * When true and the coin type is gasless-eligible, routes through the legacy
+   * gas-paid path instead of the gasless path. Useful for operators who want
+   * to explicitly consolidate address balances via Coin objects.
+   * Note: the gas-paid path requires SUI on the deposit address.
+   */
+  forceGas?: boolean;
+  /**
    * Keypair provider (injectable for tests). If omitted, uses the real
    * treasury keypairs — production callers leave this unset.
    */
   _keypairProvider?: KeypairProvider;
 }
+
+export type SweepPath = "gasless" | "gas" | "skipped";
 
 export interface SweepResult {
   depositAddress: string;
@@ -206,12 +221,14 @@ export interface SweepResult {
   digest?: string;
   dryRun: boolean;
   opId?: string;
+  /** Which execution path was used for this sweep. */
+  path: SweepPath;
 }
 
 export async function sweepDepositAddress(
   args: SweepDepositAddressArgs,
 ): Promise<SweepResult> {
-  const { derivationIndex, to, client, dryRun = false } = args;
+  const { derivationIndex, to, client, dryRun = false, forceGas = false } = args;
   const coinType = canonicalType(args.coinType);
   const initiatedBy = args.initiatedBy ?? "operator-script";
 
@@ -220,26 +237,42 @@ export async function sweepDepositAddress(
   const kp = kpProvider.getUserDepositKeypair(derivationIndex);
   const depositAddress = kp.toSuiAddress();
 
+  const isSui = coinType === canonicalType(SUI_COIN_TYPE);
+
+  // Determine routing for non-SUI coins: gasless when eligible and not
+  // overridden by forceGas.
+  const useGasless = !isSui && !forceGas && isGaslessEligible(coinType);
+
   log.info("treasury/operator: sweep start", {
     derivationIndex,
     depositAddress,
     coinType,
     to,
     dryRun,
+    path: isSui ? "gas" : (useGasless ? "gasless" : "gas"),
   });
 
-  const isSui = coinType === canonicalType(SUI_COIN_TYPE);
-
   // --- balance check -------------------------------------------------------
+  // For gasless sweeps the deposit address holds stablecoins as address
+  // balances (from gasless deposits), not as Coin objects. However we still
+  // use getCoins here to detect Coin-object balance; both paths check the
+  // coin-object total. Address balances are sourced by the PTB at execution
+  // time via FundsWithdrawal — we rely on the watcher's cached balance for
+  // the "skip if empty" heuristic.
   const targetCoins = await fetchAllCoins(client, depositAddress, coinType);
   const totalTarget = totalBalance(targetCoins);
 
   if (totalTarget === 0n) {
-    log.info("treasury/operator: sweep skipped — zero balance", {
+    log.info("treasury/operator: sweep skipped — zero coin-object balance", {
       depositAddress,
       coinType,
+      note: useGasless
+        ? "address-balance funds (from gasless deposits) are sourced at execution time; " +
+          "this skip only triggers when Coin objects are absent — proceed if the watcher " +
+          "reported an address balance for this coin"
+        : undefined,
     });
-    return { depositAddress, coinType, amountSwept: 0n, dryRun };
+    return { depositAddress, coinType, amountSwept: 0n, dryRun, path: "skipped" };
   }
 
   let amountToSweep: bigint;
@@ -260,38 +293,65 @@ export async function sweepDepositAddress(
         balance: totalTarget.toString(),
         gasReserve: GAS_RESERVE_MIST.toString(),
       });
-      return { depositAddress, coinType, amountSwept: 0n, dryRun };
+      return { depositAddress, coinType, amountSwept: 0n, dryRun, path: "skipped" };
     }
     amountToSweep = totalTarget - GAS_RESERVE_MIST;
   } else {
     amountToSweep = totalTarget;
   }
 
+  // --- gasless minimum check for eligible coins ----------------------------
+  // Below-minimum eligible coins must NOT silently fall back to the gas path
+  // (which would surprise operators with unexpected gas spend).
+  if (useGasless) {
+    const minAtomic = gaslessMinAtomic(coinType);
+    if (amountToSweep < minAtomic) {
+      const msg =
+        `sweep: ${depositAddress} has ${amountToSweep} atomic of ${coinType}, ` +
+        `below the gasless minimum ${minAtomic} (0.01 whole units); ` +
+        `skipped — pass forceGas:true to sweep with gas-paid path instead`;
+      log.info("treasury/operator: sweep skipped — below gasless minimum", {
+        depositAddress,
+        coinType,
+        amountToSweep: amountToSweep.toString(),
+        gaslessMin: minAtomic.toString(),
+        hint: "pass forceGas:true to route through the legacy gas-paid path",
+      });
+      return { depositAddress, coinType, amountSwept: 0n, dryRun, path: "skipped" };
+    }
+  }
+
   if (dryRun) {
+    const path: SweepPath = isSui ? "gas" : (useGasless ? "gasless" : "gas");
     log.info("treasury/operator: sweep dry-run", {
       depositAddress,
       coinType,
       amountToSweep: amountToSweep.toString(),
       to,
+      path,
     });
-    return { depositAddress, coinType, amountSwept: amountToSweep, dryRun: true };
+    return { depositAddress, coinType, amountSwept: amountToSweep, dryRun: true, path };
   }
 
   // --- record ops row BEFORE submission (status=pending) -------------------
   // We insert the row here, before the gas check for non-SUI, so that a
   // 'failed' row exists even when gas is missing. This satisfies the audit
   // requirement: every attempted sweep is recorded.
+  // The chosen path is appended to initiatedBy so it is visible in the ops
+  // table without a schema change.
+  const path: SweepPath = isSui ? "gas" : (useGasless ? "gasless" : "gas");
+  const opInitiatedBy = `${initiatedBy}|path:${path}`;
   const opId = recordOp({
     opKind: "sweep",
     fromAddress: depositAddress,
     toAddress: to,
     coinTypeIn: coinType,
     amountIn: amountToSweep,
-    initiatedBy,
+    initiatedBy: opInitiatedBy,
   });
 
-  // --- gas check for non-SUI sweeps ----------------------------------------
-  if (!isSui) {
+  // --- gas check for non-SUI, non-gasless sweeps ---------------------------
+  if (!isSui && !useGasless) {
     const suiCoinList = await fetchAllCoins(
       client,
       depositAddress,
@@ -314,10 +374,20 @@ export async function sweepDepositAddress(
   }
 
   // --- build PTB ------------------------------------------------------------
-  const tx = new Transaction();
-  tx.setSender(depositAddress);
+  let tx: Transaction;
 
-  if (isSui) {
+  if (useGasless) {
+    // Gasless path: single 0x2::balance::send_funds call, FundsWithdrawal
+    // input, gasPrice=0, no gasPayment. Deposit address needs no SUI.
+    tx = buildGaslessTransfer({
+      sender: depositAddress,
+      coinType,
+      amountAtomic: amountToSweep,
+      recipient: to,
+    });
+  } else if (isSui) {
+    tx = new Transaction();
+    tx.setSender(depositAddress);
     targetCoins.sort((a, b) => (b.balance > a.balance ? 1 : -1));
 
     // Use the largest coin as gas payment, sweep from the rest.
@@ -358,7 +428,11 @@ export async function sweepDepositAddress(
       }
     }
   } else {
-    // Non-SUI: merge all target coins, split exact amount, transfer.
+    // Non-SUI, gas-paid path: merge all target coins, split exact amount,
+    // transfer. Gas is paid from SUI coins on the deposit address (checked
+    // above).
+    tx = new Transaction();
+    tx.setSender(depositAddress);
     const primary = tx.object(targetCoins[0]!.objectId);
     if (targetCoins.length > 1) {
       tx.mergeCoins(
@@ -400,6 +474,7 @@ export async function sweepDepositAddress(
       amountSwept: amountToSweep.toString(),
       digest,
       opId,
+      path,
     });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -411,7 +486,7 @@ export async function sweepDepositAddress(
     throw err;
   }
 
-  return { depositAddress, coinType, amountSwept: amountToSweep, digest, dryRun: false, opId };
+  return { depositAddress, coinType, amountSwept: amountToSweep, digest, dryRun: false, opId, path };
 }
 
 // ---- sweep all registered deposit addresses ------------------------------
@@ -426,18 +501,23 @@ export interface SweepAllArgs {
   client: OperatorClient;
   dryRun?: boolean;
   initiatedBy?: string;
+  /**
+   * When true, route gasless-eligible coins through the legacy gas-paid path.
+   * See `SweepDepositAddressArgs.forceGas`.
+   */
+  forceGas?: boolean;
   /** Injectable for tests — see `SweepDepositAddressArgs._keypairProvider`. */
   _keypairProvider?: KeypairProvider;
 }
 
 export interface SweepAllReport {
   swept: SweepResult[];
-  skipped: Array<{ depositAddress: string; reason: string }>;
+  skipped: Array<{ depositAddress: string; reason: string; path?: SweepPath }>;
   errors: Array<{ depositAddress: string; error: string }>;
 }
 
 export async function sweepAll(args: SweepAllArgs): Promise<SweepAllReport> {
-  const { client, dryRun = false } = args;
+  const { client, dryRun = false, forceGas = false } = args;
   const minAmount = args.minAmount ?? 1n;
   const coinTypeFilter = args.coinType ? canonicalType(args.coinType) : null;
   const initiatedBy = args.initiatedBy ?? "operator-script";
@@ -511,6 +591,7 @@ export async function sweepAll(args: SweepAllArgs): Promise<SweepAllReport> {
           client,
           dryRun,
           initiatedBy,
+          forceGas,
           _keypairProvider: kpProvider,
         });
 
@@ -518,6 +599,7 @@ export async function sweepAll(args: SweepAllArgs): Promise<SweepAllReport> {
           report.skipped.push({
             depositAddress,
             reason: `zero spendable balance for ${ct}`,
+            path: result.path,
           });
         } else {
           report.swept.push(result);
@@ -545,6 +627,11 @@ export interface RefundUserArgs {
   client: OperatorClient;
   dryRun?: boolean;
   initiatedBy?: string;
+  /**
+   * When true, route gasless-eligible coins through the legacy gas-paid path.
+   * See `SweepDepositAddressArgs.forceGas`.
+   */
+  forceGas?: boolean;
   /** Injectable for tests — see `SweepDepositAddressArgs._keypairProvider`. */
   _keypairProvider?: KeypairProvider;
 }
@@ -557,6 +644,7 @@ export interface RefundUserResult {
     amount: bigint;
     digest?: string;
     opId?: string;
+    path: SweepPath;
   }>;
   creditsBefore: number;
   creditsAfter: number;
@@ -576,7 +664,7 @@ export interface RefundUserResult {
  * already succeeded are recorded in ops rows; credits are NOT zeroed.
  */
 export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult> {
-  const { suiAddress, client, dryRun = false } = args;
+  const { suiAddress, client, dryRun = false, forceGas = false } = args;
   const initiatedBy = args.initiatedBy ?? "operator-script";
 
   const user = findUserBySuiAddress(suiAddress);
@@ -637,28 +725,48 @@ export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult
     // Still zero credits even if no on-chain balance.
   }
 
-  // Check gas for non-SUI transfers.
-  const suiHeld = held.find((h) => h.coinType === canonicalType(SUI_COIN_TYPE));
-  const nonSuiHeld = held.filter((h) => h.coinType !== canonicalType(SUI_COIN_TYPE));
-  if (nonSuiHeld.length > 0) {
+  // Determine routing per coin type:
+  //   - SUI: always gas-paid
+  //   - gasless-eligible and not forceGas: gasless path (no SUI needed)
+  //   - everything else: gas-paid path
+  const SUI_CT = canonicalType(SUI_COIN_TYPE);
+  const nonSuiHeld = held.filter((h) => h.coinType !== SUI_CT);
+  const nonSuiGasPaid = nonSuiHeld.filter(
+    (h) => forceGas || !isGaslessEligible(h.coinType),
+  );
+
+  // Check gas only for coins that need the gas-paid path.
+  if (nonSuiGasPaid.length > 0) {
+    const suiHeld = held.find((h) => h.coinType === SUI_CT);
     const suiTotal = suiHeld?.total ?? 0n;
     if (suiTotal < GAS_RESERVE_MIST) {
       throw new Error(
         `refundUser: ${depositAddress} has insufficient SUI for gas ` +
-        `(${suiTotal} mist < ${GAS_RESERVE_MIST} mist) — needed to refund ${nonSuiHeld.map((h) => h.coinType).join(", ")}`,
+        `(${suiTotal} mist < ${GAS_RESERVE_MIST} mist) — needed to refund ` +
+        `${nonSuiGasPaid.map((h) => h.coinType).join(", ")}`,
       );
     }
   }
 
   if (dryRun) {
+    const transfersPlanned = held.map((h) => {
+      const isSui = h.coinType === SUI_CT;
+      const useGasless = !isSui && !forceGas && isGaslessEligible(h.coinType);
+      const path: SweepPath = isSui ? "gas" : (useGasless ? "gasless" : "gas");
+      return { coinType: h.coinType, amount: h.total, path };
+    });
     log.info("treasury/operator: refund dry-run", {
       suiAddress,
-      transfersPlanned: held.map((h) => ({ coinType: h.coinType, amount: h.total.toString() })),
+      transfersPlanned: transfersPlanned.map((t) => ({
+        coinType: t.coinType,
+        amount: t.amount.toString(),
+        path: t.path,
+      })),
     });
     return {
       suiAddress,
       depositAddress,
-      transfers: held.map((h) => ({ coinType: h.coinType, amount: h.total })),
+      transfers: transfersPlanned,
       creditsBefore,
       creditsAfter: 0,
       dryRun: true,
@@ -671,10 +779,13 @@ export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult
     amount: bigint;
     digest: string;
     opId: string;
+    path: SweepPath;
   }> = [];
 
   for (const { coinType, coins, total } of held) {
-    const isSui = coinType === canonicalType(SUI_COIN_TYPE);
+    const isSui = coinType === SUI_CT;
+    const useGasless = !isSui && !forceGas && isGaslessEligible(coinType);
+    const path: SweepPath = isSui ? "gas" : (useGasless ? "gasless" : "gas");
     let amountToSend: bigint;
 
     if (isSui) {
@@ -690,20 +801,27 @@ export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult
       amountToSend = total;
     }
 
-    // Record op BEFORE submission.
+    // Record op BEFORE submission. Path is recorded in initiatedBy.
     const opId = recordOp({
       opKind: "transfer",
       fromAddress: depositAddress,
       toAddress: suiAddress,
       coinTypeIn: coinType,
       amountIn: amountToSend,
-      initiatedBy,
+      initiatedBy: `${initiatedBy}|path:${path}`,
     });
 
-    const tx = new Transaction();
-    tx.setSender(depositAddress);
-
-    if (isSui) {
+    let tx: Transaction;
+    if (useGasless) {
+      tx = buildGaslessTransfer({
+        sender: depositAddress,
+        coinType,
+        amountAtomic: amountToSend,
+        recipient: suiAddress,
+      });
+    } else if (isSui) {
+      tx = new Transaction();
+      tx.setSender(depositAddress);
       coins.sort((a, b) => (b.balance > a.balance ? 1 : -1));
       const gasCoin = coins.find((c) => c.balance >= GAS_RESERVE_MIST);
       if (gasCoin) {
@@ -731,6 +849,9 @@ export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult
         tx.transferObjects([split!], suiAddress);
       }
     } else {
+      // gas-paid non-SUI
+      tx = new Transaction();
+      tx.setSender(depositAddress);
       const primary = tx.object(coins[0]!.objectId);
       if (coins.length > 1) {
         tx.mergeCoins(primary, coins.slice(1).map((c) => tx.object(c.objectId)));
@@ -763,7 +884,7 @@ export async function refundUser(args: RefundUserArgs): Promise<RefundUserResult
       throw err;
     }
 
-    completedTransfers.push({ coinType, amount: amountToSend, digest, opId });
+    completedTransfers.push({ coinType, amount: amountToSend, digest, opId, path });
   }
 
   // Atomically zero the user's credits after all transfers succeeded.

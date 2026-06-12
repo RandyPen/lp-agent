@@ -14,6 +14,8 @@
  * Pattern mirrors cdpm_web/src/lib/lending-config.ts (lines 71–153).
  */
 
+import { normalizeStructTag } from "@mysten/sui/utils";
+
 export type KaiVaultEntry = {
   /** Human label for logging / debugging. */
   symbol: string;
@@ -93,8 +95,13 @@ export const KAI_VAULTS: KaiVaultEntry[] = [
   },
 ];
 
+function norm(t: string): string {
+  try { return normalizeStructTag(t); } catch { return t.trim(); }
+}
+
 export function getKaiVaultByUnderlying(coinType: string): KaiVaultEntry | undefined {
-  return KAI_VAULTS.find((v) => v.underlyingType === coinType);
+  const key = norm(coinType);
+  return KAI_VAULTS.find((v) => norm(v.underlyingType) === key);
 }
 
 export function getKaiVaultByYt(ytType: string): KaiVaultEntry | undefined {
