@@ -11,7 +11,7 @@
  *   - Derived state parameters: market_state, lending_pct, half_width, trend_bias.
  *
  * The ShadowRunner wraps the existing rebalancer strategy decision path. It is
- * wired in by index.ts when `cfg.ml.shadowMode === true && cfg.strategy === "mlAgent"`.
+ * wired in by index.ts when `cfg.ml.shadowMode === true`.
  *
  * Design notes:
  *   - Shadow mode is deliberately NOT integrated into the regular `tickOne` loop
@@ -19,7 +19,15 @@
  *     flag is misconfigured.
  *   - The rebalancer's `tickOne` continues to run the LIVE strategy (rule-based)
  *     as before; the ShadowRunner runs in parallel for observability only.
+ *   - The shadow runner uses a DEDICATED stateMachine instance (separate from the
+ *     live mlAgent's machine). This prevents the shared machine from being
+ *     advanced N× per tick when N PMs are managed (F1 fix).
  *   - DB write failures are logged as warnings and do NOT abort the shadow tick.
+ *   - When STRATEGY=mlAgent AND ML_SHADOW_MODE=true simultaneously, both live
+ *     and shadow write `predictions` rows for the same pool. Shadow rows use
+ *     strategy_label="shadow:mlAgent" (configurable via `strategyLabel`) so they
+ *     are distinguishable. index.ts logs a startup warning when this combo is
+ *     active — see "duplication" note there.
  */
 
 import type { Database } from "bun:sqlite";
@@ -50,10 +58,25 @@ export interface ShadowRunnerDeps {
   mlStrategy: Strategy;
   /** The rule-based fallback strategy used as the comparison baseline. */
   ruleStrategy: Strategy;
-  /** The state machine used by mlAgent (read `.current()` after the decision). */
+  /**
+   * DEDICATED state machine for the shadow path.
+   *
+   * Must be a separate instance from the live mlAgent's state machine.
+   * Sharing the live machine causes it to be advanced N× per tick (once per PM)
+   * making shadow data order-dependent garbage (F1 fix).
+   */
   stateMachine: StateMachine;
   /** SQLite database for writing shadow_decisions rows. */
   db: Database;
+  /**
+   * Label stored in the `model_version` column to distinguish shadow rows from
+   * live prediction rows. Defaults to "shadow:mlAgent".
+   *
+   * When STRATEGY=mlAgent AND ML_SHADOW_MODE=true simultaneously, both paths
+   * write to `predictions` for the same pool. Using distinct labels is the
+   * mechanism that keeps them distinguishable in queries.
+   */
+  strategyLabel?: string;
   /** Injectable clock for tests. */
   now?: () => number;
 }
@@ -108,6 +131,7 @@ function serializeStrategyOutput(output: StrategyOutput): string {
 export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
   const { mlStrategy, ruleStrategy, stateMachine, db } = deps;
   const nowFn = deps.now ?? (() => Date.now());
+  const strategyLabel = deps.strategyLabel ?? "shadow:mlAgent";
 
   // Prepare the insert statement lazily so that a closed/invalid DB at
   // construction time doesn't throw here — it throws at the first tick, where
@@ -183,7 +207,7 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         ctx.lendingPct,
         ctx.halfWidth,
         ctx.trendBias,
-        null, // model_version: populated by a separate query against predictions if needed
+        strategyLabel,
         nowFn(),
       );
 
@@ -193,6 +217,7 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         mlKind: mlOutput.kind,
         ruleKind: ruleOutput?.kind ?? "n/a",
         state: ctx.state,
+        strategyLabel,
       });
     } catch (dbErr) {
       log.warn("shadowRunner: DB write failed", {

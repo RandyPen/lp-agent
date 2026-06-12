@@ -55,7 +55,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from features.registry import build_feature_vector
 from serving.psi import PsiTracker
@@ -73,12 +73,16 @@ COMPLETENESS_FALLBACK_THRESHOLD = 0.7
 
 
 class OhlcvBar(BaseModel):
-    bucketStartMs: int
+    model_config = ConfigDict(populate_by_name=True)
+
+    # Canonical wire name is `ts` (src/prediction/types.ts OhlcvBar.ts);
+    # `bucketStartMs` is accepted as a legacy alias for older payloads.
+    ts: int = Field(..., validation_alias=AliasChoices("ts", "bucketStartMs"))
     open: float
     high: float
     low: float
     close: float
-    volume: float | None = None  # TS OhlcvBar carries no volume; optional here
+    volume: float | None = None  # TS sends volume; optional here (unused by v1 features)
 
 
 class CetusState(BaseModel):
@@ -124,10 +128,10 @@ class ReloadRequest(BaseModel):
 def _bars_frame(bars: list[OhlcvBar], prefix: str, fields: tuple[str, ...]) -> pd.DataFrame:
     if not bars:
         raise ValueError(f"snapshot has no {prefix} bars")
-    rows = sorted(bars, key=lambda b: b.bucketStartMs)
+    rows = sorted(bars, key=lambda b: b.ts)
     data = {f"{prefix}_{f}": [getattr(b, f) for b in rows] for f in fields}
     index = pd.DatetimeIndex(
-        pd.to_datetime([b.bucketStartMs for b in rows], unit="ms", utc=True), name="ts"
+        pd.to_datetime([b.ts for b in rows], unit="ms", utc=True), name="ts"
     )
     df = pd.DataFrame(data, index=index)
     return df[~df.index.duplicated(keep="last")]

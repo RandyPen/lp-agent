@@ -20,11 +20,17 @@ export function buildSuiUsdcProfile(): PoolProfile {
   return {
     name: "sui-usdc",
     poolId: process.env.SUI_USDC_POOL_ID ?? "",
+    // Agent logical convention: coinA=SUI (base), coinB=USDC (quote).
+    // Used for lending routing and PM balance labeling.
     coinTypeA: SUI_TYPE,
     coinTypeB: usdcType,
     decimalsA: 9,
     decimalsB: 6,
-    binStep: 10,
+    // Physical DLMM pool order: Pool<USDC=6, SUI=9>.
+    // Price feeds use these to compute USDC-per-SUI (Binance SUIUSDC convention).
+    poolCoinADecimals: 6,
+    poolCoinBDecimals: 9,
+    binStep: 50,
     pricePairLabel: "SUI/USDC",
     defaultStrategyParams: {
       binWidth: 10,

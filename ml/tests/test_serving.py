@@ -55,18 +55,20 @@ def artifact_root(tmp_path_factory):
 
 
 def make_snapshot(n_bars: int = 120, seed: int = 7) -> dict:
-    """A MarketSnapshot JSON body assembled from synthetic bars (no volume —
-    the TS OhlcvBar type carries none)."""
+    """A MarketSnapshot JSON body assembled from synthetic bars, mirroring the
+    canonical TS wire shape (src/prediction/types.ts OhlcvBar): bar timestamps
+    are sent as ``ts`` and ``volume`` is included."""
 
     def bars(seed_offset: int, start_price: float) -> list[dict]:
         ohlcv = make_ohlcv(n_bars, seed=seed + seed_offset, start_price=start_price)
         return [
             {
-                "bucketStartMs": int(ts.value // 1_000_000),
+                "ts": int(ts.value // 1_000_000),
                 "open": float(row["open"]),
                 "high": float(row["high"]),
                 "low": float(row["low"]),
                 "close": float(row["close"]),
+                "volume": float(row["volume"]),
             }
             for ts, row in ohlcv.iterrows()
         ]
@@ -174,6 +176,27 @@ class TestPredictContract:
         # old (v1.1.0) bundle still serves
         assert client.get("/health").json()["model_version"] == "v1.1.0"
         assert client.post("/predict", json=make_snapshot()).json()["modelVersion"] == "v1.1.0"
+
+    def test_ts_bar_timestamps_match_ts_contract(self, client):
+        """Regression: TS sends bar timestamps as `ts` (src/prediction/types.ts).
+
+        A pydantic field named `bucketStartMs` without an alias used to 422
+        every real /predict call, silently degrading the provider to
+        fallback="sidecar_down"."""
+        snapshot = make_snapshot()
+        assert all("ts" in bar for bar in snapshot["binance"]["sui"])
+        resp = client.post("/predict", json=snapshot)
+        assert resp.status_code == 200
+        assert set(resp.json()) == PREDICTION_RESPONSE_KEYS
+
+    def test_legacy_bucket_start_ms_alias_still_accepted(self, client):
+        snapshot = make_snapshot()
+        for key in ("sui", "btc", "eth"):
+            for bar in snapshot["binance"][key]:
+                bar["bucketStartMs"] = bar.pop("ts")
+        resp = client.post("/predict", json=snapshot)
+        assert resp.status_code == 200
+        assert set(resp.json()) == PREDICTION_RESPONSE_KEYS
 
     def test_empty_bars_rejected_as_422(self, client):
         snapshot = make_snapshot()

@@ -22,6 +22,11 @@ const POOL_ID = "0xpool123";
 const DLMM_PACKAGE = "0x5664f9d3fd82c84023870cfbda8ea84e14c8dd56ce557ad2116e0668581a682b";
 const BIN_STEP = 10;
 
+// SUI/USDC mainnet pool physical orientation: coinA=USDC(6), coinB=SUI(9).
+// Tests default to these unless overridden.
+const POOL_COIN_A_DECIMALS = 6;
+const POOL_COIN_B_DECIMALS = 9;
+
 /** Build a minimal SuiEvent representing a SwapEvent for the given pool / binId. */
 function makeSwapEvent(
   binId: number,
@@ -62,15 +67,30 @@ function makeSwapEvent(
   } as unknown as SuiEvent;
 }
 
-/** Build a fake pool object response for getObject(). */
+/**
+ * Build a fake pool object response matching the REAL on-chain field layout:
+ *   fields.active_id = { fields: { bits: <u32> } }
+ *   fields.bin_manager.fields.bin_step = <number>
+ *
+ * Previous tests used `current_index` and top-level `bin_step` — those fields
+ * do NOT exist on the real pool object.
+ */
 function makePoolObjectResponse(activeBinId: number, binStep: number): object {
   const bits = activeBinId < 0 ? activeBinId + 0x100000000 : activeBinId;
   return {
     data: {
       content: {
         fields: {
-          current_index: { bits },
-          bin_step: binStep,
+          active_id: {
+            type: "0x...::I32",
+            fields: { bits },
+          },
+          bin_manager: {
+            type: "0x...::BinManager",
+            fields: {
+              bin_step: binStep,
+            },
+          },
         },
       },
     },
@@ -137,19 +157,22 @@ describe("createCetusEventsFeed", () => {
       const client = makeFakePoolClient(0, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
-        binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
       });
       const state = feed.latest();
       expect(state.activeBin).toBe(0);
-      expect(state.binStep).toBe(BIN_STEP);
+      // binStep is 0 before first poll (the pool object provides the real value).
+      expect(typeof state.binStep).toBe("number");
     });
 
     it("lastUpdatedMs() is 0 before first poll", () => {
       const client = makeFakePoolClient(-5990, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
-        binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
       });
       expect(feed.lastUpdatedMs()).toBe(0);
@@ -158,12 +181,14 @@ describe("createCetusEventsFeed", () => {
 
   describe("after polling", () => {
     it("updates activeBin and price after start()", async () => {
-      // bin id -5990 with binStep=10: price = (1.001)^-5990
+      // bin id -5990 with binStep=10:
+      // priceFromBinIdAsQuote(-5990, 10, 6, 9) = 10^3 / (1.001^-5990) = 1000 * (1.001^5990)
       const binId = -5990;
       const client = makeFakePoolClient(binId, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
-        binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
         pollIntervalMs: 1_000_000, // don't auto-repoll in tests
       });
@@ -184,7 +209,8 @@ describe("createCetusEventsFeed", () => {
       const client = makeFakePoolClient(binId, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
-        binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
         pollIntervalMs: 1_000_000,
       });
@@ -201,6 +227,8 @@ describe("createCetusEventsFeed", () => {
       const client = makeFakePoolClient(-5990, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
         pollIntervalMs: 1_000_000,
       });
@@ -216,6 +244,8 @@ describe("createCetusEventsFeed", () => {
       const client = makeFakePoolClient(-5990, BIN_STEP);
       const feed = createCetusEventsFeed({
         poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
         pollIntervalMs: 1_000_000,
       });
@@ -235,9 +265,146 @@ describe("createCetusEventsFeed", () => {
   describe("stop function", () => {
     it("stop() can be called multiple times without throwing", () => {
       const client = makeFakePoolClient(-5990, BIN_STEP);
-      const feed = createCetusEventsFeed({ poolId: POOL_ID, clientOverride: client });
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: client,
+      });
       const stop = feed.start();
       expect(() => { stop(); stop(); }).not.toThrow();
+    });
+  });
+
+  describe("pool object field shape regression", () => {
+    it("throws with an explicit error when active_id is missing (not silent defaults)", async () => {
+      // Pool object with the OLD (wrong) field layout: current_index at top-level.
+      // This should throw — not silently default to activeBin=0.
+      const badClient = {
+        getObject: async () => ({
+          data: {
+            content: {
+              fields: {
+                current_index: { bits: 1442 }, // wrong path — should be active_id.fields.bits
+                bin_step: 50,                   // wrong path — should be bin_manager.fields.bin_step
+              },
+            },
+          },
+        }),
+      };
+
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: badClient,
+        pollIntervalMs: 1_000_000,
+      });
+
+      // start() fires the first poll; the error is caught and logged at 'error' level.
+      // We verify the underlying queryPoolState throws by calling the feed and
+      // checking the feed was NOT updated (lastUpdatedMs remains 0).
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      // lastUpdatedMs should still be 0 because the poll errored.
+      expect(feed.lastUpdatedMs()).toBe(0);
+    });
+
+    it("throws when pool object has no content fields at all", async () => {
+      const emptyClient = {
+        getObject: async () => ({ data: {} }),
+      };
+
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: emptyClient,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.lastUpdatedMs()).toBe(0);
+    });
+
+    it("reads binStep from bin_manager.fields.bin_step (not top-level)", async () => {
+      // Real layout: binStep lives at fields.bin_manager.fields.bin_step = 50.
+      const client = makeFakePoolClient(1442, 50);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.latest().binStep).toBe(50);
+    });
+  });
+
+  describe("price normalization", () => {
+    it("produces human USDC-per-SUI price close to Binance for the live mainnet numbers", async () => {
+      // Ground truth (verified 2026-06 against mainnet):
+      //   active_id.bits = 1442, binStep = 50, pool = Pool<USDC=6, SUI=9>
+      //   Binance SUIUSDC ≈ 0.7486; expected feed price ≈ 0.7526 (within 1%)
+      //
+      // Formula: priceFromBinIdAsQuote(1442, 50, 6, 9)
+      //   = 10^(9-6) / (1.005^1442)
+      //   = 1000 / 1328.8
+      //   ≈ 0.7526
+      const client = makeFakePoolClient(1442, 50);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: 6,
+        poolCoinBDecimals: 9,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      const state = feed.latest();
+      expect(state.activeBin).toBe(1442);
+      expect(state.binStep).toBe(50);
+
+      const price = Number(state.price);
+      // Expected: ~0.7526. Allow ±5% for rounding in toPrecision.
+      expect(price).toBeGreaterThan(0.70);
+      expect(price).toBeLessThan(0.80);
+      // Tighter check: within 1% of 0.7526.
+      expect(Math.abs(price - 0.7526) / 0.7526).toBeLessThan(0.01);
+    });
+
+    it("price is NOT in lamport units (must be < 100 for a sub-dollar token)", async () => {
+      // The old broken formula returned ~1328.8 (lamport-B-per-A).
+      // After the fix, price must be a human value < 100.
+      const client = makeFakePoolClient(1442, 50);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: 6,
+        poolCoinBDecimals: 9,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      const price = Number(feed.latest().price);
+      expect(price).toBeLessThan(100);
+      expect(price).toBeGreaterThan(0);
     });
   });
 });
@@ -264,6 +431,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: baseTs - 1,
         clientOverride: client,
         onBatch: (b) => { batches.push(b); },
@@ -287,6 +456,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         clientOverride: client,
         onBatch: (b) => b.forEach((r) => records.push(r)),
       });
@@ -297,6 +468,35 @@ describe("backfillSwapEvents", () => {
       expect(first.binId).toBe(-5990);
       expect(typeof first.price).toBe("string");
       expect(Number(first.price)).toBeGreaterThan(0);
+    });
+
+    it("stores human prices (not lamport-level raw ratios) in price records", async () => {
+      // binId=1442, binStep=50, poolCoinADecimals=6, poolCoinBDecimals=9
+      // Expected price ≈ 0.7526 (USDC/SUI), not 1328.8 (lamport-B/A raw ratio).
+      const baseTs = 1_700_000_000_000;
+      const events = [makeSwapEvent(1442, baseTs, "tx1", "0")];
+      const client = makeQueryEventsClient([
+        { events, hasNextPage: false, nextCursor: null },
+      ]);
+
+      const records: SwapEventRecord[] = [];
+      await backfillSwapEvents({
+        poolId: POOL_ID,
+        binStep: 50,
+        poolCoinADecimals: 6,
+        poolCoinBDecimals: 9,
+        clientOverride: client,
+        onBatch: (b) => b.forEach((r) => records.push(r)),
+      });
+
+      expect(records.length).toBe(1);
+      const r = records[0]!;
+      expect(r.binId).toBe(1442);
+      const price = Number(r.price);
+      expect(price).toBeGreaterThan(0.70);
+      expect(price).toBeLessThan(0.80);
+      // Must NOT be lamport-level (which would be ~1328.8).
+      expect(price).toBeLessThan(100);
     });
   });
 
@@ -330,6 +530,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: baseTs - 1,
         clientOverride: client,
         onBatch: (b) => b.forEach((r) => allRecords.push(r)),
@@ -356,6 +558,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: cutoff,
         clientOverride: client,
         onBatch: (b) => b.forEach((r) => allRecords.push(r)),
@@ -383,6 +587,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: baseTs - 200,
         clientOverride: client,
         onBatch: (b) => b.forEach((r) => allRecords.push(r)),
@@ -408,6 +614,8 @@ describe("backfillSwapEvents", () => {
         backfillSwapEvents({
           poolId: POOL_ID,
           binStep: BIN_STEP,
+          poolCoinADecimals: POOL_COIN_A_DECIMALS,
+          poolCoinBDecimals: POOL_COIN_B_DECIMALS,
           fromMs: 0,
           clientOverride: client,
           onBatch: (b) => b.forEach((r) => records.push(r)),
@@ -433,6 +641,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: baseTs,
         clientOverride: client,
         onBatch: (b) => b.forEach((r) => allRecords.push(r)),
@@ -453,6 +663,8 @@ describe("backfillSwapEvents", () => {
         backfillSwapEvents({
           poolId: POOL_ID,
           binStep: BIN_STEP,
+          poolCoinADecimals: POOL_COIN_A_DECIMALS,
+          poolCoinBDecimals: POOL_COIN_B_DECIMALS,
           clientOverride: client,
           onBatch: (b) => b.forEach((r) => records.push(r)),
         }),
@@ -480,6 +692,8 @@ describe("backfillSwapEvents", () => {
       await backfillSwapEvents({
         poolId: POOL_ID,
         binStep: BIN_STEP,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
         fromMs: 0,
         toMs,
         clientOverride: client,

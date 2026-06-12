@@ -101,8 +101,9 @@ export const LENDING_PCT_BASE: Record<MarketState, number> = {
   EXTREME: 1.00,
 };
 
-/** L1 soft circuit-breaker: lending percentage bonus (+10pp). */
-export const L1_LENDING_BONUS = 0.10;
+// L1_LENDING_BONUS was removed (F6): the L1 soft circuit bonus is applied
+// exclusively in mlAgent via the RiskVeto.lendingPctBonusPp field.
+// deriveLendingPct no longer accepts an l1Bonus parameter.
 
 // ---------------------------------------------------------------------------
 // Continuous parameter derivation functions
@@ -124,11 +125,24 @@ export function deriveHalfWidth(widthSigma: number): number {
  * Derive the tolerance in bins before a recenter is triggered.
  *
  *   toleranceBins = max(1, round(widthSigma))
+ *   capped at `halfWidth` (pre-W5-grid-search sanity bound — F4)
  *
  * A wider predicted distribution tolerates more drift before recentering.
+ *
+ * The cap at `halfWidth` prevents a pathological case at real SUI volatility
+ * where widthSigma exceeds HALF_WIDTH_MAX (8): without the cap, toleranceBins
+ * can exceed halfWidth, making the tolerance guard permanently true (the
+ * position center can never drift farther than halfWidth bins from the target).
+ * The cap ensures toleranceBins ≤ halfWidth so the guard remains meaningful.
+ * W5 grid-search will calibrate the exact ratio; this is a pre-calibration
+ * safety bound only.
+ *
+ * @param widthSigma - predicted distribution width in bin units
+ * @param halfWidth  - derived halfWidth for this tick (from deriveHalfWidth)
  */
-export function deriveToleranceBins(widthSigma: number): number {
-  return Math.max(1, Math.round(widthSigma));
+export function deriveToleranceBins(widthSigma: number, halfWidth: number): number {
+  const raw = Math.max(1, Math.round(widthSigma));
+  return Math.min(raw, halfWidth);
 }
 
 /**
@@ -174,17 +188,17 @@ export function deriveTrendBias(pAbove: number, pBelow: number): number {
  *               base(50%) + (70% − 50%) × |trendBias|
  *   EXTREME → 100 %
  *
- * L1 soft circuit-breaker bonus: +10 pp applied after state baseline, then
- * clamped to [0, 1].
+ * Note: the L1 soft circuit-breaker bonus (+10 pp) is applied EXTERNALLY in
+ * mlAgent via RiskVeto.lendingPctBonusPp — not here. This function always
+ * returns the state-machine baseline with no L1 adjustment (F6 dead-code removal).
  */
 export function deriveLendingPct(
   state: MarketState,
   trendBias: number,
-  l1Bonus: boolean,
 ): number {
   let base: number;
   if (state === "EXTREME") {
-    base = LENDING_PCT_BASE.EXTREME;  // 1.0 — bonus does not matter
+    base = LENDING_PCT_BASE.EXTREME;  // 1.0
   } else if (state === "TREND") {
     // 50% + linear ramp of up to 20pp based on |trendBias| strength
     base = LENDING_PCT_BASE.TREND + 0.20 * Math.abs(trendBias);
@@ -192,6 +206,5 @@ export function deriveLendingPct(
     base = LENDING_PCT_BASE.NORMAL;
   }
 
-  const withBonus = l1Bonus ? base + L1_LENDING_BONUS : base;
-  return Math.max(0, Math.min(1, withBonus));
+  return Math.max(0, Math.min(1, base));
 }

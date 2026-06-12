@@ -8,6 +8,7 @@
  *   bun run backtest --strategy=multiBinSpot --from=2026-04-01 --to=2026-05-01
  *   bun run backtest --strategy=singleBin --db=./data/app.db --initial-a=100000000000 --initial-b=250000000
  *   bun run backtest --json    # emit per-tick records as JSON to stdout
+ *   bun run backtest --help    # print usage and exit
  */
 
 import { Database } from "bun:sqlite";
@@ -16,6 +17,40 @@ import { buildSuiUsdcProfile } from "../pools/sui-usdc.ts";
 import { isStrategyName, listStrategyNames } from "../strategies/registry.ts";
 import { runBacktest } from "./replay.ts";
 import type { PriceObservation } from "../domain/types.ts";
+
+// ---------------------------------------------------------------------------
+// Help text
+// ---------------------------------------------------------------------------
+
+const USAGE = `
+backtest — offline strategy replay against historical price_observations
+
+Usage:
+  bun run backtest [options]
+
+Options:
+  --strategy=<name>        Strategy to replay (required unless using default).
+                           Available: singleBin | multiBinSpot | emaTrend
+                           Note: mlAgent cannot be backtested offline — it
+                           requires the live Python prediction sidecar. See
+                           docs/implementation-plan-v1.md §W5 for the planned
+                           shadow-vs-backtest comparison workflow.
+  --pool=<name>            Pool profile name. Default: sui-usdc
+  --db=<path>              Path to SQLite database. Default: ./data/app.db
+  --from=<date|ms>         Start timestamp (ISO date or epoch ms). Default: beginning
+  --to=<date|ms>           End timestamp (ISO date or epoch ms). Default: now
+  --initial-a=<atomic>     Initial balance of coin A in atomic units. Default: 100000000000
+  --initial-b=<atomic>     Initial balance of coin B in atomic units. Default: 250000000
+  --history-window-ms=<ms> Price history window for strategy context. Default: 300000 (5 min)
+  --json                   Emit per-tick records as JSON lines to stdout
+  --help, -h               Print this help and exit
+
+Examples:
+  bun run backtest --strategy=multiBinSpot
+  bun run backtest --strategy=emaTrend --from=2026-04-01 --to=2026-05-01
+  bun run backtest --strategy=singleBin --db=./data/app.db --json
+`.trimStart();
+
 
 interface CliArgs {
   pool: string;
@@ -29,7 +64,13 @@ interface CliArgs {
   json: boolean;
 }
 
-function parseArgs(argv: string[]): CliArgs {
+interface ParseArgsResult {
+  args: CliArgs;
+  /** true when --help/-h was passed; caller should print usage and exit 0. */
+  help: boolean;
+}
+
+function parseArgs(argv: string[]): ParseArgsResult {
   const args: CliArgs = {
     pool: "sui-usdc",
     strategy: "multiBinSpot",
@@ -46,6 +87,9 @@ function parseArgs(argv: string[]): CliArgs {
     if (raw === "--json") {
       args.json = true;
       continue;
+    }
+    if (raw === "--help" || raw === "-h") {
+      return { args, help: true };
     }
     if (!raw.startsWith("--")) continue;
     const eq = raw.indexOf("=");
@@ -81,7 +125,7 @@ function parseArgs(argv: string[]): CliArgs {
         console.warn(`backtest: unknown arg --${key}=${val} (ignored)`);
     }
   }
-  return args;
+  return { args, help: false };
 }
 
 function parseTimestamp(raw: string): number {
@@ -149,11 +193,28 @@ function printSummary(summary: import("./types.ts").BacktestSummary): void {
 }
 
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  const { args, help } = parseArgs(process.argv.slice(2));
+
+  if (help) {
+    process.stdout.write(USAGE);
+    process.exit(0);
+  }
+
+  // Early friendly error for mlAgent before touching the DB or registry.
+  if (args.strategy === "mlAgent") {
+    console.error(
+      "backtest: mlAgent cannot be backtested offline — it requires the live Python " +
+      "prediction sidecar to be running and serving /predict requests.\n" +
+      "See docs/implementation-plan-v1.md §W5 for the planned shadow-vs-backtest " +
+      "comparison workflow. Use a rule-based strategy (singleBin, multiBinSpot, " +
+      "emaTrend) for offline replay.",
+    );
+    process.exit(1);
+  }
 
   if (!isStrategyName(args.strategy)) {
     console.error(
-      `Unknown strategy '${args.strategy}'. Available: ${listStrategyNames().join(", ")}`,
+      `Unknown strategy '${args.strategy}'. Available: ${listStrategyNames().filter((s) => s !== "mlAgent").join(", ")}`,
     );
     process.exit(1);
   }

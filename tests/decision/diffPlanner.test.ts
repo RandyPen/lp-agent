@@ -69,6 +69,7 @@ function makeCtx(state: StateContext["state"], overrides: Partial<StateContext> 
     trendBias: 0,
     lendingPct: state === "EXTREME" ? 1 : state === "TREND" ? 0.5 : 0.35,
     toleranceBins: 2,
+    maxCenterOffset: 2,
     minDwellMs: state === "EXTREME" ? 10 * 60 * 1000 : 15 * 60 * 1000,
     ...overrides,
   };
@@ -197,10 +198,9 @@ describe("diffPlan — NORMAL state", () => {
     }
   });
 
-  it("clips center offset to ±maxCenterOffset (derived from toleranceBins)", () => {
-    // toleranceBins = 1 → maxCenterOffset = 1
-    // pred centerOffset = 10 → should be clipped to ±1
-    const ctx = makeCtx("NORMAL", { toleranceBins: 1, halfWidth: 2 });
+  it("clips center offset to ±maxCenterOffset (from ctx.maxCenterOffset — F5)", () => {
+    // maxCenterOffset = 1 (explicit), pred centerOffset = 10 → should be clipped to ±1
+    const ctx = makeCtx("NORMAL", { toleranceBins: 1, maxCenterOffset: 1, halfWidth: 2 });
     const pred = makePred({ centerOffset: 10 });
     const plan = diffPlan(makeInput({ ctx, pred }));
     expect(plan).not.toBeNull();

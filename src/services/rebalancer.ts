@@ -216,6 +216,13 @@ export function createRebalancerService(
   log.info("rebalancer: strategy selected", { name: strategy.name });
   const agentAddress = getAgentAddress();
 
+  // G2 fix: track last EVALUATION time per PM (not last succeeded rebalance).
+  // The cooldown anchors on last evaluation so that a rapid crash 2 min after
+  // a NORMAL tick does not wait ~18 more minutes for response. Per-PM map is
+  // reset on restart (in-memory), which is safe: a fresh process simply evaluates
+  // immediately on the first scheduler heartbeat.
+  const lastEvalMs = new Map<string, number>();
+
   async function tickOne(pmId: string): Promise<void> {
     // Short correlation id so every log line + DB row produced by this tick
     // can be threaded together. Crockford-base32-ish — readable in journals.
@@ -226,28 +233,46 @@ export function createRebalancerService(
       // Effective cooldown — for mlAgent the state machine provides the interval.
       const effectiveCooldown = getEffectiveCooldownMs(cfg, mlDeps);
 
-      // Cooldown check: look at the most recent succeeded rebalance.
-      const lastRow = db
-        .query<RebalanceRow, [string]>(
-          `SELECT id, submitted_at_ms, status
-           FROM rebalances
-           WHERE pm_id = ? AND status = 'succeeded'
-           ORDER BY planned_at_ms DESC
-           LIMIT 1`,
-        )
-        .get(pmId);
+      // G2 fix: when L2 or L3 risk is active for the pool, bypass the eval-interval
+      // cooldown so the next scheduler heartbeat evaluates immediately. We check the
+      // risk level before the cooldown gate because the risk monitor only knows the
+      // poolId (not pmId) at this point. We derive poolId from the subscriptions
+      // cache; if missing we fall through to the normal cooldown path.
+      //
+      // Cooldown anchor: use lastEvalMs (last evaluation, successful or not) rather
+      // than last succeeded rebalance. A failed or quiet tick still "used" the eval
+      // slot — anchoring on last-success would re-evaluate immediately after every
+      // quiet tick, defeating the cooldown.
+      const poolIdForPm = subscriptions.listActive().find((s) => s.pmId === pmId)?.poolId;
+      const riskLevel = poolIdForPm && mlDeps
+        ? mlDeps.riskMonitor.activeLevel(poolIdForPm)
+        : null;
+      const riskActive = riskLevel === "L2" || riskLevel === "L3";
 
-      if (lastRow && lastRow.submitted_at_ms !== null) {
-        const elapsed = Date.now() - lastRow.submitted_at_ms;
-        if (elapsed < effectiveCooldown) {
-          log.debug("rebalancer: cooldown active, skipping tick", {
-            tickId,
-            pmId,
-            remainingMs: effectiveCooldown - elapsed,
-          });
-          return;
-        }
+      const lastEval = lastEvalMs.get(pmId) ?? 0;
+      const evalElapsed = Date.now() - lastEval;
+
+      if (!riskActive && evalElapsed < effectiveCooldown) {
+        log.debug("rebalancer: cooldown active, skipping tick", {
+          tickId,
+          pmId,
+          remainingMs: effectiveCooldown - evalElapsed,
+        });
+        return;
       }
+
+      if (riskActive) {
+        log.debug("rebalancer: bypassing cooldown due to active risk level", {
+          tickId,
+          pmId,
+          riskLevel,
+        });
+      }
+
+      // Record this as an evaluation (before any early returns below, so even
+      // authorization failures count as an evaluation attempt and don't cause
+      // a tight loop on permanently-revoked PMs).
+      lastEvalMs.set(pmId, Date.now());
 
       // Authorization check. If we missed an AgentRemoved event (RPC hiccup),
       // hard-delete the row here too — matches subscriptions.ts behaviour so

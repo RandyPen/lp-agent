@@ -10,11 +10,31 @@ export interface PoolProfile {
   name: string;
   /** DLMM pool object id on the active network. */
   poolId: string;
-  /** Fully-qualified type tags. coin_type_a is the "base" token of the pool. */
+  /**
+   * Fully-qualified type tags.
+   *
+   * NOTE: `coinTypeA` / `coinTypeB` reflect the agent's logical convention (used for
+   * lending routing and balance labeling), NOT necessarily the DLMM pool's physical
+   * coin order. The physical pool order matters only for price math — use
+   * `poolCoinADecimals` / `poolCoinBDecimals` when it differs from `decimalsA` / `decimalsB`.
+   */
   coinTypeA: string;
   coinTypeB: string;
   decimalsA: number;
   decimalsB: number;
+  /**
+   * Physical coin decimals as stored in the DLMM pool object (Pool<coinA, coinB>).
+   * Present only when the pool's physical coin order differs from the agent's logical
+   * convention above.
+   *
+   * For the SUI/USDC mainnet pool: Pool<USDC=6, SUI=9>, so `poolCoinADecimals=6`,
+   * `poolCoinBDecimals=9`. Price feeds use these to compute the human price in the
+   * Binance SUIUSDC convention (USDC per SUI).
+   *
+   * When absent, price feeds fall back to `decimalsA` / `decimalsB`.
+   */
+  poolCoinADecimals?: number;
+  poolCoinBDecimals?: number;
   /** Bin step in basis points (1 = 0.01%). Verified at runtime against on-chain pool. */
   binStep: number;
   /** Used to look up external prices (e.g. "SUI/USDC"). */

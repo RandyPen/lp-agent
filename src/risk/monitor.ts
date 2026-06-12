@@ -57,10 +57,33 @@ export interface RiskMonitor {
    */
   checkPreTick(input: StrategyInput): RiskVeto | null;
   /**
-   * Feed a fresh market snapshot into the rolling windows. Call this on every
-   * new snapshot arrival (not only on rebalancer ticks).
+   * Feed a fresh market snapshot into the rolling windows for the given pool.
+   * This is the primary ingestion path. Always pass an explicit poolId so that
+   * per-pool windows are correctly keyed.
+   *
+   * Call this on every new snapshot arrival (not only on rebalancer ticks) so
+   * the windows are warm before the first checkPreTick on each tick.
    */
-  observe(snapshot: MarketSnapshot, pred?: PredictionResponse): void;
+  observeForPool(poolId: string, snapshot: MarketSnapshot, pred?: PredictionResponse): void;
+  /**
+   * Set the 24-hour PnL fraction for a pool. The value must be a fraction
+   * (e.g. -0.05 = -5%). Only call this when a genuine PnL-pct figure is
+   * available (e.g. from a PnL-attribution service); do not fabricate a value
+   * by converting absolute USD PnL without a portfolio-value denominator.
+   */
+  set24hPnl(poolId: string, pnlFraction: number): void;
+  /**
+   * Returns true when the risk monitor considers volatility to have recovered
+   * enough to allow an EXTREME→normal exit for the given pool.
+   *
+   * Equivalent to the canExitExtreme check in the monitor's evaluateL2 path:
+   * all L2 triggers clear + vol below VOLATILITY_RECOVERY_THRESHOLD +
+   * EXTREME_STABLE_REQUIRED_MS elapsed.
+   *
+   * The state machine calls this (via mlAgent) instead of computing its own
+   * proxy from pred values.
+   */
+  volRecovered(poolId: string): boolean;
   /**
    * Return the highest active level for `poolId`, or null when no circuit is
    * currently active.
@@ -78,9 +101,21 @@ interface PoolRiskState {
   spreadWindow: SpreadPoint[];
   /** Latest snapshot timestamp, or null before first observation. */
   latestSnapshotTs: number | null;
-  /** Latest pAbove + pBelow from predictions. */
-  latestPBreakSum: number;
-  /** Latest 24h PnL fraction. Updated externally by the caller via observe(). */
+  /**
+   * Latest pAbove from a non-fallback prediction, stored separately so that
+   * checkPreTick can call checkPBreakSum with the real values instead of
+   * reconstructing them from a sum via a symmetric approximation.
+   */
+  latestPAbove: number;
+  /** Latest pBelow from a non-fallback prediction. */
+  latestPBelow: number;
+  /**
+   * Epoch ms of the most recent non-fallback prediction stored here.
+   * Used to expire stale prediction data before running the pBreakSum
+   * pre-tick check. null when no prediction has been observed yet.
+   */
+  latestPredTs: number | null;
+  /** Latest 24h PnL fraction (caller-supplied via set24hPnl). */
   latest24hPnl: number;
   /** Whether L2 circuit is currently active for this pool. */
   extremeActive: boolean;
@@ -106,6 +141,12 @@ const EXTREME_STABLE_REQUIRED_MS = 10 * 60 * 1000;
 const VOLATILITY_RECOVERY_THRESHOLD = 0.07;
 /** Max window entries to keep per pool (prune oldest when exceeded). */
 const MAX_WINDOW_ENTRIES = 500;
+/**
+ * Maximum age of a stored prediction before the pBreakSum pre-tick check is
+ * skipped. Set to 2× the NORMAL eval interval (40 min) — a prediction older
+ * than this is too stale to be used as a circuit-breaker signal.
+ */
+const PRED_STALE_THRESHOLD_MS = 2 * 20 * 60 * 1000; // 40 min
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -159,7 +200,9 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         tvlWindow: [],
         spreadWindow: [],
         latestSnapshotTs: null,
-        latestPBreakSum: 0,
+        latestPAbove: 0,
+        latestPBelow: 0,
+        latestPredTs: null,
         latest24hPnl: 0,
         extremeActive: false,
         extremeEnteredAtMs: null,
@@ -199,25 +242,14 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   }
 
   // ---------------------------------------------------------------------------
-  // observe() — feed rolling windows
+  // observeForPool() — feed rolling windows
+  //
+  // This is the sole ingestion path. Callers must always supply an explicit
+  // poolId — the heuristic activeBin+price-prefix keying that `observe()` used
+  // caused a memory leak (every new activeBin created a new pool entry) and
+  // permanently-cold windows for the actual pool. There is no `observe()`
+  // without a poolId; all callers (mlAgent, tests) use `observeForPool`.
   // ---------------------------------------------------------------------------
-
-  function observe(snapshot: MarketSnapshot, pred?: PredictionResponse): void {
-    const poolId = snapshot.cetus.activeBin.toString(); // keyed by pool context
-    // Note: poolId is derived from snapshot.cetus but we need to store per cetus pool.
-    // The snapshot doesn't carry an explicit poolId field, so we derive it from the
-    // cetus price string + binStep combination. In practice, the monitor is instantiated
-    // per pool, but the interface is designed to handle multiple pools.
-    // For now, use the spread + activeBin as a proxy, or the caller must ensure
-    // snapshot.cetus.price is unique per pool. Since MarketSnapshot does not have
-    // a poolId field, we use a composite key.
-    //
-    // In the integration layer (mlAgent / rebalancer), the caller passes snapshots
-    // that are scoped to a specific pool already. We'll use the binStep+activeBin
-    // composite as the pool discriminator, but real usage should call
-    // observeForPool() with explicit poolId.
-    observeForPool(snapshot.cetus.activeBin + ":" + snapshot.cetus.price.slice(0, 8), snapshot, pred);
-  }
 
   function observeForPool(
     poolId: string,
@@ -240,7 +272,8 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       pruneWindow(state.tvlWindow, ts - WINDOW_5M_MS - 60_000);
     }
 
-    // Update spread window (absolute value stored, sign not needed for L2)
+    // Update spread window
+    // SpreadPoint.spread stores the SIGNED spread value; consumers take abs() as needed.
     if (Number.isFinite(snapshot.spread)) {
       state.spreadWindow.push({ ts, spread: snapshot.spread });
       pruneWindow(state.spreadWindow, ts - SPREAD_LOOKBACK_MS - 60_000);
@@ -249,9 +282,12 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     // Update snapshot timestamp
     state.latestSnapshotTs = ts;
 
-    // Update pBreakSum from prediction if available
+    // Store pAbove and pBelow separately (F7) so the pre-tick check can
+    // call checkPBreakSum with the real values rather than splitting a sum.
     if (pred && pred.fallback === false) {
-      state.latestPBreakSum = pred.pAbove + pred.pBelow;
+      state.latestPAbove = pred.pAbove;
+      state.latestPBelow = pred.pBelow;
+      state.latestPredTs = ts;
     }
 
     // Evaluate L2 triggers and update extremeActive
@@ -286,8 +322,13 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     triggerResults.push(spreadResult);
 
     // --- pBreakSum trigger (from prediction) ---
+    // Use the freshly-passed pred when available; otherwise fall back to the
+    // stored values from the most recent non-fallback observation (F7).
     if (pred && pred.fallback === false) {
       const pBreakResult = checkPBreakSum(pred.pAbove, pred.pBelow, thresholds.pBreakSum);
+      triggerResults.push(pBreakResult);
+    } else if (state.latestPredTs !== null) {
+      const pBreakResult = checkPBreakSum(state.latestPAbove, state.latestPBelow, thresholds.pBreakSum);
       triggerResults.push(pBreakResult);
     }
 
@@ -422,15 +463,19 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       );
       const outageResult = checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now);
       const pnlResult = checkPnl24h(state.latest24hPnl, thresholds.pnl24hPct);
-      const pBreakResult = checkPBreakSum(
-        state.latestPBreakSum / 2, // approximate pAbove and pBelow symmetrically
-        state.latestPBreakSum / 2,
-        thresholds.pBreakSum,
-      );
+      // Only include the pBreakSum check when the stored prediction is fresh
+      // enough to be meaningful (F7: skip when older than 2× NORMAL eval interval).
+      const predIsFresh =
+        state.latestPredTs !== null &&
+        now - state.latestPredTs < PRED_STALE_THRESHOLD_MS;
+      const pBreakResult = predIsFresh
+        ? checkPBreakSum(state.latestPAbove, state.latestPBelow, thresholds.pBreakSum)
+        : null;
 
       // Find the first firing trigger for the reason string
-      const firing = [volResult, tvlResult, spreadResult, outageResult, pnlResult, pBreakResult]
-        .find((r) => r.fires);
+      const allTriggers = [volResult, tvlResult, spreadResult, outageResult, pnlResult];
+      if (pBreakResult !== null) allTriggers.push(pBreakResult);
+      const firing = allTriggers.find((r) => r.fires);
 
       const triggerName = firing?.metric ?? "unknown";
 
@@ -498,24 +543,58 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   }
 
   // ---------------------------------------------------------------------------
+  // volRecovered() — expose the canExitExtreme check to the state machine (F2)
+  // ---------------------------------------------------------------------------
+
+  function volRecovered(poolId: string): boolean {
+    const state = poolStates.get(poolId);
+    if (!state || !state.extremeActive) {
+      // No EXTREME state active → trivially "recovered".
+      return true;
+    }
+    const now = nowMs();
+    const volResult = checkVolatility5m(state.priceWindow, thresholds.extremeVolatility5m, now);
+    // canExitExtreme also checks all L2 triggers. Re-derive the full result set here.
+    const tvlResult = checkTvlDrop5m(state.tvlWindow, thresholds.tvlDrop5m, now);
+    const spreadResult = checkSpreadSustained(
+      state.spreadWindow,
+      thresholds.spreadExtreme,
+      thresholds.spreadSustainMs,
+      now,
+    );
+    const outageResult = checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now);
+    const pnlResult = checkPnl24h(state.latest24hPnl, thresholds.pnl24hPct);
+    const triggerResults = [volResult, tvlResult, spreadResult, outageResult, pnlResult];
+    const predIsFresh =
+      state.latestPredTs !== null &&
+      now - state.latestPredTs < PRED_STALE_THRESHOLD_MS;
+    if (predIsFresh) {
+      triggerResults.push(checkPBreakSum(state.latestPAbove, state.latestPBelow, thresholds.pBreakSum));
+    }
+
+    return canExitExtreme({
+      triggerResults,
+      enteredAtMs: state.extremeEnteredAtMs ?? now,
+      stableRequiredMs: EXTREME_STABLE_REQUIRED_MS,
+      nowMs: now,
+      volatilityRecoveryThreshold: VOLATILITY_RECOVERY_THRESHOLD,
+      currentVolatility5m: volResult.observed,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Return the RiskMonitor interface
   // ---------------------------------------------------------------------------
 
-  // Expose observeForPool for direct pool-scoped observation (used by tests
-  // and integration points that have an explicit poolId).
-  const monitor: RiskMonitor & {
-    observeForPool(poolId: string, snapshot: MarketSnapshot, pred?: PredictionResponse): void;
-    set24hPnl(poolId: string, pnl: number): void;
-    emergencyStop: EmergencyStop;
-  } = {
+  const monitor: RiskMonitor & { emergencyStop: EmergencyStop } = {
     checkPreTick,
-    observe,
     observeForPool,
-    activeLevel,
-    set24hPnl(poolId: string, pnl: number): void {
+    set24hPnl(poolId: string, pnlFraction: number): void {
       const state = getOrCreatePoolState(poolId);
-      state.latest24hPnl = pnl;
+      state.latest24hPnl = pnlFraction;
     },
+    volRecovered,
+    activeLevel,
     emergencyStop,
   };
 

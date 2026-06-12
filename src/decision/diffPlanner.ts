@@ -159,15 +159,28 @@ function computeNormalWeights(
 /**
  * Compute per-bin weight vector for TREND state.
  *
+ * Two regimes with deliberately different direction semantics (F9):
+ *
  * Weak trend (|trendBias| ≤ 0.7):
  *   Normal-shaped weights around active bin, with directional skew applied:
- *     k < activeBin (bid side): w *= (1 + 0.3 × trendBias)   [positive = bullish = more bids]
+ *     k < activeBin (bid side): w *= (1 + 0.3 × trendBias)
  *     k > activeBin (ask side): w *= (1 - 0.3 × trendBias)
+ *   When trendBias > 0 (bullish): BIDS are boosted (more coinA placed below active).
+ *   This provides liquidity on the anticipated continuation side — i.e. we expect
+ *   the price to move up, so we hold more bid inventory to be sold as price rises.
+ *   NOTE: this "follow-trend" direction (boosting the side in the trend direction)
+ *   is the OPPOSITE of a counter-trend positioning. Whether to follow or fade the
+ *   trend at weak-bias levels is to be validated in the W5 grid search / shadow data.
  *
  * Strong trend (|trendBias| > 0.7):
- *   Only 1–3 bins on the *counter-trend* side.
- *   Scale = 25 % of market capital (the remaining 75 % goes to lending).
- *   Returns weights for those 1–3 bins only; the caller applies the 25 % scaling.
+ *   Only 1–3 bins on the *counter-trend* side (25 % of market capital; 75 % to lending).
+ *   trendBias > 0 (bullish) → counter-trend = bid side (below active), preparing for
+ *     a potential reversal by holding liquidity below current price.
+ *   trendBias < 0 (bearish) → counter-trend = ask side (above active).
+ *   NOTE: this "fade-the-trend" direction at strong bias (|bias|>0.7) is intentionally
+ *   opposite to the weak-trend regime's "follow-trend" boost. The switch in direction
+ *   semantics at the |bias|=0.7 boundary is a deliberate design choice that warrants
+ *   validation in W5 grid search / shadow data.
  */
 function computeTrendWeights(
   activeBin: number,
@@ -513,21 +526,14 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     };
   }
 
-  // --- Derive maxCenterOffset from ctx fields (no import from src/state/) ---
-  // Per implementation-plan §5.1:
-  //   maxCenterOffset = uncertainty > u_high ? 1 : clamp(round(widthSigma), 1, 3)
-  // The StateContext carries `halfWidth` which was derived as:
-  //   halfWidth = clamp(round(k_w × widthSigma), 2, 8)
-  // We can back-derive widthSigma ≈ halfWidth / k_w (k_w = 2.0 default).
-  // But more precisely: the ctx carries all we need for clipping the center
-  // offset. The design says "use ctx fields only", and the relevant ctx fields
-  // that encode the uncertainty regime are:
-  //   ctx.toleranceBins (= max(1, round(widthSigma))) and ctx.halfWidth.
-  // maxCenterOffset = clamp(round(widthSigma_approx), 1, 3)
-  // widthSigma_approx ≈ ctx.toleranceBins (= max(1, round(widthSigma)))
-  // When uncertainty is high the state machine already collapses halfWidth → 2
-  // and toleranceBins → 1; we propagate the same conservative clip.
-  const maxCenterOffset = Math.min(Math.max(ctx.toleranceBins, 1), 3);
+  // --- maxCenterOffset: read directly from ctx (F5) ---
+  // The state machine populates ctx.maxCenterOffset via deriveMaxCenterOffset(),
+  // which handles the uncertainty-high path (featureCompleteness < U_HIGH → 1 bin)
+  // and the normal path (clamp(round(widthSigma), 1, 3)).
+  // diffPlanner no longer re-derives this value — the state machine is the
+  // single source of truth (eliminates the local re-derivation that had no
+  // uncertainty input and used toleranceBins as a proxy).
+  const maxCenterOffset = ctx.maxCenterOffset;
 
   // --- NORMAL: center derived from predicted offset ---
   // --- TREND:  center = active bin (don't follow moving target) ---

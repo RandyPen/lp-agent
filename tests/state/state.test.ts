@@ -32,6 +32,7 @@ import {
   EVAL_INTERVAL_MS,
   MIN_DWELL_MS,
   TREND_BIAS_NORMALISER,
+  LENDING_PCT_BASE,
 } from "../../src/state/params.ts";
 
 import {
@@ -263,19 +264,36 @@ describe("deriveHalfWidth", () => {
 });
 
 describe("deriveToleranceBins", () => {
-  it("minimum is 1", () => {
-    expect(deriveToleranceBins(0)).toBe(1);
-    expect(deriveToleranceBins(0.4)).toBe(1);
+  it("minimum is 1 (half width large enough that cap doesn't bite)", () => {
+    expect(deriveToleranceBins(0, 8)).toBe(1);
+    expect(deriveToleranceBins(0.4, 8)).toBe(1);
   });
 
   it("rounds to nearest integer", () => {
-    expect(deriveToleranceBins(1.4)).toBe(1);
-    expect(deriveToleranceBins(1.5)).toBe(2);
-    expect(deriveToleranceBins(2.0)).toBe(2);
+    expect(deriveToleranceBins(1.4, 8)).toBe(1);
+    expect(deriveToleranceBins(1.5, 8)).toBe(2);
+    expect(deriveToleranceBins(2.0, 8)).toBe(2);
   });
 
-  it("wider sigma → more tolerance", () => {
-    expect(deriveToleranceBins(3.0)).toBeGreaterThan(deriveToleranceBins(1.0));
+  it("wider sigma → more tolerance (when halfWidth is large enough)", () => {
+    expect(deriveToleranceBins(3.0, 8)).toBeGreaterThan(deriveToleranceBins(1.0, 8));
+  });
+
+  it("caps at halfWidth — tolerance cannot exceed the range half-width (F4)", () => {
+    // widthSigma=5 → raw=5, but halfWidth=3 → cap at 3
+    expect(deriveToleranceBins(5, 3)).toBe(3);
+    // widthSigma=2 → raw=2, halfWidth=8 → no cap needed
+    expect(deriveToleranceBins(2, 8)).toBe(2);
+  });
+
+  it("cap prevents permanently-true tolerance guard at high vol (F4 regression)", () => {
+    // At real SUI vol, widthSigma can be >> HALF_WIDTH_MAX (8).
+    // Without the cap, toleranceBins=10 with halfWidth=4 would mean the guard
+    // is always null (drift can never exceed 10 when max drift = halfWidth = 4).
+    const halfWidth = 4;
+    const highSigma = 10;
+    const tol = deriveToleranceBins(highSigma, halfWidth);
+    expect(tol).toBeLessThanOrEqual(halfWidth);
   });
 });
 
@@ -344,49 +362,44 @@ describe("deriveTrendBias", () => {
 });
 
 describe("deriveLendingPct", () => {
-  it("NORMAL with no L1 bonus → 35%", () => {
-    expect(deriveLendingPct("NORMAL", 0, false)).toBeCloseTo(0.35, 10);
+  it("NORMAL → 35% (no L1 bonus in state machine — F6)", () => {
+    expect(deriveLendingPct("NORMAL", 0)).toBeCloseTo(0.35, 10);
   });
 
-  it("NORMAL with L1 bonus → 45%", () => {
-    expect(deriveLendingPct("NORMAL", 0, true)).toBeCloseTo(0.45, 10);
+  it("L1 bonus is applied externally (mlAgent veto path), not in params (F6)", () => {
+    // The bonus is NOT in deriveLendingPct. 35% + 10pp = 45% is computed in mlAgent.
+    expect(deriveLendingPct("NORMAL", 0)).toBeCloseTo(LENDING_PCT_BASE.NORMAL, 10);
   });
 
-  it("EXTREME → always 1.0 regardless of trendBias and l1Bonus", () => {
-    expect(deriveLendingPct("EXTREME", 0, false)).toBe(1.0);
-    expect(deriveLendingPct("EXTREME", 1, true)).toBe(1.0);
-    expect(deriveLendingPct("EXTREME", -1, true)).toBe(1.0);
+  it("EXTREME → always 1.0 regardless of trendBias", () => {
+    expect(deriveLendingPct("EXTREME", 0)).toBe(1.0);
+    expect(deriveLendingPct("EXTREME", 1)).toBe(1.0);
+    expect(deriveLendingPct("EXTREME", -1)).toBe(1.0);
   });
 
   it("TREND with trendBias=0 → 50%", () => {
-    expect(deriveLendingPct("TREND", 0, false)).toBeCloseTo(0.50, 10);
+    expect(deriveLendingPct("TREND", 0)).toBeCloseTo(0.50, 10);
   });
 
   it("TREND with trendBias=1 → 70%", () => {
-    expect(deriveLendingPct("TREND", 1, false)).toBeCloseTo(0.70, 10);
+    expect(deriveLendingPct("TREND", 1)).toBeCloseTo(0.70, 10);
   });
 
   it("TREND with trendBias=-1 → 70% (abs value)", () => {
-    expect(deriveLendingPct("TREND", -1, false)).toBeCloseTo(0.70, 10);
+    expect(deriveLendingPct("TREND", -1)).toBeCloseTo(0.70, 10);
   });
 
   it("TREND with trendBias=0.5 → 60%", () => {
     // 0.50 + 0.20 × 0.5 = 0.60
-    expect(deriveLendingPct("TREND", 0.5, false)).toBeCloseTo(0.60, 10);
-  });
-
-  it("TREND with trendBias=1 and L1 bonus → 80%", () => {
-    expect(deriveLendingPct("TREND", 1, true)).toBeCloseTo(0.80, 10);
+    expect(deriveLendingPct("TREND", 0.5)).toBeCloseTo(0.60, 10);
   });
 
   it("result is always in [0, 1]", () => {
     for (const state of ["NORMAL", "TREND", "EXTREME"] as MarketState[]) {
       for (const bias of [-1, -0.5, 0, 0.5, 1]) {
-        for (const bonus of [false, true]) {
-          const v = deriveLendingPct(state, bias, bonus);
-          expect(v).toBeGreaterThanOrEqual(0);
-          expect(v).toBeLessThanOrEqual(1);
-        }
+        const v = deriveLendingPct(state, bias);
+        expect(v).toBeGreaterThanOrEqual(0);
+        expect(v).toBeLessThanOrEqual(1);
       }
     }
   });
@@ -797,7 +810,7 @@ describe("StateMachine — EXTREME exit with dwell + hysteresis", () => {
     expect(ctx.state).toBe("EXTREME");
   });
 
-  it("exits EXTREME after dwell when all conditions clear", () => {
+  it("exits EXTREME after dwell when all conditions clear (volRecovered=true from risk monitor)", () => {
     let t = 0;
     const sm = createStateMachine({ poolId: "poolX2", db, now: () => t });
 
@@ -807,16 +820,17 @@ describe("StateMachine — EXTREME exit with dwell + hysteresis", () => {
     sm.advance(makeSnapshot(flatBars(30)), makePred(), makeInput(), entrySignal);
     const extremeEntry = t;
 
-    // Wait 10 min + 1s, no signal, low p-sum
+    // Wait 10 min + 1s, no signal, low p-sum.
+    // Pass volRecovered=true (which in production mlAgent gets from riskMonitor.volRecovered()).
     t = extremeEntry + MIN_DWELL_MS.EXTREME + 1_000;
     const pred = makePred({ pAbove: 0.2, pBelow: 0.2 });  // sum = 0.4
-    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput(), null);
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput(), null, true);
 
     expect(ctx.state).not.toBe("EXTREME");
     expect(ctx.state).toBe("NORMAL");
   });
 
-  it("does NOT exit EXTREME while external signal is still active", () => {
+  it("does NOT exit EXTREME while external signal is still active (even with volRecovered)", () => {
     let t = 0;
     const sm = createStateMachine({ poolId: "poolX3", db, now: () => t });
 
@@ -825,11 +839,11 @@ describe("StateMachine — EXTREME exit with dwell + hysteresis", () => {
     sm.advance(makeSnapshot(flatBars(30)), makePred(), makeInput(), entrySignal);
     const extremeEntry = t;
 
-    // After dwell, but signal is still active
+    // After dwell, signal still active — should not exit even with volRecovered=true
     t = extremeEntry + MIN_DWELL_MS.EXTREME + 1_000;
     const pred = makePred({ pAbove: 0.2, pBelow: 0.2 });
     const keepSignal: ExtremeSignal = { active: true, trigger: "still_bad" };
-    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput(), keepSignal);
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput(), keepSignal, true);
 
     expect(ctx.state).toBe("EXTREME");
   });
@@ -1029,14 +1043,36 @@ describe("StateMachine — StateContext fields", () => {
     expect(ctx.halfWidth).toBe(4);
   });
 
-  it("toleranceBins is derived from widthSigma", () => {
+  it("toleranceBins is derived from widthSigma, capped at halfWidth (F4)", () => {
     const sm = createStateMachine({ poolId: "pool-ctx4", db, now: () => 0 });
     const ctx = sm.advance(
       makeSnapshot(flatBars(30)),
-      makePred({ widthSigma: 2.0 }),  // → max(1, round(2.0))=2
+      makePred({ widthSigma: 2.0 }),  // → max(1, round(2.0))=2, halfWidth=4 → no cap
       makeInput(),
     );
     expect(ctx.toleranceBins).toBe(2);
+    expect(ctx.toleranceBins).toBeLessThanOrEqual(ctx.halfWidth);
+  });
+
+  it("maxCenterOffset is populated in StateContext (F5)", () => {
+    const sm = createStateMachine({ poolId: "pool-ctx6", db, now: () => 0 });
+    const ctx = sm.advance(
+      makeSnapshot(flatBars(30)),
+      makePred({ widthSigma: 2.0, featureCompleteness: 1.0 }),
+      makeInput(),
+    );
+    // widthSigma=2.0, uncertaintyHigh=false → clamp(round(2),1,3)=2
+    expect(ctx.maxCenterOffset).toBe(2);
+  });
+
+  it("maxCenterOffset=1 when uncertainty is high (featureCompleteness < 0.8)", () => {
+    const sm = createStateMachine({ poolId: "pool-ctx7", db, now: () => 0 });
+    const ctx = sm.advance(
+      makeSnapshot(flatBars(30)),
+      makePred({ widthSigma: 3.0, featureCompleteness: 0.5 }),  // high uncertainty
+      makeInput(),
+    );
+    expect(ctx.maxCenterOffset).toBe(1);
   });
 
   it("TREND: trendBias is computed from pAbove-pBelow", () => {

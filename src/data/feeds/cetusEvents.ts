@@ -31,12 +31,26 @@
  *
  * Sui RPC endpoints used:
  *   - `queryEvents` with MoveEventType filter for `<DLMM_PACKAGE>::pool::SwapEvent`
- *   - `getObject` for pool state (activeBin, sqrtPrice, tvl, binStep)
+ *   - `getObject` for pool state (activeBin, binStep)
+ *
+ * Pool object field layout (verified against mainnet 2026-06):
+ *   fields.active_id = { type: "...I32", fields: { bits: <u32> } }
+ *   fields.bin_manager.fields.bin_step  (u64 as string or number)
+ *   There is NO top-level `current_index` and NO top-level `bin_step`.
+ *
+ * Price convention:
+ *   All prices stored in `price_observations` and returned by `latest().price`
+ *   are human USDC-per-SUI (Binance SUIUSDC convention).
+ *   For Pool<USDC=6, SUI=9>:
+ *     price = 10^(poolCoinBDecimals − poolCoinADecimals) / (1+binStep/10000)^binId
+ *           = 10^3 / (1.005^1442) ≈ 0.7526
+ *   This is computed by `priceFromBinIdAsQuote(binId, binStep, poolCoinADecimals, poolCoinBDecimals)`.
  */
 
 import type { SuiEvent } from "@mysten/sui/jsonRpc";
 import { getDb } from "../../db/client.ts";
 import { getSuiClient } from "../../sui/client.ts";
+import { priceFromBinIdAsQuote } from "../../domain/binMath.ts";
 import { log } from "../../lib/logger.ts";
 
 // ---------------------------------------------------------------------------
@@ -58,6 +72,13 @@ const DEFAULT_POLL_INTERVAL_MS = 30_000;
 
 // Default TVL fallback when pool object doesn't expose it directly.
 const TVL_FALLBACK_USD = 0;
+
+// ---------------------------------------------------------------------------
+// Default pool-physical coin decimals (SUI/USDC mainnet pool: Pool<USDC=6, SUI=9>)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_POOL_COIN_A_DECIMALS = 6; // USDC = 6 decimals (physical coinA of the real pool)
+const DEFAULT_POOL_COIN_B_DECIMALS = 9; // SUI  = 9 decimals (physical coinB of the real pool)
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -96,17 +117,6 @@ function isRawSwapEvent(v: unknown): v is RawSwapEvent {
 /** Reinterpret a Cetus u32-encoded signed I32 bin id as a JS number. */
 function decodeBinId(bits: number): number {
   return bits >= 0x80000000 ? bits - 0x100000000 : bits;
-}
-
-/**
- * Compute a human-readable price from a bin id using the DLMM formula:
- *   price = (1 + binStep / 10_000) ^ binId
- * This matches `priceFromBinId` in domain/binMath.ts without importing that
- * module (to keep cetusEvents.ts self-contained).
- */
-function binIdToPrice(binId: number, binStep: number): string {
-  const ratio = 1 + binStep / 10_000;
-  return Math.pow(ratio, binId).toFixed(10);
 }
 
 // ---------------------------------------------------------------------------
@@ -192,6 +202,8 @@ function extractSwapEvent(
   event: SuiEvent,
   poolId: string,
   binStep: number,
+  poolCoinADecimals: number,
+  poolCoinBDecimals: number,
 ): SwapEventRecord | null {
   if (!event.type.includes("pool::SwapEvent")) return null;
 
@@ -207,7 +219,8 @@ function extractSwapEvent(
   if (!lastBinSwap) return null;
 
   const binId = decodeBinId(lastBinSwap.bin_id.bits);
-  const price = binIdToPrice(binId, binStep);
+  // Human price in the Binance quote convention (USDC per SUI for this pool).
+  const price = priceFromBinIdAsQuote(binId, binStep, poolCoinADecimals, poolCoinBDecimals);
 
   const tsRaw = event.timestampMs;
   const timestampMs = tsRaw != null ? Number(tsRaw) : Date.now();
@@ -241,15 +254,21 @@ export interface CetusPoolState {
 
 /**
  * Query pool object on-chain to get the current active bin and bin step.
- * The DLMM pool object fields (using the official SDK layout):
- *   fields.current_index (I32 encoded as u32 bits — same as bin_id.bits)
- *   fields.bin_step (u64 in basis points)
- *   fields.fee_growth_global_a, fee_growth_global_b (we skip these)
- *   TVL is not directly on the pool object in a reliable USD form;
- *   we return 0 and let the aggregator layer inject it when available.
+ *
+ * Real DLMM pool object field layout (verified against mainnet):
+ *   fields.active_id = { type: "...I32", fields: { bits: <u32 two's-complement> } }
+ *   fields.bin_manager.fields.bin_step  (u64, may be string or number)
+ *
+ * There is NO top-level `current_index` and NO top-level `bin_step`.
+ * Throws explicitly on missing fields — never silently defaults to zeros.
+ *
+ * @param poolCoinADecimals  Physical decimals of the pool's coinA (e.g. 6 for USDC).
+ * @param poolCoinBDecimals  Physical decimals of the pool's coinB (e.g. 9 for SUI).
  */
 async function queryPoolState(
   poolId: string,
+  poolCoinADecimals: number,
+  poolCoinBDecimals: number,
   clientOverride?: { getObject: (args: { id: string; options: object }) => Promise<unknown> },
 ): Promise<CetusPoolState> {
   const client = clientOverride ?? getSuiClient();
@@ -267,21 +286,76 @@ async function queryPoolState(
     throw new Error(`cetusEvents: pool object ${poolId} has no content fields`);
   }
 
-  // current_index is stored as a { bits: number } signed-I32 wrapper.
-  const rawIndex = fields["current_index"] as { bits?: number } | number | undefined;
-  let activeBin = 0;
-  if (typeof rawIndex === "object" && rawIndex !== null && "bits" in rawIndex) {
-    activeBin = decodeBinId(Number((rawIndex as { bits: number }).bits));
-  } else if (typeof rawIndex === "number") {
-    activeBin = rawIndex;
+  // active_id is stored as a nested I32 struct: { fields: { bits: <u32> } }.
+  // There is no top-level "current_index" field.
+  const activeIdField = fields["active_id"];
+  if (
+    activeIdField === undefined ||
+    activeIdField === null ||
+    typeof activeIdField !== "object"
+  ) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} missing fields.active_id ` +
+        `(got: ${JSON.stringify(activeIdField)})`,
+    );
+  }
+  const activeIdInner = (activeIdField as Record<string, unknown>)["fields"];
+  if (
+    activeIdInner === undefined ||
+    activeIdInner === null ||
+    typeof activeIdInner !== "object"
+  ) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} fields.active_id has no nested fields ` +
+        `(got: ${JSON.stringify(activeIdField)})`,
+    );
+  }
+  const bitsRaw = (activeIdInner as Record<string, unknown>)["bits"];
+  if (bitsRaw === undefined || bitsRaw === null) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} fields.active_id.fields.bits is missing`,
+    );
+  }
+  const activeBin = decodeBinId(Number(bitsRaw));
+
+  // bin_step lives at fields.bin_manager.fields.bin_step — NOT at the top level.
+  const binManagerField = fields["bin_manager"];
+  if (
+    binManagerField === undefined ||
+    binManagerField === null ||
+    typeof binManagerField !== "object"
+  ) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} missing fields.bin_manager ` +
+        `(got: ${JSON.stringify(binManagerField)})`,
+    );
+  }
+  const binManagerInner = (binManagerField as Record<string, unknown>)["fields"];
+  if (
+    binManagerInner === undefined ||
+    binManagerInner === null ||
+    typeof binManagerInner !== "object"
+  ) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} fields.bin_manager has no nested fields ` +
+        `(got: ${JSON.stringify(binManagerField)})`,
+    );
+  }
+  const binStepRaw = (binManagerInner as Record<string, unknown>)["bin_step"];
+  if (binStepRaw === undefined || binStepRaw === null) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} fields.bin_manager.fields.bin_step is missing`,
+    );
+  }
+  const binStep = Number(binStepRaw);
+  if (!Number.isFinite(binStep) || binStep <= 0) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} bin_step=${binStepRaw} is not a valid positive number`,
+    );
   }
 
-  const binStepRaw = fields["bin_step"];
-  const binStep = typeof binStepRaw === "number" ? binStepRaw
-    : typeof binStepRaw === "string" ? Number(binStepRaw)
-    : 10; // fallback to 10 bps
-
-  const price = binIdToPrice(activeBin, binStep);
+  // Human price: USDC per SUI (Binance SUIUSDC convention).
+  const price = priceFromBinIdAsQuote(activeBin, binStep, poolCoinADecimals, poolCoinBDecimals);
 
   return {
     activeBin,
@@ -298,10 +372,20 @@ async function queryPoolState(
 export interface CetusEventsFeedOptions {
   /** Cetus DLMM pool object ID. */
   poolId: string;
-  /** Bin step in basis points (e.g. 10). */
-  binStep?: number;
   /** How often to poll pool state. Default 30_000 ms. */
   pollIntervalMs?: number;
+  /**
+   * Physical decimals of the DLMM pool's coinA.
+   * For the SUI/USDC mainnet pool (Pool<USDC=6, SUI=9>): 6.
+   * Defaults to DEFAULT_POOL_COIN_A_DECIMALS (6).
+   */
+  poolCoinADecimals?: number;
+  /**
+   * Physical decimals of the DLMM pool's coinB.
+   * For the SUI/USDC mainnet pool (Pool<USDC=6, SUI=9>): 9.
+   * Defaults to DEFAULT_POOL_COIN_B_DECIMALS (9).
+   */
+  poolCoinBDecimals?: number;
   /**
    * Injectable SuiClient-like object for testing.
    * Must implement `getObject` and `queryEvents`.
@@ -319,21 +403,28 @@ export interface CetusEventsFeed {
 }
 
 export function createCetusEventsFeed(opts: CetusEventsFeedOptions): CetusEventsFeed {
-  const { poolId, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS } = opts;
+  const {
+    poolId,
+    pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+    poolCoinADecimals = DEFAULT_POOL_COIN_A_DECIMALS,
+    poolCoinBDecimals = DEFAULT_POOL_COIN_B_DECIMALS,
+  } = opts;
   const clientOverride = opts.clientOverride as
     | { getObject: (args: { id: string; options: object }) => Promise<unknown> }
     | undefined;
 
+  // Initial cached state: activeBin=0 and price="0" before first poll.
+  // The feed's lastUpdatedMs() guard prevents consumers from using stale zeros.
   let cached: CetusPoolState = {
     activeBin: 0,
     price: "0",
     tvlUsd: 0,
-    binStep: opts.binStep ?? 10,
+    binStep: 0,
   };
   let lastUpdated = 0;
 
   async function refresh(): Promise<void> {
-    const state = await queryPoolState(poolId, clientOverride);
+    const state = await queryPoolState(poolId, poolCoinADecimals, poolCoinBDecimals, clientOverride);
     // Preserve tvlUsd from previous cycle if the new query doesn't supply it.
     cached = {
       ...state,
@@ -383,6 +474,18 @@ export interface BackfillSwapEventsOptions {
   /** Bin step in bps (needed for price calculation). */
   binStep: number;
   /**
+   * Physical decimals of the DLMM pool's coinA.
+   * For the SUI/USDC mainnet pool (Pool<USDC=6, SUI=9>): 6.
+   * Defaults to DEFAULT_POOL_COIN_A_DECIMALS (6).
+   */
+  poolCoinADecimals?: number;
+  /**
+   * Physical decimals of the DLMM pool's coinB.
+   * For the SUI/USDC mainnet pool (Pool<USDC=6, SUI=9>): 9.
+   * Defaults to DEFAULT_POOL_COIN_B_DECIMALS (9).
+   */
+  poolCoinBDecimals?: number;
+  /**
    * Earliest timestamp (ms) to backfill to.
    * If omitted, backfill as far back as the RPC allows.
    */
@@ -431,7 +534,15 @@ interface QueryEventsClient {
  * that cursor so we continue scanning older events.
  */
 export async function backfillSwapEvents(opts: BackfillSwapEventsOptions): Promise<void> {
-  const { poolId, binStep, fromMs, toMs, onBatch } = opts;
+  const {
+    poolId,
+    binStep,
+    fromMs,
+    toMs,
+    onBatch,
+    poolCoinADecimals = DEFAULT_POOL_COIN_A_DECIMALS,
+    poolCoinBDecimals = DEFAULT_POOL_COIN_B_DECIMALS,
+  } = opts;
   const cutoff = fromMs ?? 0;
   const toMsActual = toMs ?? Date.now();
 
@@ -487,10 +598,10 @@ export async function backfillSwapEvents(opts: BackfillSwapEventsOptions): Promi
         break;
       }
 
-      const record = extractSwapEvent(event, poolId, binStep);
+      const record = extractSwapEvent(event, poolId, binStep, poolCoinADecimals, poolCoinBDecimals);
       if (record !== null) {
         batch.push(record);
-        // Persist price point to price_observations.
+        // Persist human price point to price_observations.
         persistPriceObservation(poolId, record.price, record.timestampMs);
       }
     }

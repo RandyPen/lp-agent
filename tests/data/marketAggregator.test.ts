@@ -42,6 +42,8 @@ function makeFakeBinanceFeed(opts: FakeBinanceFeedOpts = {}): BinanceMultiFeed {
     latest5m: () => ({ sui: suiBars, btc: btcBars, eth: ethBars }),
     latest: (): BinanceMultiWindows => ({ sui: suiBars, btc: btcBars, eth: ethBars }),
     lastUpdatedMs: () => lastUpdatedMs,
+    // Per-symbol staleness falls back to the feed-level timestamp in this stub.
+    symbolLastUpdatedMs: (_symbol: string, _interval: "1m" | "5m") => lastUpdatedMs,
   };
 }
 
@@ -130,12 +132,41 @@ describe("createMarketAggregator", () => {
       expect(snap.binance.eth.length).toBe(5);
     });
 
-    it("uses injected now() for snapshot timestamp", () => {
-      const fixedNow = 1_700_000_000_000;
-      const deps = makeDeps({}, {}, {}, fixedNow);
+    it("snapshot.ts is the max of the feeds' lastUpdatedMs values (not wall-clock)", () => {
+      // F4 fix: snapshot.ts must reflect data age, not call time.
+      const binanceUpdated = 1_700_000_090_000;
+      const derivUpdated  = 1_700_000_095_000;
+      const cetusUpdated  = 1_700_000_080_000;
+
+      // nowMs is set far in the future — if snapshot.ts == nowMs the fix is broken.
+      const nowMs = 1_800_000_000_000;
+
+      const deps = makeDeps(
+        { lastUpdatedMs: binanceUpdated },
+        { lastUpdatedMs: derivUpdated },
+        { lastUpdatedMs: cetusUpdated },
+        nowMs,
+      );
       const agg = createMarketAggregator(deps);
       const snap = agg.latest();
-      expect(snap.ts).toBe(fixedNow);
+
+      // ts must be the max of the three feed timestamps.
+      expect(snap.ts).toBe(Math.max(binanceUpdated, derivUpdated, cetusUpdated));
+      expect(snap.ts).not.toBe(nowMs);
+    });
+
+    it("snapshot.ts equals the newest underlying feed timestamp", () => {
+      const t1 = 1_700_000_000_000;
+      const t2 = 1_700_000_010_000;
+      const t3 = 1_700_000_005_000;
+
+      const deps = makeDeps(
+        { lastUpdatedMs: t1 },
+        { lastUpdatedMs: t3 },
+        { lastUpdatedMs: t2 },
+      );
+      const snap = createMarketAggregator(deps).latest();
+      expect(snap.ts).toBe(t2); // max(t1, t3, t2) = t2
     });
   });
 
@@ -194,6 +225,7 @@ describe("createMarketAggregator", () => {
         latest5m: () => ({ sui: [], btc: [], eth: [] }),
         latest: () => ({ sui: [], btc: [], eth: [] }),
         lastUpdatedMs: () => Date.now(),
+        symbolLastUpdatedMs: (_s: string, _i: "1m" | "5m") => Date.now(),
       };
       const deps: MarketAggregatorDeps = {
         binance,
@@ -263,7 +295,10 @@ describe("createMarketAggregator", () => {
   });
 
   describe("staleness()", () => {
-    it("returns Infinity for sources that have never updated", () => {
+    it("returns Number.MAX_SAFE_INTEGER sentinel for sources that have never updated", () => {
+      // Previously Infinity was returned, but that serializes as null in JSON.stringify.
+      // The sentinel Number.MAX_SAFE_INTEGER is used instead so staleness objects can be
+      // safely logged and compared (still "> any reasonable maxAgeMs").
       const deps = makeDeps(
         { lastUpdatedMs: 0 },
         { lastUpdatedMs: 0 },
@@ -271,11 +306,14 @@ describe("createMarketAggregator", () => {
         1_000_000,
       );
       const s = createMarketAggregator(deps).staleness();
-      expect(s.sui).toBe(Infinity);
-      expect(s.btc).toBe(Infinity);
-      expect(s.eth).toBe(Infinity);
-      expect(s.derivatives).toBe(Infinity);
-      expect(s.cetus).toBe(Infinity);
+      expect(s.sui).toBe(Number.MAX_SAFE_INTEGER);
+      expect(s.btc).toBe(Number.MAX_SAFE_INTEGER);
+      expect(s.eth).toBe(Number.MAX_SAFE_INTEGER);
+      expect(s.derivatives).toBe(Number.MAX_SAFE_INTEGER);
+      expect(s.cetus).toBe(Number.MAX_SAFE_INTEGER);
+      // Verify these serialize correctly through JSON (not as null).
+      const serialized = JSON.stringify(s);
+      expect(serialized).not.toContain("null");
     });
 
     it("returns correct age in ms for each source", () => {

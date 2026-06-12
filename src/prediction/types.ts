@@ -103,16 +103,35 @@ export interface PredictionResponse {
    * Predicted distribution width in bin units.
    * widthSigma = (centerQ90 − centerQ10) / 2.56
    * (dividing by 2.56 converts the 80 % quantile spread to a σ-equivalent).
+   *
+   * Note: the sidecar's widthSigma measures center-prediction uncertainty
+   * (quantile spread / 2.56), NOT raw price σ. It represents how uncertain
+   * the model is about where the center will be, in bin units.
    */
   widthSigma: number;
   /**
-   * Probability that the price will move above the current active bin's upper
-   * boundary within the prediction horizon. Derived from the log-normal CDF.
+   * Probability that the price will move above the upper boundary of the
+   * current active bin range within the prediction horizon.
+   *
+   * Definition (aligned with sidecar ml/serving/app.py):
+   *   pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
+   * where upperOffset is the upper boundary of the PM's current bin range
+   * (in bin units relative to activeBin), defaulting to +0.5 bin when no
+   * range context is provided. q50 = centerOffset (= 0 for NullProvider).
+   *
+   * Both pAbove and pBelow use bin-unit offsets so they are scale-invariant
+   * with respect to the pool's binStep.
    */
   pAbove: number;
   /**
-   * Probability that the price will move below the current active bin's lower
-   * boundary within the prediction horizon.
+   * Probability that the price will move below the lower boundary of the
+   * current active bin range within the prediction horizon.
+   *
+   * Definition (aligned with sidecar ml/serving/app.py):
+   *   pBelow = Φ((lowerOffset − q50) / widthSigma)
+   * where lowerOffset is the lower boundary of the PM's current bin range
+   * (in bin units, typically negative), defaulting to −0.5 bin when no
+   * range context is provided. q50 = centerOffset (= 0 for NullProvider).
    */
   pBelow: number;
   /** Model artifact version string (e.g. "null-v0", "v1.0.0"). */
@@ -174,9 +193,25 @@ export interface StateContext {
   lendingPct: number;
   /**
    * Maximum allowed drift in bins from the predicted center before a
-   * recenter is triggered. Continuous: toleranceBins = max(1, round(widthSigma)).
+   * recenter is triggered.
+   *
+   * Derivation (params.ts §5.1):
+   *   toleranceBins = max(1, round(widthSigma))
+   *   capped at halfWidth to prevent the tolerance guard from becoming
+   *   permanently true when real SUI vol causes widthSigma >> halfWidth.
    */
   toleranceBins: number;
+  /**
+   * Maximum allowed center offset in bins from the active bin (F5).
+   *
+   * Derivation (params.ts deriveMaxCenterOffset):
+   *   When featureCompleteness < U_HIGH (uncertainty high):  maxCenterOffset = 1
+   *   Otherwise: clamp(round(widthSigma), 1, 3)
+   *
+   * diffPlanner reads this directly instead of re-deriving it, ensuring the
+   * state machine is the single source of truth for this parameter.
+   */
+  maxCenterOffset: number;
   /**
    * Minimum time (ms) to remain in the current state before a transition is
    * allowed. Prevents rapid oscillation at state boundaries.

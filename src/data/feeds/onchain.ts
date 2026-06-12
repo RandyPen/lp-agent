@@ -22,7 +22,7 @@ import type { PoolProfile } from "../../pools/types.ts";
 import type { PriceObservation } from "../../domain/types.ts";
 import type { OhlcvBar } from "../../forecast/types.ts";
 import { bucketToOhlcv } from "../../forecast/volatility.ts";
-import { priceFromBinId } from "../../domain/binMath.ts";
+import { priceFromBinId, priceFromBinIdAsQuote } from "../../domain/binMath.ts";
 import { getSuiClient } from "../../sui/client.ts";
 import { getDb } from "../../db/client.ts";
 import { PriceFeedError } from "../../lib/errors.ts";
@@ -107,7 +107,13 @@ function observationFromSwapEvent(
   // Safe: I32 range fits in a JS number; no BigInt needed here.
   const binId = bits >= 0x80000000 ? bits - 0x100000000 : bits;
 
-  const price = priceFromBinId(binId, profile.binStep, profile.decimalsA, profile.decimalsB);
+  // Use the pool's physical coin decimals when available (set when the pool's physical
+  // coinA/B order differs from the agent's logical convention). For Pool<USDC=6,SUI=9>
+  // we want USDC-per-SUI (Binance SUIUSDC convention), which is the inverted formula.
+  const price =
+    profile.poolCoinADecimals !== undefined && profile.poolCoinBDecimals !== undefined
+      ? priceFromBinIdAsQuote(binId, profile.binStep, profile.poolCoinADecimals, profile.poolCoinBDecimals)
+      : priceFromBinId(binId, profile.binStep, profile.decimalsA, profile.decimalsB);
 
   // timestampMs is on the SuiEvent envelope (string | null | undefined).
   const tsRaw = event.timestampMs;

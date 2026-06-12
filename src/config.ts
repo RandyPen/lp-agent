@@ -170,6 +170,8 @@ export interface AppConfig {
   fallbackStrategy: StrategyName;
   /** Risk monitor thresholds for L1/L2/L3 circuit breakers. */
   risk: RiskAppConfig;
+  /** How often the background riskObserver loop samples market data (ms). */
+  riskObserverIntervalMs: number;
 }
 
 function required(name: string): string {
@@ -425,6 +427,14 @@ export function loadConfig(): AppConfig {
     errs.push(`RISK_PNL_24H_PCT must be a finite number, got '${process.env.RISK_PNL_24H_PCT ?? ""}'`);
   }
 
+  // Risk observer sampling interval.
+  const riskObserverIntervalMs = Number(optional("RISK_OBSERVER_INTERVAL_MS", "30000"));
+  if (!Number.isFinite(riskObserverIntervalMs) || riskObserverIntervalMs <= 0) {
+    errs.push(
+      `RISK_OBSERVER_INTERVAL_MS must be a positive number, got '${process.env.RISK_OBSERVER_INTERVAL_MS ?? ""}'`,
+    );
+  }
+
   const risk: RiskAppConfig = {
     thresholds: {
       extremeVolatility5m,
@@ -479,6 +489,7 @@ export function loadConfig(): AppConfig {
     ml,
     fallbackStrategy,
     risk,
+    riskObserverIntervalMs,
   };
 
   return cached;

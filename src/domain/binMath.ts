@@ -41,6 +41,31 @@ export function priceFromBinId(
 }
 
 /**
+ * Human-readable price as coinA-per-coinB (inverted from the standard formula).
+ *
+ * Use this when the DLMM pool's physical coinA is the quote asset and you want
+ * the price expressed as "quote per base" (i.e. "coinA per coinB").
+ *
+ * Example: for a Pool<USDC=6, SUI=9> at binId=1442, binStep=50:
+ *   raw ratio = 1.005^1442 ≈ 1328.8  (lamport-SUI per lamport-USDC)
+ *   priceFromBinIdAsQuote(1442, 50, 6, 9)
+ *     = 10^(9−6) / 1328.8 ≈ 0.7526  (USDC per SUI — Binance SUIUSDC convention)
+ *
+ * Formula: 10^(decimalsB − decimalsA) / (1 + binStep/10000)^binId
+ */
+export function priceFromBinIdAsQuote(
+  binId: number,
+  binStep: number,
+  decimalsA: number,
+  decimalsB: number,
+): string {
+  const ratio = Math.pow(1 + binStep / BASIS_POINT_MAX, binId);
+  const decimalShift = Math.pow(10, decimalsB - decimalsA);
+  const human = decimalShift / ratio;
+  return human.toPrecision(15).replace(/\.?0+$/, "");
+}
+
+/**
  * Nearest bin id for a given decimal-adjusted price string.
  * `useFloor = true` rounds down (conservative lower bound);
  * `useFloor = false` rounds up (conservative upper bound).

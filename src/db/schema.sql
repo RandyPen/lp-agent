@@ -211,7 +211,11 @@ CREATE TABLE IF NOT EXISTS predictions (
   model_version   TEXT NOT NULL,
   active_bin      INTEGER NOT NULL,
   center_q10      REAL NOT NULL,
-  center_q50      REAL NOT NULL,
+  -- center_offset: the q50 center offset in bin units relative to activeBin (F8).
+  -- Named center_offset (not center_q50) because the model predicts an offset
+  -- from the active bin, not an absolute bin position.  centerOffset = 0 means
+  -- "predicted center coincides with the current active bin".
+  center_offset   REAL NOT NULL,
   center_q90      REAL NOT NULL,
   width_sigma     REAL NOT NULL,
   p_above         REAL NOT NULL,
@@ -219,6 +223,16 @@ CREATE TABLE IF NOT EXISTS predictions (
   feature_completeness REAL NOT NULL,
   psi             REAL NOT NULL,
   fallback        TEXT,
+  -- executed_path: which strategy actually produced the output for this tick.
+  --   'model'           — the ML model's output was used directly (not in probation,
+  --                       fallback === false, PSI < threshold).
+  --   'tier0_fallback'  — pred.fallback !== false; Tier 0 was used and we were NOT
+  --                       already in probation before this tick.
+  --   'tier0_probation' — pred.fallback === false but the pool is still in probation
+  --                       (probation entry is not yet cleared — Tier 0 executed).
+  -- NULL is reserved for shadow-mode rows and any pre-upgrade rows written before
+  -- this column existed. The column is NOT NULL for all new rows written by mlAgent.
+  executed_path   TEXT NOT NULL CHECK(executed_path IN ('model','tier0_fallback','tier0_probation')),
   infer_ms        INTEGER NOT NULL,
   snapshot_digest TEXT              -- 6 个关键字段的压缩摘要;完整特征行落 parquet,不进 SQLite
 );

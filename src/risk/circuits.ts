@@ -29,7 +29,7 @@ export interface TvlPoint {
 
 export interface SpreadPoint {
   ts: number;     // epoch ms
-  spread: number; // abs((cetus - binance) / binance)
+  spread: number; // SIGNED (cetus - binance) / binance; consumers take Math.abs() as needed
 }
 
 // ---------------------------------------------------------------------------

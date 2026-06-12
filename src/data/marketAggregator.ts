@@ -52,11 +52,27 @@ export class DataOutageError extends LiquidityManagerError {
 // ---------------------------------------------------------------------------
 
 export interface StalenessInfo {
-  /** ms since the last successful Binance SUIUSDC update. */
+  /**
+   * ms since the last successful Binance SUIUSDC 1m update.
+   * This is the strategy-critical feed — it drives the feed-level outage guard.
+   *
+   * Returns `Number.MAX_SAFE_INTEGER` (not `Infinity`) when a feed has never
+   * updated (`lastUpdatedMs() === 0`). This sentinel survives `JSON.stringify`
+   * (Infinity serializes as null) and is still greater than any reasonable
+   * `maxAgeMs` comparison used by `allSourcesDown()`.
+   */
   sui: number;
-  /** ms since the last successful Binance BTCUSDT update (same feed as sui). */
+  /**
+   * ms since the last successful Binance BTCUSDT 1m update.
+   * Derived from symbolLastUpdatedMs when available; falls back to the
+   * feed-level lastUpdatedMs (SUI 1m) for feeds that don't expose per-symbol
+   * staleness.
+   */
   btc: number;
-  /** ms since the last successful Binance ETHUSDT update (same feed as sui). */
+  /**
+   * ms since the last successful Binance ETHUSDT 1m update.
+   * Same fallback semantics as btc.
+   */
   eth: number;
   /** ms since the last successful derivatives update. */
   derivatives: number;
@@ -146,8 +162,19 @@ export function createMarketAggregator(deps: MarketAggregatorDeps): MarketAggreg
         spread = (cetusPrice - latestSuiClose) / latestSuiClose;
       }
 
+      // snapshot.ts is the newest underlying data timestamp — max of the
+      // feeds' lastUpdatedMs values that contributed to this snapshot.
+      // Using wall-clock here would make downstream staleness checks measure
+      // "how recently latest() was called" rather than data age; max-of-sources
+      // correctly reflects when the data was last refreshed.
+      const dataTs = Math.max(
+        binance.lastUpdatedMs(),
+        derivatives.lastUpdatedMs(),
+        cetus.lastUpdatedMs(),
+      );
+
       const snapshot: MarketSnapshot = {
-        ts: now(),
+        ts: dataTs,
         cetus: {
           activeBin: cetusData.activeBin,
           price: cetusData.price,
@@ -172,16 +199,39 @@ export function createMarketAggregator(deps: MarketAggregatorDeps): MarketAggreg
 
     staleness(): StalenessInfo {
       const nowMs = now();
-      const binanceAge = binance.lastUpdatedMs() === 0 ? Infinity : nowMs - binance.lastUpdatedMs();
-      const derivAge = derivatives.lastUpdatedMs() === 0 ? Infinity : nowMs - derivatives.lastUpdatedMs();
-      const cetusAge = cetus.lastUpdatedMs() === 0 ? Infinity : nowMs - cetus.lastUpdatedMs();
 
-      // binance feed covers all three symbols from the same REST calls,
-      // so sui/btc/eth staleness is the same value.
+      // Use per-symbol staleness when the feed exposes symbolLastUpdatedMs
+      // (the per-symbol tracking introduced in F2). Fall back to the feed-level
+      // SUI 1m timestamp for feeds that don't implement the extended surface.
+      //
+      // When a feed has never updated (lastMs === 0), return the sentinel value
+      // Number.MAX_SAFE_INTEGER rather than Infinity so that staleness objects
+      // survive JSON.stringify() without becoming null.
+      const NEVER_UPDATED_SENTINEL = Number.MAX_SAFE_INTEGER;
+      function ageMs(lastMs: number): number {
+        return lastMs === 0 ? NEVER_UPDATED_SENTINEL : nowMs - lastMs;
+      }
+
+      const hasSym = "symbolLastUpdatedMs" in binance &&
+        typeof (binance as { symbolLastUpdatedMs: unknown }).symbolLastUpdatedMs === "function";
+
+      const suiAge = ageMs(binance.lastUpdatedMs()); // always SUI 1m
+      const btcAge = hasSym
+        ? ageMs((binance as { symbolLastUpdatedMs(s: string, i: "1m" | "5m"): number })
+            .symbolLastUpdatedMs("BTCUSDT", "1m"))
+        : suiAge;
+      const ethAge = hasSym
+        ? ageMs((binance as { symbolLastUpdatedMs(s: string, i: "1m" | "5m"): number })
+            .symbolLastUpdatedMs("ETHUSDT", "1m"))
+        : suiAge;
+
+      const derivAge = ageMs(derivatives.lastUpdatedMs());
+      const cetusAge = ageMs(cetus.lastUpdatedMs());
+
       return {
-        sui: binanceAge,
-        btc: binanceAge,
-        eth: binanceAge,
+        sui: suiAge,
+        btc: btcAge,
+        eth: ethAge,
         derivatives: derivAge,
         cetus: cetusAge,
       };

@@ -286,4 +286,95 @@ describe("createBinanceMultiFeed", () => {
       expect(() => { stop(); stop(); }).not.toThrow();
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // F2: per-symbol/per-interval staleness tracking
+  // ---------------------------------------------------------------------------
+
+  describe("symbolLastUpdatedMs — per-symbol staleness surface", () => {
+    it("returns 0 for all symbols before any update", () => {
+      const feed = createBinanceMultiFeed({ fetchFn: makeFakeFetch({}) });
+      expect(feed.symbolLastUpdatedMs("SUIUSDC", "1m")).toBe(0);
+      expect(feed.symbolLastUpdatedMs("BTCUSDT", "1m")).toBe(0);
+      expect(feed.symbolLastUpdatedMs("ETHUSDT", "1m")).toBe(0);
+      expect(feed.symbolLastUpdatedMs("SUIUSDC", "5m")).toBe(0);
+    });
+
+    it("updates per-symbol timestamps on successful refresh", async () => {
+      const fixedNow = 1_700_000_100_000;
+      const klines = makeKlines(2, 2.5);
+      const fetchFn = makeFakeFetch({
+        "SUIUSDC:1m": klines, "BTCUSDT:1m": klines, "ETHUSDT:1m": klines,
+        "SUIUSDC:5m": klines, "BTCUSDT:5m": klines, "ETHUSDT:5m": klines,
+      });
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 5, bars5m: 5, now: () => fixedNow });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.symbolLastUpdatedMs("SUIUSDC", "1m")).toBe(fixedNow);
+      expect(feed.symbolLastUpdatedMs("BTCUSDT", "1m")).toBe(fixedNow);
+      expect(feed.symbolLastUpdatedMs("ETHUSDT", "1m")).toBe(fixedNow);
+      expect(feed.symbolLastUpdatedMs("SUIUSDC", "5m")).toBe(fixedNow);
+    });
+
+    it("feed-level lastUpdatedMs reflects only SUI 1m success", async () => {
+      const fixedNow = 1_700_000_200_000;
+      // SUI 1m fails; BTC/ETH succeed
+      let callCount = 0;
+      const suiKlines = makeKlines(2, 2.5);
+      const otherKlines = makeKlines(2, 65000);
+      const fetchFn: FetchFn = async (input): Promise<Response> => {
+        const url = typeof input === "string" ? input
+          : input instanceof URL ? input.toString() : (input as Request).url;
+        const urlObj = new URL(url);
+        const symbol = urlObj.searchParams.get("symbol") ?? "";
+        const interval = urlObj.searchParams.get("interval") ?? "";
+        if (symbol === "SUIUSDC" && interval === "1m") {
+          throw new Error("SUIUSDC 1m fetch error");
+        }
+        const klines = symbol === "SUIUSDC" ? suiKlines : otherKlines;
+        return new Response(JSON.stringify(klines), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      };
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 5, bars5m: 5, now: () => fixedNow });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      // Feed-level lastUpdatedMs must remain 0 — SUI 1m never succeeded.
+      expect(feed.lastUpdatedMs()).toBe(0);
+      // BTC/ETH 1m should have updated.
+      expect(feed.symbolLastUpdatedMs("BTCUSDT", "1m")).toBe(fixedNow);
+      expect(feed.symbolLastUpdatedMs("ETHUSDT", "1m")).toBe(fixedNow);
+    });
+
+    it("feed-level lastUpdatedMs advances when SUI 1m succeeds even if 5m fails", async () => {
+      const fixedNow = 1_700_000_300_000;
+      const klines = makeKlines(2, 2.5);
+      const fetchFn: FetchFn = async (input): Promise<Response> => {
+        const url = typeof input === "string" ? input
+          : input instanceof URL ? input.toString() : (input as Request).url;
+        const urlObj = new URL(url);
+        const interval = urlObj.searchParams.get("interval") ?? "";
+        if (interval === "5m") throw new Error("5m fetch error");
+        return new Response(JSON.stringify(klines), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      };
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 5, bars5m: 5, now: () => fixedNow });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      // SUI 1m succeeded → feed-level lastUpdatedMs advances.
+      expect(feed.lastUpdatedMs()).toBe(fixedNow);
+      // 5m windows never updated.
+      expect(feed.symbolLastUpdatedMs("SUIUSDC", "5m")).toBe(0);
+    });
+  });
 });

@@ -12,6 +12,15 @@
  *   - No SQLite persistence here — the aggregator layer handles any needed
  *     persistence via price_observations.
  *   - Fetch function is injectable for deterministic tests.
+ *
+ * Staleness contract (F2 fix):
+ *   - Per-symbol, per-interval `lastUpdatedMs` are tracked independently.
+ *   - The feed-level `lastUpdatedMs()` reflects only the SUI 1m window — the
+ *     strategy-critical input used by marketAggregator's outage guard.
+ *   - `symbolLastUpdatedMs(symbol, interval)` surfaces per-symbol staleness for
+ *     diagnostics and the `staleness()` surface in marketAggregator.
+ *   - When SUI 1m batch fails but BTC/ETH succeed, a WARN is emitted and the
+ *     feed-level timestamp is NOT updated (preventing silent stale SUI data).
  */
 
 import { log } from "../../lib/logger.ts";
@@ -61,6 +70,8 @@ export interface BinanceMultiFeedOptions {
   bars5m?: number;
   /** Injectable fetch function (for testing). Defaults to global fetch. */
   fetchFn?: FetchFn;
+  /** Injectable clock for deterministic tests. Defaults to Date.now. */
+  now?: () => number;
 }
 
 export interface BinanceMultiWindows {
@@ -77,8 +88,21 @@ export interface BinanceMultiFeed {
   latest5m(): BinanceMultiWindows;
   /** Combined latest windows for MarketSnapshot (uses 1m bars). */
   latest(): BinanceMultiWindows;
-  /** Epoch ms of the last successful update, or 0 if never updated. */
+  /**
+   * Epoch ms of the last successful SUI 1m update, or 0 if never updated.
+   *
+   * Strategy-critical: this value is what marketAggregator's outage guard
+   * checks. It reflects only the SUI 1m window because that is the primary
+   * feature source for DLMM position decisions.
+   */
   lastUpdatedMs(): number;
+  /**
+   * Per-symbol, per-interval last-updated timestamps for diagnostics.
+   *
+   * Returns 0 for a symbol/interval that has never successfully updated.
+   * Keys use the form `"SUIUSDC:1m"`, `"BTCUSDT:5m"`, etc.
+   */
+  symbolLastUpdatedMs(symbol: string, interval: "1m" | "5m"): number;
 }
 
 // ---------------------------------------------------------------------------
@@ -95,6 +119,9 @@ const SYMBOLS: SymbolConfig[] = [
   { symbol: "BTCUSDT", key: "btc" },
   { symbol: "ETHUSDT", key: "eth" },
 ];
+
+// The SUI 1m symbol key used for the feed-level staleness signal.
+const SUI_SYMBOL = "SUIUSDC";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -173,11 +200,23 @@ export function createBinanceMultiFeed(opts: BinanceMultiFeedOptions = {}): Bina
   const maxBars1m = opts.bars1m ?? DEFAULT_1M_BARS;
   const maxBars5m = opts.bars5m ?? DEFAULT_5M_BARS;
   const fetchFn: FetchFn = opts.fetchFn ?? fetch;
+  const nowFn = opts.now ?? (() => Date.now());
 
   // In-memory rolling windows per symbol per interval.
   const windows1m: BinanceMultiWindows = { sui: [], btc: [], eth: [] };
   const windows5m: BinanceMultiWindows = { sui: [], btc: [], eth: [] };
-  let lastUpdated = 0;
+
+  // Per-symbol, per-interval last-updated timestamps.
+  // Key format: "<SYMBOL>:<interval>" e.g. "SUIUSDC:1m", "BTCUSDT:5m".
+  const symbolUpdated = new Map<string, number>();
+
+  function symKey(symbol: string, interval: "1m" | "5m"): string {
+    return `${symbol}:${interval}`;
+  }
+
+  function markSymbolUpdated(symbol: string, interval: "1m" | "5m"): void {
+    symbolUpdated.set(symKey(symbol, interval), nowFn());
+  }
 
   async function jsonFetch<T>(url: string): Promise<T> {
     let resp: Response;
@@ -210,33 +249,66 @@ export function createBinanceMultiFeed(opts: BinanceMultiFeedOptions = {}): Bina
     return parseKlines(raw);
   }
 
-  async function refreshAll(): Promise<void> {
+  /**
+   * Refresh all symbols for a given interval. Per-symbol results are settled
+   * independently so a BTC failure doesn't block SUI from updating.
+   *
+   * Feed-level lastUpdatedMs (used by marketAggregator's outage guard) is only
+   * updated when the SUI 1m batch succeeds. When SUI fails but others succeed,
+   * a WARN is emitted so operators know the strategy-critical feed is stale.
+   */
+  async function refreshAllForInterval(interval: "1m" | "5m", maxBars: number): Promise<void> {
     const results = await Promise.allSettled(
-      SYMBOLS.flatMap((cfg) => [
-        refreshSymbol(cfg, "1m", maxBars1m).then((bars) => {
-          windows1m[cfg.key] = mergeWindow(windows1m[cfg.key], bars, maxBars1m);
+      SYMBOLS.map((cfg) =>
+        refreshSymbol(cfg, interval, maxBars).then((bars) => {
+          const windows = interval === "1m" ? windows1m : windows5m;
+          windows[cfg.key] = mergeWindow(windows[cfg.key], bars, maxBars);
+          markSymbolUpdated(cfg.symbol, interval);
         }),
-        refreshSymbol(cfg, "5m", maxBars5m).then((bars) => {
-          windows5m[cfg.key] = mergeWindow(windows5m[cfg.key], bars, maxBars5m);
-        }),
-      ]),
+      ),
     );
 
-    const failures = results.filter((r) => r.status === "rejected");
+    // Log per-symbol failures.
+    const failures = results
+      .map((r, i) => ({ result: r, cfg: SYMBOLS[i]! }))
+      .filter((x) => x.result.status === "rejected");
+
     if (failures.length > 0) {
-      for (const f of failures) {
+      for (const { result, cfg } of failures) {
         log.warn("binanceMulti: partial refresh failure", {
-          error: (f as PromiseRejectedResult).reason instanceof Error
-            ? (f as PromiseRejectedResult).reason.message
-            : String((f as PromiseRejectedResult).reason),
+          symbol: cfg.symbol,
+          interval,
+          error: (result as PromiseRejectedResult).reason instanceof Error
+            ? (result as PromiseRejectedResult).reason.message
+            : String((result as PromiseRejectedResult).reason),
         });
       }
-    }
 
-    // Update lastUpdated even on partial success (at least some windows refreshed).
-    if (failures.length < results.length) {
-      lastUpdated = Date.now();
+      // Warn specifically when the SUI 1m batch failed (strategy-critical).
+      if (interval === "1m") {
+        const suiFailed = failures.some((x) => x.cfg.symbol === SUI_SYMBOL);
+        const othersSucceeded = failures.length < SYMBOLS.length;
+        if (suiFailed && othersSucceeded) {
+          log.warn("binanceMulti: SUI 1m batch failed while other symbols succeeded — " +
+            "feed-level lastUpdatedMs will NOT advance; snapshots may have stale SUI bars", {
+            successfulSymbols: SYMBOLS
+              .filter((s) => results[SYMBOLS.indexOf(s)]!.status === "fulfilled")
+              .map((s) => s.symbol),
+          });
+        }
+      }
     }
+  }
+
+  /**
+   * Initial full refresh (both intervals, all symbols).
+   * Errors are logged but do not throw so the agent loop can continue.
+   */
+  async function refreshAll(): Promise<void> {
+    await Promise.allSettled([
+      refreshAllForInterval("1m", maxBars1m),
+      refreshAllForInterval("5m", maxBars5m),
+    ]);
   }
 
   return {
@@ -251,32 +323,18 @@ export function createBinanceMultiFeed(opts: BinanceMultiFeedOptions = {}): Bina
 
       // Stagger the two timers slightly so they don't race.
       const timer1m = setInterval(() => {
-        SYMBOLS.forEach((cfg) => {
-          refreshSymbol(cfg, "1m", maxBars1m)
-            .then((bars) => {
-              windows1m[cfg.key] = mergeWindow(windows1m[cfg.key], bars, maxBars1m);
-              lastUpdated = Date.now();
-            })
-            .catch((err: unknown) => {
-              log.warn(`binanceMulti: 1m refresh failed for ${cfg.symbol}`, {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            });
+        refreshAllForInterval("1m", maxBars1m).catch((err: unknown) => {
+          log.warn("binanceMulti: 1m interval refresh loop error", {
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
       }, REFRESH_1M_INTERVAL_MS);
 
       const timer5m = setInterval(() => {
-        SYMBOLS.forEach((cfg) => {
-          refreshSymbol(cfg, "5m", maxBars5m)
-            .then((bars) => {
-              windows5m[cfg.key] = mergeWindow(windows5m[cfg.key], bars, maxBars5m);
-              lastUpdated = Date.now();
-            })
-            .catch((err: unknown) => {
-              log.warn(`binanceMulti: 5m refresh failed for ${cfg.symbol}`, {
-                error: err instanceof Error ? err.message : String(err),
-              });
-            });
+        refreshAllForInterval("5m", maxBars5m).catch((err: unknown) => {
+          log.warn("binanceMulti: 5m interval refresh loop error", {
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
       }, REFRESH_5M_INTERVAL_MS);
 
@@ -312,8 +370,20 @@ export function createBinanceMultiFeed(opts: BinanceMultiFeedOptions = {}): Bina
       };
     },
 
+    /**
+     * Returns the last-updated timestamp for the SUI 1m window.
+     *
+     * This is the feed-level staleness signal consumed by marketAggregator's
+     * outage guard. It only advances when the SUI 1m batch succeeds, so a
+     * partial success (BTC/ETH ok, SUI failed) correctly keeps this at its
+     * previous value and triggers the outage guard when the window expires.
+     */
     lastUpdatedMs(): number {
-      return lastUpdated;
+      return symbolUpdated.get(symKey(SUI_SYMBOL, "1m")) ?? 0;
+    },
+
+    symbolLastUpdatedMs(symbol: string, interval: "1m" | "5m"): number {
+      return symbolUpdated.get(symKey(symbol, interval)) ?? 0;
     },
   };
 }

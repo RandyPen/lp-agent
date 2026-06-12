@@ -170,7 +170,14 @@ describe("NullPredictionProvider", () => {
     });
   });
 
-  describe("pAbove + pBelow invariants", () => {
+  describe("pAbove + pBelow invariants (sidecar-aligned definition — F3)", () => {
+    // Definition (aligned with ml/serving/app.py):
+    //   pAbove = 1 − Φ((upperOffset − 0) / widthSigma)
+    //   pBelow = Φ((lowerOffset − 0) / widthSigma)
+    // ctx.currentBins = [-5992...-5988], activeBin = -5990
+    // → lowerOffset = -2, upperOffset = +2 (symmetric)
+    // pAbove = 1 - Φ(2/w), pBelow = Φ(-2/w) = 1 - Φ(2/w)  → equal and < 0.5
+
     it("pAbove and pBelow are both in (0, 0.5) for typical inputs", async () => {
       const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.003)), makeCtx());
       expect(resp.pAbove).toBeGreaterThan(0);
@@ -192,11 +199,39 @@ describe("NullPredictionProvider", () => {
       }
     });
 
-    it("pAbove and pBelow are equal (symmetric, since centerOffset=0 and no drift)", async () => {
+    it("pAbove and pBelow are equal (symmetric ctx: lowerOffset=-2, upperOffset=+2)", async () => {
+      // makeCtx() has currentBins=[-5992...-5988], activeBin=-5990 → offsets ±2 → symmetric
       const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.002)), makeCtx());
-      // They should be numerically identical because the log-normal is symmetric
-      // around the current price under μ=0.
       expect(Math.abs(resp.pAbove - resp.pBelow)).toBeLessThan(1e-10);
+    });
+
+    it("pAbove > pBelow when upper boundary is farther (asymmetric range)", async () => {
+      // Wider upper boundary → higher pAbove (more likely to cross upward)
+      const asymCtx: PmRangeContext = {
+        pmId: "0xpm-test",
+        activeBin: -5990,
+        binStep: 10,
+        currentBins: [-5992, -5991, -5990, -5989], // lowerOffset=-2, upperOffset=+1 (asymmetric)
+      };
+      // For lowerOffset=-2, upperOffset=+1:
+      // pAbove = 1 - Φ(1/w), pBelow = Φ(-2/w)
+      // Since 1/w < 2/w, Φ(1/w) < Φ(2/w), so 1-Φ(1/w) > 1-Φ(2/w) = Φ(-2/w) = pBelow
+      // → pAbove > pBelow
+      const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.003)), asymCtx);
+      expect(resp.pAbove).toBeGreaterThan(resp.pBelow);
+    });
+
+    it("uses default ±0.5 bin offsets when currentBins is empty (matches sidecar default)", async () => {
+      const emptyCtx: PmRangeContext = {
+        pmId: "0xpm-test",
+        activeBin: -5990,
+        binStep: 10,
+        currentBins: [],  // empty → default ±0.5
+      };
+      const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.003)), emptyCtx);
+      // With ±0.5 offset and widthSigma > 0, pAbove and pBelow should be equal and < 0.5
+      expect(Math.abs(resp.pAbove - resp.pBelow)).toBeLessThan(1e-10);
+      expect(resp.pAbove + resp.pBelow).toBeLessThan(1);
     });
   });
 

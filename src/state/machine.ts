@@ -50,6 +50,7 @@ import {
   deriveLendingPct,
   deriveTrendBias,
   deriveToleranceBins,
+  deriveMaxCenterOffset,
 } from "./params.ts";
 import {
   type ExtremeSignal,
@@ -69,10 +70,16 @@ export interface StateMachine {
   /**
    * Evaluate the next state given the latest market snapshot and prediction.
    *
-   * @param snapshot    Latest multi-source market snapshot.
-   * @param pred        Latest prediction response (must have fallback=false).
-   * @param input       Current strategy input (for pool context).
+   * @param snapshot       Latest multi-source market snapshot.
+   * @param pred           Latest prediction response (must have fallback=false).
+   * @param input          Current strategy input (for pool context).
    * @param extremeSignal  Optional L2 risk signal.  null/undefined = no signal.
+   * @param volRecovered   Whether the risk monitor considers volatility to have
+   *                       recovered (used for EXTREME exit hysteresis).  When
+   *                       omitted the machine defaults to false — the caller
+   *                       (mlAgent) must supply this from riskMonitor.volRecovered().
+   *                       Keeping it optional preserves backward compat for tests
+   *                       that don't wire a real risk monitor.
    * @returns A fully populated StateContext for this evaluation tick.
    */
   advance(
@@ -80,6 +87,7 @@ export interface StateMachine {
     pred: PredictionResponse,
     input: StrategyInput,
     extremeSignal?: ExtremeSignal | null,
+    volRecovered?: boolean,
   ): StateContext;
 
   /** Return the current StateContext without evaluating transitions. */
@@ -162,10 +170,16 @@ export function createStateMachine(deps: {
         ? deriveTrendBias(pred.pAbove, pred.pBelow)
         : 0;
 
-    const l1Bonus = false; // L1 bonus is determined by risk module, not state machine
-    const lendingPct = deriveLendingPct(state, trendBias, l1Bonus);
+    // L1 bonus is applied by mlAgent after the state machine returns the context;
+    // deriveLendingPct no longer accepts an l1Bonus param (F6 dead-code removal).
+    const lendingPct = deriveLendingPct(state, trendBias);
     const halfWidth = deriveHalfWidth(pred.widthSigma);
-    const toleranceBins = deriveToleranceBins(pred.widthSigma);
+    const toleranceBins = deriveToleranceBins(pred.widthSigma, halfWidth);
+
+    // F5: populate maxCenterOffset in the context so diffPlanner doesn't need to
+    // re-derive it. The state machine owns the derivation; diffPlanner reads it.
+    const uncertaintyHigh = pred.featureCompleteness < U_HIGH;
+    const maxCenterOffset = deriveMaxCenterOffset(pred.widthSigma, uncertaintyHigh);
 
     return {
       state,
@@ -175,6 +189,7 @@ export function createStateMachine(deps: {
       trendBias,
       lendingPct,
       toleranceBins,
+      maxCenterOffset,
       minDwellMs: MIN_DWELL_MS[state],
     };
   }
@@ -227,6 +242,7 @@ export function createStateMachine(deps: {
     pred: PredictionResponse,
     _input: StrategyInput,
     extremeSignal?: ExtremeSignal | null,
+    volRecovered = false,
   ): StateContext {
     const nowMs = now();
     const { state, enteredAtMs } = internalState;
@@ -274,14 +290,10 @@ export function createStateMachine(deps: {
       }
 
       if (state === "EXTREME") {
-        // volRecovered: checked conservatively — if no external signal and
-        // p-sum is low and dwell elapsed, we treat vol as recovered unless
-        // the external signal explicitly says otherwise.
-        // The risk module can inject `extremeSignal.active = true` to block exit.
-        const volRecovered =
-          !extremeSignal?.active &&
-          pred.pAbove + pred.pBelow <= 0.7 * (1 + 0.07); // 7% hysteresis margin
-
+        // volRecovered is supplied by the caller (mlAgent via riskMonitor.volRecovered())
+        // which runs the real canExitExtreme circuit-breaker check (F2: replacing the
+        // former p-sum proxy `pred.pAbove + pred.pBelow <= P_BREAK_SUM_EXTREME * (1 + EXTREME_VOL_HYSTERESIS)`
+        // which used hardcoded literals and had no actual volatility measurement).
         if (
           shouldExitExtreme(
             pred,
@@ -323,6 +335,7 @@ export function createStateMachine(deps: {
                 : internalState.state === "TREND"   ? 0.50
                 : 0.35,
       toleranceBins: 1,
+      maxCenterOffset: 1,     // conservative default; real value requires featureCompleteness
       minDwellMs: MIN_DWELL_MS[internalState.state],
     };
   }
