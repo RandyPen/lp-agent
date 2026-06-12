@@ -26,10 +26,6 @@ docs/seal-integration.md
 docs/treasury-role-design.md
 docs/x-article.md
 
-# Operator-local scripts stay untracked; the reusable subset is whitelisted.
-/scripts/*
-!/scripts/verify-agent-address.ts
-!/scripts/verify-treasury-address.ts
-!/scripts/collect-historical.ts
-!/scripts/backfill-cetus-events.ts
-!/scripts/verify-data-coverage.ts
+# The entire scripts/ directory is operator-local (verification probes,
+# bootstrap helpers, treasury ops) and stays untracked.
+/scripts/

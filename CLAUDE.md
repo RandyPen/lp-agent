@@ -40,11 +40,11 @@ Open-source quant agent (~16 kLOC TypeScript, 572 tests / 31 files; plus the `ml
 **Note on doc references**: the detailed design documents under `docs/` (implementation plan, data sources, prediction/decision/backtest/risk designs, treasury, Seal, module-and-testing) are operator-local Chinese notes — gitignored, NOT in the public repo. References to them throughout this file are kept for the operator; in a fresh clone only `docs/README.md` and `docs/project-overview.md` exist.
 
 - Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo.
-- **`.gitignore` layout** (the §2.1 open-source cleanup landed — `tests/`, the public docs, and the reusable scripts are now tracked):
+- **`.gitignore` layout** (the §2.1 open-source cleanup landed — `tests/` and the public docs are tracked; `scripts/` is fully local):
   - Root markdown (`README.md`, `CLAUDE.md`) is tracked; the operator's Chinese-named internal notes file at the repo root stays local (ignored via an ASCII-only pattern).
   - `docs/` — only the English docs are tracked (`docs/README.md`, `docs/project-overview.md`). The detailed Chinese design documents (`implementation-plan-v1.md`, `data-sources.md`, `forecasting-approach.md`, `prediction-service-design.md`, `decision-engine-design.md`, `backtest-framework-design.md`, `risk-monitoring-design.md`, `module-and-testing.md`, `treasury-role-design.md`, `seal-integration.md`, `project-background.md`, `x-article.md`) are ignored per-file and exist only on the operator's machine — they are NOT in the public repo. References to them elsewhere in this file remain valid for the operator but will not resolve in a fresh clone.
   - `/tests` — tracked (first trust signal for an open-source repo).
-  - `/scripts/*` is ignored with a whitelist: `verify-agent-address.ts`, `verify-treasury-address.ts`, `collect-historical.ts`, `backfill-cetus-events.ts`, `verify-data-coverage.ts` are tracked; operator-local scripts (`bootstrap-agent-key.ts`, `lending-bootstrap.ts`, `print-events.ts`, `treasury-*.ts`) stay untracked.
+  - `/scripts/` — the ENTIRE directory is ignored. All scripts (verification probes, bootstrap helpers, treasury ops, historical-data collectors) are operator-local; nothing under `scripts/` ships in the public repo, and the runtime never imports from it.
   - `/data` — SQLite database directory, ignored.
   - `.env`, `.env.local` — never commit secrets.
   - `ml/.gitignore` keeps `ml/artifacts/`, `ml/data/parquet/`, `ml/reports/`, `.venv` out of git; `ml/uv.lock` IS tracked for reproducibility.
@@ -52,7 +52,7 @@ Open-source quant agent (~16 kLOC TypeScript, 572 tests / 31 files; plus the `ml
 
 ## Verification scripts (convention)
 
-**One-off verification / probe / smoke-test code goes in `scripts/`, never in `src/` or `tests/`.** The scripts directory is ignored by default (`/scripts/*` with a whitelist for the reusable subset), so this kind of code is intentionally local — it's for the operator running on this machine, not part of the agent's runtime surface.
+**One-off verification / probe / smoke-test code goes in `scripts/`, never in `src/` or `tests/`.** The entire scripts directory is gitignored, so this kind of code is intentionally local — it's for the operator running on this machine, not part of the agent's runtime surface.
 
 Use cases that belong here:
 - Verifying a mnemonic derives an expected Sui address.

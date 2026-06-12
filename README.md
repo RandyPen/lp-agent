@@ -38,7 +38,10 @@ cp .env.example .env                     # edit in your secrets
                                          # risk thresholds) are documented in .env.example.
 
 # 3. Verify key derivation
-bun run scripts/verify-agent-address.ts  # should print a match
+#    Derive the address from your mnemonic at AGENT_DERIVATION_PATH and
+#    compare it with EXPECTED_AGENT_ADDRESS — the runtime enforces the
+#    match at startup and aborts on mismatch. (scripts/ is operator-local
+#    and not shipped; write your own probe there, see CLAUDE.md.)
 
 # 4. Static integrity
 bun run typecheck && bun test            # should be 572 pass
@@ -104,7 +107,7 @@ export interface PredictionProvider {
 }
 ```
 
-Implement `PredictionProvider` and plug in your own sidecar / remote service / local implementation — the framework does not change. References: `src/prediction/sidecarProvider.ts` (HTTP → Python sidecar) and `nullProvider.ts` (rule-based fallback). The training pipeline lives in `ml/` (uv-managed, LightGBM quantile models); forks rebuild the training set with `bun run scripts/collect-historical.ts` and train their own.
+Implement `PredictionProvider` and plug in your own sidecar / remote service / local implementation — the framework does not change. References: `src/prediction/sidecarProvider.ts` (HTTP → Python sidecar) and `nullProvider.ts` (rule-based fallback). The training pipeline lives in `ml/` (uv-managed, LightGBM quantile models); forks rebuild the training set with the shipped collectors (`cd ml && uv run python -m data.collectors.binance_klines --start … --end …`) and train their own.
 
 ## What you bring
 
@@ -165,7 +168,7 @@ Detailed design documents (data sources, prediction service, decision engine, ba
 ## `.gitignore` layout
 
 - `tests/`, root markdown, and the public docs (`docs/README.md`, `docs/project-overview.md`) are tracked. Internal design documents (Chinese) under `docs/` are ignored per-file and stay on the operator's machine.
-- `scripts/` is ignored by default with a whitelist for the reusable subset: `verify-agent-address.ts`, `verify-treasury-address.ts`, `collect-historical.ts`, `backfill-cetus-events.ts`, `verify-data-coverage.ts`. Operator-local scripts (bootstrap, treasury ops) stay untracked.
+- `scripts/` is entirely untracked — verification probes, bootstrap helpers, and treasury ops scripts are operator-local by convention (see CLAUDE.md "Verification scripts"). The runtime never depends on them.
 - `ml/artifacts/` (model artifacts), `ml/data/parquet/`, and `ml/reports/` stay out of git; `ml/uv.lock` is tracked so the training environment is reproducible.
 - `/data/` (SQLite), `.env`, `.env.local` are never committed.
 
