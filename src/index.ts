@@ -318,7 +318,7 @@ async function main(): Promise<void> {
   let treasuryService: TreasuryService | null = null;
   if (cfg.treasury.enabled) {
     try {
-      treasuryService = startTreasuryService(cfg.treasury);
+      treasuryService = startTreasuryService(cfg);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       log.error("treasury: failed to start", { error: msg });

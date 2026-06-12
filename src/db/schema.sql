@@ -1,17 +1,19 @@
--- LiquidityManager 全部 SQLite schema。
+-- LiquidityManager full SQLite schema.
 --
--- 设计选择:不做版本化迁移,每次 `openDb()` 启动直接执行整份文件。所有
--- CREATE 都带 `IF NOT EXISTS`,重跑是 no-op。
+-- Design choice: no versioned migrations. Each `openDb()` startup runs the
+-- entire file. All CREATEs carry `IF NOT EXISTS`, so re-running is a no-op.
 --
--- 加新表 / 加索引:直接在本文件末尾追加 — 不需要新增 migration 文件,
--- 不需要更新版本表。Dev DB 重启即生效。
+-- To add a new table or index: append at the bottom of this file — no new
+-- migration file needed, no version table to update. Effective on next dev
+-- DB restart.
 --
--- 不支持 schema 变更里需要数据搬迁的场景(ALTER TABLE 改类型、删列等)。
--- 项目阶段尚未上线、没有产品数据,出现这种需求时直接 `rm ./data/app.db`
--- 重建即可。等真上 prod 再引入正式迁移工具。
+-- Schema changes that require data migration (ALTER TABLE column type change,
+-- column removal, etc.) are not supported by this approach. While the project
+-- has no production data, simply `rm ./data/app.db` and restart to rebuild.
+-- Introduce a proper migration tool when moving to prod.
 
 ------------------------------------------------------------------------------
--- 订阅 / 事件追踪(原 0001_init)
+-- Subscriptions / event tracking (formerly 0001_init)
 ------------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -57,7 +59,7 @@ CREATE TABLE IF NOT EXISTS price_observations (
 CREATE INDEX IF NOT EXISTS price_observations_lookup ON price_observations(pool_id, observed_ms DESC);
 
 ------------------------------------------------------------------------------
--- 借贷(原 0002_lending)
+-- Lending (formerly 0002_lending)
 ------------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS lending_positions (
@@ -90,10 +92,10 @@ CREATE TABLE IF NOT EXISTS lending_actions (
 CREATE INDEX IF NOT EXISTS lending_actions_pm ON lending_actions(pm_id, planned_at_ms DESC);
 
 ------------------------------------------------------------------------------
--- 策略持仓状态(原 0003_position_state)
+-- Strategy position state (formerly 0003_position_state)
 --
--- 当前只有 fill_boundary_bin_id,bid-ask / only-bid / only-sell 类策略
--- (v2 上线)使用;v0 策略不写此表。
+-- Currently only fill_boundary_bin_id is used. Bid-ask / only-bid / only-ask
+-- style strategies (v2) write this table; v0 strategies do not.
 ------------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS position_state (
@@ -106,12 +108,12 @@ CREATE TABLE IF NOT EXISTS position_state (
 CREATE INDEX IF NOT EXISTS position_state_strategy ON position_state(strategy_name);
 
 ------------------------------------------------------------------------------
--- Treasury(用户充值 + 调仓扣减)— 见 docs/treasury-role-design.md
+-- Treasury (user top-ups + rebalance charge deductions) — see docs/treasury-role-design.md
 ------------------------------------------------------------------------------
 
--- 充值用户:一个 sui_address(用户主钱包)→ 唯一 derivation_index →
--- 唯一 deposit_address。derivation_index ∈ [1, 2^31)(0 留给 treasury master;
--- SLIP-0010 hardened 上限 2^31-1 = 2147483647)。
+-- Top-up users: one sui_address (user's main wallet) → unique derivation_index
+-- → unique deposit_address. derivation_index ∈ [1, 2^31) (0 reserved for the
+-- treasury master; SLIP-0010 hardened upper bound is 2^31-1 = 2147483647).
 CREATE TABLE IF NOT EXISTS treasury_users (
   sui_address       TEXT PRIMARY KEY,
   derivation_index  INTEGER NOT NULL UNIQUE
@@ -123,7 +125,7 @@ CREATE TABLE IF NOT EXISTS treasury_users (
 CREATE INDEX IF NOT EXISTS treasury_users_deposit_address
   ON treasury_users(deposit_address);
 
--- 每币种入账率。运营在 admin script 里更新。
+-- Per-coin credit booking rate. Operators update this via the admin script.
 -- credits = floor(amount_atomic × rate_num / rate_den)
 CREATE TABLE IF NOT EXISTS treasury_credit_rates (
   coin_type      TEXT PRIMARY KEY,
@@ -133,7 +135,7 @@ CREATE TABLE IF NOT EXISTS treasury_credit_rates (
   updated_by     TEXT
 );
 
--- Watcher 看到的最新链上余额快照。仅 delta > 0 才入账。
+-- Latest on-chain balance snapshot seen by the watcher. Credits are booked only when delta > 0.
 CREATE TABLE IF NOT EXISTS treasury_address_balances (
   deposit_address    TEXT NOT NULL,
   coin_type          TEXT NOT NULL,
@@ -142,7 +144,7 @@ CREATE TABLE IF NOT EXISTS treasury_address_balances (
   PRIMARY KEY (deposit_address, coin_type)
 );
 
--- 充值流水。append-only 审计。
+-- Deposit ledger. Append-only audit log.
 CREATE TABLE IF NOT EXISTS treasury_deposits (
   id                TEXT PRIMARY KEY,   -- ULID
   sui_address       TEXT NOT NULL,
@@ -160,10 +162,10 @@ CREATE TABLE IF NOT EXISTS treasury_deposits (
 CREATE INDEX IF NOT EXISTS treasury_deposits_user
   ON treasury_deposits(sui_address, observed_at_ms DESC);
 
--- 服务费扣减审计。每次调仓在 INSERT 时同步 UPDATE treasury_users.credits。
--- nonce 作主键防重放(rebalancer 用 `${tickId}:${pmId}` 生成)。
--- v1 不收 signature / message_b64(内部扣减由 rebalancer 触发,PM owner 通过
--- AgentAdded 链上事件默示授权);v2 暴露 HTTP API 时再 ALTER TABLE 加列。
+-- Service charge audit log. Each rebalance INSERTs here and simultaneously
+-- UPDATEs treasury_users.credits. nonce is the primary key for replay prevention
+-- (rebalancer generates it as `${tickId}:${pmId}`).
+-- NOTE: dev DBs must rm data/app.db to pick up new columns (no-migration policy)
 CREATE TABLE IF NOT EXISTS treasury_service_charges (
   nonce            TEXT PRIMARY KEY,
   sui_address      TEXT NOT NULL,
@@ -173,6 +175,9 @@ CREATE TABLE IF NOT EXISTS treasury_service_charges (
   status           TEXT NOT NULL CHECK(status IN ('ok','rejected','refunded')),
   error            TEXT,
   created_at_ms    INTEGER NOT NULL,
+  signature        TEXT,              -- user's personal-message signature (HTTP API charges only)
+  message_b64      TEXT,              -- base64-encoded signed message
+  verified_at_ms   INTEGER,           -- when the signature was verified
   FOREIGN KEY (sui_address) REFERENCES treasury_users(sui_address)
 );
 CREATE INDEX IF NOT EXISTS treasury_service_charges_user
@@ -180,7 +185,22 @@ CREATE INDEX IF NOT EXISTS treasury_service_charges_user
 CREATE INDEX IF NOT EXISTS treasury_service_charges_pm
   ON treasury_service_charges(pm_id, created_at_ms DESC);
 
--- 运营操作流水(sweep / swap / 手工转账)。append-only。
+-- Nonce audit log for HTTP API charge requests. Inserted BEFORE signature
+-- verification (nonce-first audit per docs/treasury-role-design.md Appendix C).
+-- status: 'pending' → 'accepted' on success, 'rejected' on bad signature.
+CREATE TABLE IF NOT EXISTS treasury_charge_nonces (
+  id            INTEGER PRIMARY KEY,
+  sui_address   TEXT NOT NULL,
+  nonce         TEXT NOT NULL,
+  status        TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected')),
+  error         TEXT,
+  created_at_ms INTEGER NOT NULL,
+  UNIQUE(sui_address, nonce)
+);
+CREATE INDEX IF NOT EXISTS treasury_charge_nonces_addr
+  ON treasury_charge_nonces(sui_address, created_at_ms DESC);
+
+-- Operator operation log (sweep / swap / manual transfer). Append-only.
 CREATE TABLE IF NOT EXISTS treasury_ops (
   id               TEXT PRIMARY KEY,
   op_kind          TEXT NOT NULL CHECK(op_kind IN ('sweep', 'transfer', 'swap')),
@@ -198,10 +218,12 @@ CREATE TABLE IF NOT EXISTS treasury_ops (
 );
 
 ------------------------------------------------------------------------------
--- ML 预测 + 状态机 + 风控事件(v1 — §6)
+-- ML predictions + state machine + risk events (v1 — §6)
 --
--- 键形状说明:predictions / market_state_history 按 pool_id 键(预测与状态是
--- 池级别事实,多 PM 同池不重复落行)。risk_events 加 pm_id(熔断可能针对单个 PM)。
+-- Key shape: predictions / market_state_history are keyed by pool_id (predictions
+-- and state are pool-level facts; multiple PMs on the same pool do not produce
+-- duplicate rows). risk_events include pm_id (a circuit breaker may target a
+-- single PM).
 ------------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS predictions (
@@ -234,7 +256,7 @@ CREATE TABLE IF NOT EXISTS predictions (
   -- this column existed. The column is NOT NULL for all new rows written by mlAgent.
   executed_path   TEXT NOT NULL CHECK(executed_path IN ('model','tier0_fallback','tier0_probation')),
   infer_ms        INTEGER NOT NULL,
-  snapshot_digest TEXT              -- 6 个关键字段的压缩摘要;完整特征行落 parquet,不进 SQLite
+  snapshot_digest TEXT              -- compact digest of 6 key fields; full feature row goes to parquet, not SQLite
 );
 CREATE INDEX IF NOT EXISTS predictions_pool_ts ON predictions(pool_id, ts_ms DESC);
 
@@ -253,7 +275,7 @@ CREATE INDEX IF NOT EXISTS state_pool_entered
 CREATE TABLE IF NOT EXISTS risk_events (
   id              INTEGER PRIMARY KEY AUTOINCREMENT,
   pool_id         TEXT,
-  pm_id           TEXT,              -- 可空:池级事件无 pm
+  pm_id           TEXT,              -- nullable: pool-level events have no pm
   ts_ms           INTEGER NOT NULL,
   level           TEXT NOT NULL CHECK(level IN ('L1','L2','L3')),
   kind            TEXT NOT NULL,

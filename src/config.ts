@@ -50,6 +50,8 @@ export interface TreasuryAppConfig {
   rebalanceFeeRate: number;
   /** When true, an unregistered PM owner is treated as "no credits" → rebalance skipped. */
   requireRegistration: boolean;
+  /** HTTP API config for treasury v2. null when disabled (TREASURY_HTTP_ENABLED=false). */
+  http: { enabled: boolean; host: string; port: number } | null;
 }
 
 /**
@@ -212,7 +214,7 @@ class ConfigErrorAggregator {
   toError(): ConfigError {
     const numbered = this.issues.map((s, i) => `  ${i + 1}. ${s}`).join("\n");
     return new ConfigError(
-      `配置缺失或无效(共 ${this.issues.length} 项),请补齐 .env(参见 .env.example):\n${numbered}`,
+      `Configuration missing or invalid (${this.issues.length} issue(s)) — fill in .env (see .env.example):\n${numbered}`,
     );
   }
 }
@@ -339,6 +341,19 @@ export function loadConfig(): AppConfig {
     };
   }
 
+  const treasuryHttpEnabled =
+    optional("TREASURY_HTTP_ENABLED", "false").toLowerCase() === "true";
+  const treasuryHttpHost = optional("TREASURY_HTTP_HOST", "127.0.0.1");
+  const treasuryHttpPort = Number(optional("TREASURY_HTTP_PORT", "8378"));
+  if (treasuryHttpEnabled) {
+    // Port 0 is valid (OS-assigned, used in tests). Accept 0–65535.
+    if (!Number.isInteger(treasuryHttpPort) || treasuryHttpPort < 0 || treasuryHttpPort > 65535) {
+      errs.push(
+        `TREASURY_HTTP_PORT must be an integer in range 0–65535, got '${process.env.TREASURY_HTTP_PORT ?? ""}'`,
+      );
+    }
+  }
+
   const treasury: TreasuryAppConfig = {
     enabled: treasuryEnabled,
     watcherIntervalMs: Number(optional("TREASURY_WATCHER_INTERVAL_MS", "15000")),
@@ -347,6 +362,9 @@ export function loadConfig(): AppConfig {
     rebalanceFeeRate: Number(optional("TREASURY_REBALANCE_FEE_RATE", "0.0000001")),
     requireRegistration:
       optional("TREASURY_REQUIRE_REGISTRATION", "false").toLowerCase() === "true",
+    http: treasuryHttpEnabled
+      ? { enabled: true, host: treasuryHttpHost, port: treasuryHttpPort }
+      : null,
   };
   if (treasury.enabled) {
     if (!Number.isFinite(treasury.watcherIntervalMs) || treasury.watcherIntervalMs <= 0) {

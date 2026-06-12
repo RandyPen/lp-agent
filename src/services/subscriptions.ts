@@ -23,6 +23,7 @@ import { pollEvents } from "../sui/cdpm/events.ts";
 import { EVENT_TYPES } from "../sui/cdpm/package.ts";
 import { loadConfig } from "../config.ts";
 import { log } from "../lib/logger.ts";
+import { findUserBySuiAddress } from "../treasury/store.ts";
 import type { Subscription } from "../domain/types.ts";
 import type { EventCursor } from "../sui/cdpm/types.ts";
 
@@ -255,6 +256,19 @@ export function createSubscriptionsService(): SubscriptionsService {
 
           added++;
           log.info("subscriptions: agent added", { pmId, agent });
+
+          // §5 doc: when treasury is enabled, log the treasury registration
+          // status of the new PM's owner so operators can see which PMs are
+          // unpaid at a glance. No gate here — actual enforcement is in tickOne.
+          if (cfg.treasury.enabled) {
+            const treasuryUser = findUserBySuiAddress(pm.owner);
+            log.info("subscriptions: agent added — treasury status", {
+              pmId,
+              owner: pm.owner,
+              treasuryRegistered: treasuryUser !== null,
+              credits: treasuryUser?.credits ?? 0,
+            });
+          }
         }
 
         // Advance cursor even when there are no matching events.
