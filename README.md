@@ -1,6 +1,10 @@
 # LiquidityManager
 
-> An open-source quantitative liquidity-custody agent for DLMM market-making on Sui: algorithm-driven position rebalancing, idle assets parked in lending protocols, user top-ups with per-action billing. Bun + TypeScript + SQLite, ~16K LOC, 572 bun tests + ~100 pytest tests.
+> An **autonomous, on-chain-delegated quant agent** that forecasts the short-term price *distribution* and shapes Cetus DLMM liquidity around it — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
+
+It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, σ matters more than μ, so place liquidity across bins weighted by a forecast distribution (q10/q50/q90) instead of chasing spot.
+
+Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~16K LOC, 572 bun tests + ~100 pytest tests, Apache-2.0.
 
 **v1 has landed**: the ML prediction pipeline lives in-tree — a Python training + inference sidecar (`ml/`, managed with uv), the `mlAgent` strategy, a three-state machine (`src/state`), layered circuit-breaker risk controls (`src/risk`), and shadow mode (`src/services/shadowRunner`). **The repo ships the pipeline and the framework, not trained models** — model artifacts stay out of git; forks retrain on the same pipeline. Bring your own strategies, your own pools, your own models.
 
@@ -179,7 +183,7 @@ Apache-2.0, see `LICENSE`.
 ## Acknowledgements
 
 Template inspired by:
-- [Cetus DLMM](https://docs.cetus.zone/cetus-developer-docs/cetus-dlmm) — the DLMM protocol on Sui
-- [CDPM (LeafSheep)](https://github.com/...) — the PositionManager permission abstraction; user funds never leave the user's own vault
+- [Cetus DLMM](https://cetus-1.gitbook.io/cetus-developer-docs/developer/via-dlmm-contract) — the DLMM protocol on Sui
+- [CDPM (LeafSheep)](https://github.com/randyPen/cdpm) — the PositionManager permission abstraction; user funds never leave the user's own vault
 - Scallop + Kai SAV — lending yield sources
-- [SuiAgentsTopUp](https://github.com/...) — reference implementation of the treasury pattern
+- [SuiAgentsTopUp](https://github.com/RandyPen/SuiAgentsTopUp) — reference implementation of the treasury pattern
