@@ -1,8 +1,8 @@
-# LiquidityManager
+# LP Agent
 
-> An **autonomous, on-chain-delegated quant agent** that forecasts the short-term price *distribution* and shapes Cetus DLMM liquidity around it — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
+> An **open-source agent template** — a reference implementation you fork and operate yourself, not a hosted app — for an **autonomous, on-chain-delegated quant operator** that forecasts the short-term price *distribution* and shapes Cetus DLMM liquidity around it — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
 
-It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, σ matters more than μ, so place liquidity across bins weighted by a forecast distribution (q10/q50/q90) instead of chasing spot.
+It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. There is no central service: each deployer owns their own risk policy, capital limits, fee design, and trained model. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, σ matters more than μ, so place liquidity across bins weighted by a forecast distribution (q10/q50/q90) instead of chasing spot.
 
 Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~16K LOC, 572 bun tests + ~100 pytest tests, Apache-2.0.
 
@@ -24,6 +24,69 @@ Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~16K L
 - ❌ No cross-chain support (Sui mainnet only)
 - ❌ No public HTTP API — SQLite + CLI scripts only, plus an optional bind-local treasury HTTP API (`TREASURY_HTTP_ENABLED`, off by default; never expose it raw to the internet)
 - ❌ No user-initiated refunds (operator sweeps manually)
+
+## Architecture
+
+The chain is the control plane: users delegate a `PositionManager` on-chain, the agent auto-discovers it, and every decision leaves as **one atomic PTB** that can touch the position but never withdraw from it.
+
+```mermaid
+flowchart TB
+    subgraph chain["⛓️ Sui mainnet"]
+        PM["User's PositionManager<br/>(CDPM / LeafSheep)<br/>— owner keeps custody —"]
+        POOL["Cetus DLMM pool"]
+        LEND["Scallop / Kai lending"]
+    end
+
+    PM -- "AgentAdded / AgentRemoved events" --> SUB
+
+    subgraph agent["🤖 LP Agent · Bun + TypeScript"]
+        SUB["Subscription service<br/>auto-discovers delegated PMs"] --> REB["Rebalancer<br/>per-PM tick loop"]
+        FEEDS["Market-data feeds<br/>onchain · Binance · derivatives"] --> AGG["Market aggregator"]
+        AGG --> REB
+        REB --> RISK{"Risk gate<br/>L1 / L2 / L3"}
+        RISK --> STATE["State machine<br/>NORMAL · TREND · EXTREME"]
+        STATE --> STRAT["Strategy<br/>singleBin · multiBinSpot<br/>emaTrend · mlAgent"]
+        AGG --> FC["Forecast layer · rule-based<br/>σ + bin weights (Tier 0)"]
+        FC -- "rule-based forecast" --> STRAT
+        STRAT --> EXEC["Executor<br/>builds one atomic PTB"]
+        REB -. "optional billing" .-> TRE["Treasury<br/>top-up + credit ledger<br/>pre-debit / refund"]
+    end
+
+    subgraph ml["🐍 ML sidecar · Python / uv (optional)"]
+        PRED["PredictionProvider seam"] --> LGBM["LightGBM quantile<br/>q10 / q50 / q90 + vol"]
+    end
+
+    AGG -- "market snapshot" --> PRED
+    LGBM -- "ML forecast distribution" --> STRAT
+    PRED -. "sidecar down → falls back to rule forecast" .-> FC
+
+    EXEC -- "collect → remove → transfer → redeem → add → supply" --> PM
+    PM --- POOL
+    PM --- LEND
+    FEEDS -. "reads swap events" .- POOL
+```
+
+**Legend — each box maps to a module** (`ID` is the diagram node id):
+
+| Box | ID | Source |
+|---|---|---|
+| Subscription service | `SUB` | `src/services/subscriptions.ts` |
+| Rebalancer (tick loop) | `REB` | `src/services/rebalancer.ts` |
+| Market-data feeds | `FEEDS` | `src/data/feeds/` (onchain · binance · binanceMulti · derivatives · cetusEvents) |
+| Market aggregator | `AGG` | `src/data/marketAggregator.ts` |
+| Risk gate L1/L2/L3 | `RISK` | `src/risk/` |
+| State machine | `STATE` | `src/state/` |
+| Strategy | `STRAT` | `src/strategies/` |
+| Forecast layer (rule-based, Tier 0) | `FC` | `src/forecast/` (σ estimators + bin-weight mapping) |
+| Executor (atomic PTB) | `EXEC` | `src/services/executor.ts` |
+| Treasury (billing) | `TRE` | `src/treasury/` |
+| PredictionProvider seam | `PRED` | `src/prediction/` |
+| LightGBM quantile model | `LGBM` | `ml/` (Python sidecar, uv-managed) |
+| PositionManager / pool / lending | `PM` · `POOL` · `LEND` | on-chain: CDPM PositionManager, Cetus DLMM pool, Scallop/Kai (adapters in `src/sui/lending/`) |
+
+**One tick, per subscribed PM:** fetch PM state + pool active bin + spot + history → pre-tick **risk** check → **state** machine eval → **strategy** plan — consuming either the ML prediction or the rule-based **forecast** layer (σ + bin weights), plus the state params → lending router decides redeem/supply → (optional) **treasury** pre-debit → **executor** submits the unified PTB → on failure refund the charge → record to SQLite. The ML sidecar is consumed only through the `PredictionProvider` seam; if it is unavailable the agent degrades explicitly to the rule-based forecast (the Tier 0 floor) and logs the reason — never a silent fallback.
+
+> The repo ships the framework and the pipeline drawn above — **not** the trained model that sits behind the `PredictionProvider` seam. Forks train their own. See [`docs/project-overview.md`](./docs/project-overview.md) for the module-level map.
 
 ## Quick start
 
