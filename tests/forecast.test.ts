@@ -148,9 +148,9 @@ describe("computeBinWeights", () => {
   // fallback regardless of inputs).
   const activeLogPrice = Math.log(1000); // priceFromBinId(0, 10, 9, 6) ≈ 1000
   const baseInput = {
-    binStep: 10,
-    decimalsA: 9,
-    decimalsB: 6,
+    // Non-inverted orientation: physical decimals 9/6, human price rises with
+    // bin id (same numbers the old decimalsA/decimalsB fields produced).
+    orientation: { binStep: 10, poolCoinADecimals: 9, poolCoinBDecimals: 6, poolCoinAIsQuote: false },
     activeBinId: 0,
     feeRateBps: 0, // fee derate off for the base test
     distribution: { logMu: activeLogPrice, sigma: 0.01, horizonMs: 60_000, estimator: "test" },

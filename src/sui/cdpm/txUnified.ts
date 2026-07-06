@@ -170,6 +170,33 @@ function appendTransferFeeToBalance(
   });
 }
 
+/**
+ * Append the DLMM router's on-chain active-id slippage assertion:
+ *   `<dlmmPublishedAt>::utils::validate_active_id_slippage<A, B>(&Pool<A,B>, u32 activeIdBits, u32 binShift)`
+ * Aborts the whole PTB when |pool.active_id − plannedActiveBinId| > maxDriftBins.
+ * Signature verified against the mainnet router package (sui_getNormalizedMoveFunction).
+ */
+export function appendValidateActiveIdSlippage(
+  tx: Transaction,
+  pm: Pick<PMState, "poolId" | "coinTypeA" | "coinTypeB">,
+  plannedActiveBinId: number,
+  maxDriftBins: number,
+  dlmmPublishedAt: string,
+): void {
+  if (!Number.isInteger(maxDriftBins) || maxDriftBins < 0) {
+    throw new OnchainFailureError(`maxDriftBins must be a non-negative integer, got ${maxDriftBins}`);
+  }
+  tx.moveCall({
+    target: `${dlmmPublishedAt}::utils::validate_active_id_slippage`,
+    typeArguments: [pm.coinTypeA, pm.coinTypeB],
+    arguments: [
+      tx.object(pm.poolId),
+      tx.pure.u32(binIdToU32Bits(plannedActiveBinId)),
+      tx.pure.u32(maxDriftBins),
+    ],
+  });
+}
+
 function appendAddLiquidity(
   tx: Transaction,
   pm: PMState,
@@ -420,6 +447,45 @@ function appendKaiRedeem(
 }
 
 /**
+ * Build a dryRun-only probe PTB containing just the collect+remove prefix of
+ * a plan. Dry-running it yields the `AgentLiquidityRemoved` event with the
+ * EXACT amounts the remove would free — the only reliable way to size the
+ * re-add, since v0 chain reads leave per-bin position amounts at 0n.
+ *
+ * Never submit this transaction; it exists for `dryRunTransactionBlock`.
+ */
+export function buildRemoveProbeTx(
+  pm: PMState,
+  plan: RebalancePlan,
+): { tx: Transaction; commandCount: number } {
+  const cfg = loadConfig();
+  const { globalConfigId, versionedId } = loadCetusIds(cfg.network);
+  const agentAddress = getAgentAddress();
+
+  const tx = new Transaction();
+  tx.setSender(agentAddress);
+  let commandCount = 0;
+
+  const hasFeesInBag = pm.feeBag.a > 0n || pm.feeBag.b > 0n;
+  if (plan.collectFees || hasFeesInBag) {
+    appendCollectFee(tx, pm, globalConfigId, versionedId);
+    commandCount++;
+  }
+  if (plan.removeShares.size > 0) {
+    const bins: number[] = [];
+    const shares: bigint[] = [];
+    for (const [binId, share] of plan.removeShares) {
+      bins.push(binId);
+      shares.push(share);
+    }
+    appendRemoveLiquidity(tx, pm, bins, shares, globalConfigId, versionedId);
+    commandCount++;
+  }
+
+  return { tx, commandCount };
+}
+
+/**
  * Build the unified rebalance PTB. Returns the Transaction + a human-readable
  * description for the rebalance journal.
  *
@@ -450,6 +516,25 @@ export async function buildUnifiedRebalanceTx(
   if (scallopIds) {
     appendScallopAccrueInterest(tx, scallopIds);
     descriptionParts.push("accrue_interest");
+    commandCount++;
+  }
+
+  // [0.5] On-chain slippage assertion — before any state-changing DLMM op so a
+  // drifted active bin aborts the whole PTB. Only relevant when the plan
+  // actually adds liquidity (the pre-computed per-bin split is what's priced
+  // for the planned active bin). Placed after accrue_interest, which must
+  // stay PTB[0] for Scallop ops.
+  const willAdd =
+    plan.addBins.length > 0 && (plan.addAmountA > 0n || plan.addAmountB > 0n);
+  if (willAdd && cfg.slippageGuardOnchain && plan.plannedActiveBinId !== undefined) {
+    appendValidateActiveIdSlippage(
+      tx,
+      pm,
+      plan.plannedActiveBinId,
+      cfg.slippageMaxBinDrift,
+      cfg.dlmmPublishedAt,
+    );
+    descriptionParts.push(`slippage_guard[±${cfg.slippageMaxBinDrift}]`);
     commandCount++;
   }
 

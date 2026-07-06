@@ -290,6 +290,10 @@ CREATE TABLE IF NOT EXISTS risk_events (
   threshold       REAL NOT NULL,
   observed        REAL NOT NULL,
   action          TEXT NOT NULL,
+  -- 'shadow' rows come from the dedicated shadow risk monitor; live risk
+  -- analytics must filter on source='live'. (Added via ensureColumns on
+  -- pre-existing DBs — see db/client.ts.)
+  source          TEXT NOT NULL DEFAULT 'live' CHECK(source IN ('live','shadow')),
   resolved_at_ms  INTEGER
 );
 CREATE INDEX IF NOT EXISTS risk_events_ts ON risk_events(ts_ms DESC);
@@ -325,9 +329,89 @@ CREATE TABLE IF NOT EXISTS shadow_decisions (
   trend_bias            REAL,
   model_version         TEXT,
   prediction_id         INTEGER REFERENCES predictions(id),
+  -- Decision-time market anchors so shadow rows can be SCORED later
+  -- (hypothetical in-range time vs price_observations). Added via
+  -- ensureColumns on pre-existing DBs — see db/client.ts.
+  active_bin            INTEGER,
+  spot_price            TEXT,
   created_at_ms         INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS shadow_decisions_pool_ts
   ON shadow_decisions(pool_id, ts_ms DESC);
 CREATE INDEX IF NOT EXISTS shadow_decisions_pm_ts
   ON shadow_decisions(pm_id, ts_ms DESC);
+
+------------------------------------------------------------------------------
+-- position_lots — per-side inventory lots for the age stop-loss (§4.2).
+--
+-- The diff planner rebuilds the whole position on every rebalance, so naive
+-- "one lot per add" bookkeeping would re-stamp acquired_at_ms every time and
+-- the 4h/12h age thresholds could never fire. `lotStore.syncLotsAfterRebalance`
+-- therefore CARRIES lots FORWARD across rebuilds: re-added amounts up to the
+-- previously-open total keep the earliest acquired_at_ms and a value-weighted
+-- cost basis; only the excess becomes a new lot stamped at the rebalance time.
+--
+-- `side` is the PHYSICAL coin side ('A' = bins above active, 'B' = below).
+-- `bin_id` is the representative parking bin (the side's largest-amount bin) —
+--   an approximation used only for mark-to-market in ageStopLoss.
+-- `cost_basis` is the HUMAN pair price (quote-per-base) at acquisition.
+-- `amount` is raw units, bigint-as-string.
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS position_lots (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  pm_id          TEXT NOT NULL,
+  side           TEXT NOT NULL CHECK(side IN ('A','B')),
+  bin_id         INTEGER NOT NULL,
+  acquired_at_ms INTEGER NOT NULL,
+  cost_basis     REAL NOT NULL,
+  amount         TEXT NOT NULL,
+  status         TEXT NOT NULL CHECK(status IN ('open','closed')) DEFAULT 'open',
+  created_at_ms  INTEGER NOT NULL,
+  closed_at_ms   INTEGER
+);
+CREATE INDEX IF NOT EXISTS position_lots_pm_open ON position_lots(pm_id, status);
+
+------------------------------------------------------------------------------
+-- pnl_ticks — PnL accounting samples (D1). One row per evaluated rebalancer
+-- tick (including quiet ticks — NAV must be sampled continuously so the
+-- 24h mark-to-market window has coverage).
+--
+-- `cost_credits` keeps the treasury charge in CREDITS (exact) — converting
+-- to USD would fabricate an exchange rate the system doesn't own.
+-- `nav_usd` is the honest denominator: idle + fees + lending principal +
+-- position mark (entry amounts at the current spot).
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS pnl_ticks (
+  id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+  pool_id             TEXT NOT NULL,
+  pm_id               TEXT NOT NULL,
+  ts_ms               INTEGER NOT NULL,
+  fee_income_usd      REAL NOT NULL,
+  cost_credits        INTEGER NOT NULL,
+  inventory_delta_usd REAL NOT NULL,
+  il_usd              REAL,
+  nav_usd             REAL NOT NULL,
+  market_state        TEXT CHECK(market_state IN ('NORMAL','TREND','EXTREME')),
+  rebalance_id        INTEGER
+);
+CREATE INDEX IF NOT EXISTS pnl_ticks_pool_ts ON pnl_ticks(pool_id, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS pnl_ticks_pm_ts ON pnl_ticks(pm_id, ts_ms DESC);
+
+------------------------------------------------------------------------------
+-- position_entry_snapshots — what was deployed at the last successful add
+-- (D2). Used to (a) mark the open position's value for NAV (per-bin position
+-- amounts are 0n in v0 chain reads) and (b) measure impermanent loss at the
+-- next remove (hold-value vs realized remove proceeds).
+-- Amounts are PHYSICAL raw units; spot_price is the human pair price.
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS position_entry_snapshots (
+  pm_id           TEXT PRIMARY KEY,
+  ts_ms           INTEGER NOT NULL,
+  amount_a        TEXT NOT NULL,
+  amount_b        TEXT NOT NULL,
+  spot_price      REAL NOT NULL,
+  entry_value_usd REAL NOT NULL
+);

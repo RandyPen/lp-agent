@@ -112,6 +112,7 @@ function makeCtx(state: StateContext["state"] = "NORMAL"): StateContext {
     evalIntervalMs: 20 * 60 * 1000,
     halfWidth: 3,
     trendBias: 0,
+    strongTrend: false,
     lendingPct: 0.35,
     toleranceBins: 2,
     maxCenterOffset: 2,
@@ -182,9 +183,15 @@ function makeMockRiskMonitor(veto: RiskVeto | null = null): RiskMonitor {
   return {
     checkPreTick: () => veto,
     observeForPool: () => {},
+    observeSourceStaleness: () => {},
     set24hPnl: () => {},
     volRecovered: () => true,
     activeLevel: () => null,
+    emergencyStop: {
+      trip: () => {},
+      isTripped: () => false,
+      reset: () => {},
+    },
   };
 }
 
@@ -804,5 +811,213 @@ describe("mlAgent — restart rehydration", () => {
     // plan() tick 2: streak becomes 3 → exits probation.
     const o2 = await strategy.plan(input);
     expect("reason" in o2 ? o2.reason !== "from-fallback" : true).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — L2 veto survives fallback delegation
+// ---------------------------------------------------------------------------
+
+describe("mlAgent — L2 EXTREME veto during fallback/probation", () => {
+  beforeEach(() => {
+    db = freshDb();
+  });
+
+  function makeInputWithPosition(): StrategyInput {
+    const input = makeStrategyInput();
+    input.pm.positionBins = [
+      { binId: 98, liquidityShare: 5_000n, amountA: 0n, amountB: 0n },
+      { binId: 102, liquidityShare: 7_000n, amountA: 0n, amountB: 0n },
+    ];
+    return input;
+  }
+
+  it("fallback + L2 veto → full-withdrawal plan, NOT fallback.plan()", async () => {
+    let fallbackCalled = false;
+    const fallback: Strategy = {
+      name: "spyFallback",
+      plan: async () => { fallbackCalled = true; return { kind: "quiet", reason: "spy" }; },
+    };
+    const strategy = createMlAgentStrategy(makeDeps({
+      provider: makeMockProvider(makePred({ fallback: "timeout" })),
+      riskMonitor: makeMockRiskMonitor({
+        kind: "extreme", level: "L2", reason: "L2 EXTREME active: volatility_5m", trigger: "volatility_5m",
+      }),
+      fallback,
+    }));
+
+    const output = await strategy.plan(makeInputWithPosition());
+
+    expect(fallbackCalled).toBe(false);
+    expect(output.kind).toBe("plan_and_reconcile");
+    if (output.kind !== "plan_and_reconcile") throw new Error("unreachable");
+    // Full withdrawal: every bin's shares removed, nothing re-added.
+    expect(output.plan.removeShares.size).toBe(2);
+    expect(output.plan.removeShares.get(98)).toBe(5_000n);
+    expect(output.plan.removeShares.get(102)).toBe(7_000n);
+    expect(output.plan.addAmountA).toBe(0n);
+    expect(output.plan.addAmountB).toBe(0n);
+    expect(output.plan.addBins).toHaveLength(0);
+    expect(output.plan.reason).toContain("L2 during fallback");
+    expect(output.plan.reason).toContain("volatility_5m");
+  });
+
+  it("fallback + L2 veto + empty position → quiet (nothing to withdraw)", async () => {
+    const strategy = createMlAgentStrategy(makeDeps({
+      provider: makeMockProvider(makePred({ fallback: "timeout" })),
+      riskMonitor: makeMockRiskMonitor({
+        kind: "extreme", level: "L2", reason: "L2", trigger: "spread_sustained",
+      }),
+    }));
+
+    const output = await strategy.plan(makeStrategyInput()); // no positionBins, no fees
+    expect(output.kind).toBe("quiet");
+    if (output.kind !== "quiet") throw new Error("unreachable");
+    expect(output.reason).toContain("nothing to withdraw");
+  });
+
+  it("fallback + L1 soft veto → still delegates to fallback (logged limitation)", async () => {
+    let fallbackCalled = false;
+    const fallback: Strategy = {
+      name: "spyFallback",
+      plan: async () => { fallbackCalled = true; return { kind: "quiet", reason: "spy" }; },
+    };
+    const strategy = createMlAgentStrategy(makeDeps({
+      provider: makeMockProvider(makePred({ fallback: "timeout" })),
+      riskMonitor: makeMockRiskMonitor({
+        kind: "soft", level: "L1", reason: "spread in soft band", lendingPctBonusPp: 10, halfWidthFactor: 0.7,
+      }),
+      fallback,
+    }));
+
+    const output = await strategy.plan(makeStrategyInput());
+    expect(fallbackCalled).toBe(true);
+    expect(output.kind).toBe("quiet");
+  });
+
+  it("probation (not fresh fallback) + L2 veto → full withdrawal too", async () => {
+    // Tick 1: fallback prediction puts the pool into probation.
+    const deps = makeDeps({
+      provider: makeMockProvider(makePred({ fallback: "timeout" })),
+    });
+    const strategy = createMlAgentStrategy(deps);
+    await strategy.plan(makeStrategyInput());
+
+    // Tick 2: inference succeeds (still in probation) but L2 fires.
+    deps.provider = makeMockProvider(makePred({ fallback: false }));
+    deps.riskMonitor = makeMockRiskMonitor({
+      kind: "extreme", level: "L2", reason: "L2", trigger: "tvl_drop_5m",
+    });
+    const output = await strategy.plan(makeInputWithPosition());
+    expect(output.kind).toBe("plan_and_reconcile");
+    if (output.kind !== "plan_and_reconcile") throw new Error("unreachable");
+    expect(output.plan.addBins).toHaveLength(0);
+    expect(output.plan.removeShares.size).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — stateCtx threading (C4)
+// ---------------------------------------------------------------------------
+
+describe("mlAgent — stateCtx on plan outputs", () => {
+  beforeEach(() => {
+    db = freshDb();
+  });
+
+  it("plan_and_reconcile carries the adjusted ctx incl. the L1 lending bonus", async () => {
+    const baseCtx = makeCtx("NORMAL");
+    const strategy = createMlAgentStrategy(makeDeps({
+      stateMachine: makeMockStateMachine(baseCtx),
+      riskMonitor: makeMockRiskMonitor({
+        kind: "soft", level: "L1", reason: "soft", lendingPctBonusPp: 10, halfWidthFactor: 0.7,
+      }),
+    }));
+    const input = makeStrategyInput();
+    // Force a plan: prediction offset pushes the (empty) position to deploy.
+    const output = await strategy.plan(input);
+    if (output.kind === "plan_and_reconcile" || output.kind === "plan_only") {
+      expect(output.stateCtx).toBeDefined();
+      expect(output.stateCtx!.lendingPct).toBeCloseTo(baseCtx.lendingPct + 0.10, 10);
+      expect(output.stateCtx!.halfWidth).toBe(Math.max(2, Math.round(baseCtx.halfWidth * 0.7)));
+    } else {
+      throw new Error(`expected a plan output, got ${output.kind}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3 (C2) — age stop-loss end-to-end through the orchestration layer
+// ---------------------------------------------------------------------------
+
+import { syncLotsAfterRebalance } from "../../src/decision/lotStore.ts";
+
+describe("mlAgent — age stop-loss orchestration", () => {
+  beforeEach(() => {
+    db = freshDb();
+  });
+
+  it("a stale losing lot forces a liquidation directive into the plan", async () => {
+    // Seed: side-A lot parked at bin 105, acquired 13h ago at cost 0.9 while
+    // the current price is ~1.0 → ask-lot loss ≈ 11% > 5% with age > 12h →
+    // force_liquidate at active+1 (non-inverted fixture profile, dir=+1).
+    const thirteenHoursAgo = BASE_NOW - 13 * 3_600_000;
+    syncLotsAfterRebalance(
+      db,
+      PM_ID,
+      {
+        pmId: PM_ID,
+        removeShares: new Map(),
+        addAmountA: 1_000_000n,
+        addAmountB: 0n,
+        addBins: [105],
+        addAmountsA: [1_000_000n],
+        addAmountsB: [0n],
+        collectFees: false,
+        reason: "seed",
+      },
+      0.9,
+      thirteenHoursAgo,
+    );
+
+    const strategy = createMlAgentStrategy(makeDeps({}));
+    const input = makeStrategyInput();
+    // Balanced book so the inventory correction doesn't zero a side.
+    input.pm.balance = { a: 1_000_000n, b: 1_000_000n };
+    const output = await strategy.plan(input);
+
+    if (output.kind !== "plan_and_reconcile" && output.kind !== "plan_only") {
+      throw new Error(`expected a plan, got ${output.kind}`);
+    }
+    expect(output.plan.reason).toContain("stopLoss=force@101"); // active(100)+1
+    expect(output.plan.addBins).toContain(101);
+  });
+
+  it("a young lot produces no stop-loss directive", async () => {
+    syncLotsAfterRebalance(
+      db,
+      PM_ID,
+      {
+        pmId: PM_ID,
+        removeShares: new Map(),
+        addAmountA: 1_000_000n,
+        addAmountB: 0n,
+        addBins: [105],
+        addAmountsA: [1_000_000n],
+        addAmountsB: [0n],
+        collectFees: false,
+        reason: "seed",
+      },
+      0.9,
+      BASE_NOW - 3_600_000, // 1h old — below every age threshold
+    );
+
+    const strategy = createMlAgentStrategy(makeDeps({}));
+    const input = makeStrategyInput();
+    input.pm.balance = { a: 1_000_000n, b: 1_000_000n };
+    const output = await strategy.plan(input);
+    if (output.kind === "plan_and_reconcile" || output.kind === "plan_only") {
+      expect(output.plan.reason).not.toContain("stopLoss=");
+    }
   });
 });

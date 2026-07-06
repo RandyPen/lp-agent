@@ -10,8 +10,11 @@
  *   - `now` is injected so tests are deterministic.
  *   - `extremeSignal` is injected by the risk module (L2 circuit breaker).
  *     The local p-sum check runs independently; either source can trigger EXTREME.
- *   - Min-dwell enforcement: no transition is allowed until `nowMs >=
- *     enteredAtMs + minDwellMs` regardless of any other condition.
+ *   - Min-dwell enforcement: non-emergency transitions are blocked until
+ *     `nowMs >= enteredAtMs + minDwellMs`. EXTREME **entry** is the exception —
+ *     the machine (machine.ts) evaluates it before the dwell gate, because for
+ *     a custody agent entering the protective state late is the failure mode.
+ *     EXTREME **exit** still respects dwell + stability + vol recovery.
  *
  * ---------------------------------------------------------------------------
  * drift_strength formula
@@ -42,11 +45,9 @@
 
 import type { MarketSnapshot, MarketState, PredictionResponse } from "../prediction/types.ts";
 import {
-  DRIFT_STRENGTH_ENTRY,
-  DRIFT_STRENGTH_EXIT,
+  DEFAULT_STATE_PARAMS,
   MIN_DWELL_MS,
-  P_BREAK_ENTRY,
-  P_BREAK_SUM_EXTREME,
+  type StateParams,
 } from "./params.ts";
 
 // ---------------------------------------------------------------------------
@@ -93,6 +94,18 @@ export function computeDriftStrength(snapshot: MarketSnapshot): number {
 
   const closes: number[] = bars.map((b) => b.close);
   const n = closes.length;
+
+  // Fail loudly on corrupted feed data: a NaN/Infinity close would silently
+  // disable TREND entry (NaN > threshold === false) while still permitting
+  // TREND exit — the worst combination. The feed layer owns data hygiene;
+  // a non-finite close reaching here is an invariant violation.
+  for (let i = 0; i < n; i++) {
+    if (!Number.isFinite(closes[i]!)) {
+      throw new RangeError(
+        `state/transitions: computeDriftStrength received non-finite close at bar ${i}: ${closes[i]}`,
+      );
+    }
+  }
 
   // Signal returns: the two most recent 1-min close-to-close changes
   const close0 = closes[n - 1]!;
@@ -161,10 +174,11 @@ export function dwellElapsed(
 export function shouldEnterTrend(
   snapshot: MarketSnapshot,
   pred: PredictionResponse,
+  params: StateParams = DEFAULT_STATE_PARAMS,
 ): boolean {
   const driftStrength = computeDriftStrength(snapshot);
-  if (driftStrength > DRIFT_STRENGTH_ENTRY) return true;
-  if (Math.max(pred.pAbove, pred.pBelow) > P_BREAK_ENTRY) return true;
+  if (driftStrength > params.driftStrengthEntry) return true;
+  if (Math.max(pred.pAbove, pred.pBelow) > params.pBreakEntry) return true;
   return false;
 }
 
@@ -178,10 +192,11 @@ export function shouldEnterTrend(
 export function shouldExitTrend(
   snapshot: MarketSnapshot,
   pred: PredictionResponse,
+  params: StateParams = DEFAULT_STATE_PARAMS,
 ): boolean {
   const driftStrength = computeDriftStrength(snapshot);
-  if (driftStrength > DRIFT_STRENGTH_EXIT) return false;
-  if (Math.max(pred.pAbove, pred.pBelow) > P_BREAK_ENTRY) return false;
+  if (driftStrength > params.driftStrengthExit) return false;
+  if (Math.max(pred.pAbove, pred.pBelow) > params.pBreakEntry) return false;
   return true;
 }
 
@@ -201,6 +216,7 @@ export function shouldExitTrend(
 export function shouldEnterExtreme(
   pred: PredictionResponse,
   extremeSignal: ExtremeSignal | null | undefined,
+  params: StateParams = DEFAULT_STATE_PARAMS,
 ): { enter: boolean; trigger: string } {
   // L2 risk module injection takes priority
   if (extremeSignal?.active) {
@@ -209,10 +225,10 @@ export function shouldEnterExtreme(
 
   // Local model signal: pAbove + pBelow exceeds threshold
   const pSum = pred.pAbove + pred.pBelow;
-  if (pSum > P_BREAK_SUM_EXTREME) {
+  if (pSum > params.pBreakSumExtreme) {
     return {
       enter: true,
-      trigger: `p_break_sum=${pSum.toFixed(4)}>threshold=${P_BREAK_SUM_EXTREME}`,
+      trigger: `p_break_sum=${pSum.toFixed(4)}>threshold=${params.pBreakSumExtreme}`,
     };
   }
 
@@ -225,17 +241,18 @@ export function shouldEnterExtreme(
  * Returns true when ALL of the following hold:
  *   (a) The external risk signal is inactive (or absent) — all L2 conditions
  *       cleared by the risk module.
- *   (b) The local p-sum has dropped back below P_BREAK_SUM_EXTREME.
- *   (c) The stability window has been met: `nowMs - extremeEnteredAtMs >= 10min`.
+ *   (b) The local p-sum has dropped back below `pBreakSumExtremeExit` — a
+ *       dedicated exit threshold strictly below the entry threshold, so a
+ *       p-sum oscillating around the entry value cannot flap EXTREME on/off.
+ *   (c) The stability window has been met: `nowMs - extremeEnteredAtMs >=
+ *       MIN_DWELL_MS.EXTREME` (10 min).
  *   (d) Volatility recovery: the snapshot must pass the hysteresis check, which
  *       the caller indicates via `volRecovered` (the risk module compares the
- *       current rolling vol to the pre-EXTREME baseline and returns true when
- *       it has receded to within 7% of that baseline).
+ *       current rolling vol to the recovery threshold and returns true when it
+ *       has receded below it).
  *
- * Note: the 10-minute stability check is enforced here on top of the standard
- * min-dwell check in the machine — EXTREME has a 10-min minDwellMs so the
- * dwellElapsed guard will already block early exits.  The check here is
- * redundant but explicit for clarity.
+ * Note: the stability check reuses MIN_DWELL_MS.EXTREME, the same window the
+ * machine's dwellElapsed guard enforces — redundant but explicit for clarity.
  */
 export function shouldExitExtreme(
   pred: PredictionResponse,
@@ -243,16 +260,17 @@ export function shouldExitExtreme(
   volRecovered: boolean,
   extremeEnteredAtMs: number,
   nowMs: number,
+  params: StateParams = DEFAULT_STATE_PARAMS,
 ): boolean {
   // Risk signal must be fully clear
   if (extremeSignal?.active) return false;
 
-  // p-sum must have receded
-  if (pred.pAbove + pred.pBelow > P_BREAK_SUM_EXTREME) return false;
+  // p-sum must have receded below the EXIT threshold (hysteresis band between
+  // pBreakSumExtremeExit and pBreakSumExtreme)
+  if (pred.pAbove + pred.pBelow > params.pBreakSumExtremeExit) return false;
 
-  // Must have stabilised for the 10-min EXTREME min-dwell window
-  const EXTREME_STABILITY_MS = 10 * 60 * 1_000;
-  if (nowMs - extremeEnteredAtMs < EXTREME_STABILITY_MS) return false;
+  // Must have stabilised for the EXTREME min-dwell window
+  if (nowMs - extremeEnteredAtMs < MIN_DWELL_MS.EXTREME) return false;
 
   // Volatility recovery hysteresis
   if (!volRecovered) return false;

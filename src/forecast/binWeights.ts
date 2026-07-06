@@ -14,15 +14,20 @@
  * fills against.
  */
 
-import { priceFromBinId } from "../domain/binMath.ts";
+import { humanPriceForBin, type PoolOrientation } from "../domain/binMath.ts";
 import type { BinWeight, PriceDistribution } from "./types.ts";
 
 export interface BinWeightInput {
   /** Bin ids in ascending order. */
   bins: number[];
-  binStep: number;
-  decimalsA: number;
-  decimalsB: number;
+  /**
+   * Pool orientation (physical decimals + inversion flag). The distribution's
+   * logMu is in HUMAN pair-price space (quote-per-base, the spot convention),
+   * so each bin's boundaries must be mapped through the same convention —
+   * for an inverted pool (physical coinA = quote) the human price FALLS as
+   * bin id rises.
+   */
+  orientation: PoolOrientation;
   activeBinId: number;
   /** Pool fee in basis points; used to compute the dead-zone width. */
   feeRateBps: number;
@@ -65,19 +70,14 @@ function massInLogRange(logL: number, logH: number, mu: number, sigma: number): 
 }
 
 /**
- * Mid-price between bin i and bin i+1 is geometrically halfway:
- *   midPrice(i, i+1) = sqrt(P_i × P_{i+1})
+ * Mid-price between bin i and bin i+step is geometrically halfway:
+ *   midPrice(i, i+step) = sqrt(P_i × P_{i+step})
  * because bin prices are geometric (each step ~ (1 + ε)).
+ * Prices are in HUMAN pair-price space via the pool orientation.
  */
-function midPriceLog(
-  binId: number,
-  step: number,
-  binStep: number,
-  decimalsA: number,
-  decimalsB: number,
-): number {
-  const p1 = Number(priceFromBinId(binId, binStep, decimalsA, decimalsB));
-  const p2 = Number(priceFromBinId(binId + step, binStep, decimalsA, decimalsB));
+function midPriceLog(binId: number, step: number, o: PoolOrientation): number {
+  const p1 = humanPriceForBin(o, binId);
+  const p2 = humanPriceForBin(o, binId + step);
   // geometric mid → ln midpoint = (ln p1 + ln p2) / 2.
   return 0.5 * (Math.log(p1) + Math.log(p2));
 }
@@ -111,8 +111,7 @@ function feeDerate(
 }
 
 export function computeBinWeights(input: BinWeightInput): BinWeightResult {
-  const { bins, binStep, decimalsA, decimalsB, activeBinId, feeRateBps, distribution } =
-    input;
+  const { bins, orientation, activeBinId, feeRateBps, distribution } = input;
   const { logMu, sigma } = distribution;
 
   if (bins.length === 0) return { bins: [], rawMass: 0 };
@@ -120,18 +119,22 @@ export function computeBinWeights(input: BinWeightInput): BinWeightResult {
   // Compute raw probabilities first, then renormalize after derate.
   const raw: { binId: number; mass: number; priceMid: string }[] = [];
   for (const binId of bins) {
-    // Bin boundaries: midpoint to lower neighbour and midpoint to upper neighbour.
-    const lowerLog = midPriceLog(binId, -1, binStep, decimalsA, decimalsB);
-    const upperLog = midPriceLog(binId, +1, binStep, decimalsA, decimalsB);
+    // Bin boundaries: midpoints to the lower / upper neighbours. On an
+    // inverted pool the human price falls with bin id, so order the two
+    // log-boundaries explicitly.
+    const logA = midPriceLog(binId, -1, orientation);
+    const logB = midPriceLog(binId, +1, orientation);
+    const lowerLog = Math.min(logA, logB);
+    const upperLog = Math.max(logA, logB);
 
     const rawMass = massInLogRange(lowerLog, upperLog, logMu, sigma);
-    const derate = feeDerate(binId, activeBinId, binStep, feeRateBps);
+    const derate = feeDerate(binId, activeBinId, orientation.binStep, feeRateBps);
     const mass = rawMass * derate;
 
     raw.push({
       binId,
       mass,
-      priceMid: priceFromBinId(binId, binStep, decimalsA, decimalsB),
+      priceMid: humanPriceForBin(orientation, binId).toPrecision(15).replace(/\.?0+$/, ""),
     });
   }
 

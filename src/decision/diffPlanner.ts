@@ -26,7 +26,18 @@ import type { PMState, PoolState, RebalancePlan } from "../domain/types.ts";
 import type { StateContext, PredictionResponse } from "../prediction/types.ts";
 import type { PoolProfile } from "../pools/types.ts";
 import { normCdf } from "../forecast/binWeights.ts";
-import { priceFromBinId } from "../domain/binMath.ts";
+import {
+  binDirection,
+  humanPriceForBin,
+  orientationOf,
+  type PoolOrientation,
+} from "../domain/binMath.ts";
+import {
+  applyInventoryScales,
+  clampToAvailable,
+  computeInventoryAdjustment,
+  type InventoryAdjustment,
+} from "./inventory.ts";
 
 // ---------------------------------------------------------------------------
 // Public interface
@@ -38,6 +49,22 @@ export interface DiffPlanInput {
   ctx: StateContext;
   pred: PredictionResponse;
   profile: PoolProfile;
+  /**
+   * Age stop-loss directives (C2, decision-engine-design §4.2), derived by
+   * the orchestration layer from the lot book (lotStore + ageStopLoss):
+   *   - `relaxedAskFloorBin`: ask-side bins at or beyond this bin (in the
+   *     rising-price direction) are exempt from the ask-min-profit filter —
+   *     the relaxed floor IS the new minimum (cost × 1.005).
+   *   - `forceLiquidationBins`: bins that MUST be in the candidate set
+   *     (typically active ± 1 in the rising-price direction) so stale
+   *     inventory gets parked for immediate liquidation; they bypass the
+   *     ask-min filter, and their presence bypasses the shape-deviation
+   *     quiet guard.
+   */
+  stopLoss?: {
+    relaxedAskFloorBin: number | null;
+    forceLiquidationBins: number[];
+  };
 }
 
 /**
@@ -159,28 +186,27 @@ function computeNormalWeights(
 /**
  * Compute per-bin weight vector for TREND state.
  *
+ * Direction convention: `trendBias > 0` = bullish on the BASE asset (human
+ * pair price rising). In BIN space the price moves by `dir =
+ * binDirection(orientation)` per unit of human-price rise — on an inverted
+ * pool (physical coinA = quote) a bullish move DECREASES the bin id. All side
+ * selections below are expressed via `dir` so both orientations behave
+ * identically in economic terms.
+ *
  * Two regimes with deliberately different direction semantics (F9):
  *
- * Weak trend (|trendBias| ≤ 0.7):
- *   Normal-shaped weights around active bin, with directional skew applied:
- *     k < activeBin (bid side): w *= (1 + 0.3 × trendBias)
- *     k > activeBin (ask side): w *= (1 - 0.3 × trendBias)
- *   When trendBias > 0 (bullish): BIDS are boosted (more coinA placed below active).
- *   This provides liquidity on the anticipated continuation side — i.e. we expect
- *   the price to move up, so we hold more bid inventory to be sold as price rises.
- *   NOTE: this "follow-trend" direction (boosting the side in the trend direction)
- *   is the OPPOSITE of a counter-trend positioning. Whether to follow or fade the
- *   trend at weak-bias levels is to be validated in the W5 grid search / shadow data.
+ * Weak trend (|trendBias| ≤ strong threshold):
+ *   Normal-shaped weights around active bin, with a skew boosting the bins
+ *   the price is expected to move INTO (they hold the inventory that fills as
+ *   the move continues) and shrinking the opposite side.
+ *   NOTE: whether to follow or fade the trend at weak-bias levels is to be
+ *   validated in the W5 grid search / shadow data.
  *
- * Strong trend (|trendBias| > 0.7):
- *   Only 1–3 bins on the *counter-trend* side (25 % of market capital; 75 % to lending).
- *   trendBias > 0 (bullish) → counter-trend = bid side (below active), preparing for
- *     a potential reversal by holding liquidity below current price.
- *   trendBias < 0 (bearish) → counter-trend = ask side (above active).
- *   NOTE: this "fade-the-trend" direction at strong bias (|bias|>0.7) is intentionally
- *   opposite to the weak-trend regime's "follow-trend" boost. The switch in direction
- *   semantics at the |bias|=0.7 boundary is a deliberate design choice that warrants
- *   validation in W5 grid search / shadow data.
+ * Strong trend (|trendBias| > strong threshold):
+ *   Only 1–3 bins on the *counter-trend* side (25 % of market capital;
+ *   the rest to lending) — positioned for a potential reversal.
+ *   NOTE: the follow↔fade switch at the strong-bias boundary is a deliberate
+ *   design choice that warrants validation in W5 grid search / shadow data.
  */
 function computeTrendWeights(
   activeBin: number,
@@ -189,16 +215,22 @@ function computeTrendWeights(
   widthSigma: number,
   pmLower: number,
   pmUpper: number,
+  strongTrend: boolean,
+  dir: 1 | -1,
 ): { weights: Map<number, number>; strongTrend: boolean } {
-  const absB = Math.abs(trendBias);
-  const strongTrend = absB > 0.7;
+  // strongTrend is derived by the state machine (|trendBias| > stateParams.
+  // trendBiasStrong) and passed in via ctx — no local re-derivation, so a
+  // config override of the threshold reaches this regime switch too.
+
+  // Bin-space direction of the expected move: sign(trendBias) in human price,
+  // mapped through the pool orientation.
+  const moveSign = Math.sign(trendBias) * dir;
 
   if (strongTrend) {
-    // Counter-trend: trendBias > 0 (bullish) → counter-trend is bid (below active)
-    //                trendBias < 0 (bearish) → counter-trend is ask (above active)
-    const counterTrendAbove = trendBias < 0; // bearish → counter is above
+    // Counter-trend side = opposite to the expected move.
+    const counterAbove = moveSign < 0;
     const bins: number[] = [];
-    if (counterTrendAbove) {
+    if (counterAbove) {
       for (let k = activeBin + 1; k <= Math.min(activeBin + 3, pmUpper); k++) bins.push(k);
     } else {
       for (let k = activeBin - 1; k >= Math.max(activeBin - 3, pmLower); k--) bins.push(k);
@@ -213,14 +245,17 @@ function computeTrendWeights(
   const lo = Math.max(activeBin - halfWidth, pmLower);
   const hi = Math.min(activeBin + halfWidth, pmUpper);
 
+  const skew = 0.3 * Math.abs(trendBias);
   const raw = new Map<number, number>();
   let total = 0;
   for (let k = lo; k <= hi; k++) {
     if (k === activeBin) continue;
     let w = gaussianWeight(k, activeBin, widthSigma);
-    // Apply directional bias: trendBias > 0 (bullish) → boost bid side (k < active)
-    if (k < activeBin) w *= 1 + 0.3 * trendBias;
-    else w *= 1 - 0.3 * trendBias;
+    // Boost the bins in the path of the expected move; shrink the others.
+    const binSide = Math.sign(k - activeBin);
+    if (moveSign !== 0) {
+      w *= binSide === moveSign ? 1 + skew : 1 - skew;
+    }
     if (w > 0) {
       raw.set(k, w);
       total += w;
@@ -314,30 +349,37 @@ function splitProportional(total: bigint, weights: number[]): bigint[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Compute the ask minimum price for a bin (bin is above active bin = LP sells A).
+ * Ask-minimum-price filter for BASE-selling bins.
+ *
+ * "Asks" are the bins holding the BASE asset — they fill by selling base as
+ * the human price rises into them. Which physical side that is depends on the
+ * pool orientation: bins above active hold physical coinA, so asks are the
+ * ABOVE side on a normal pool and the BELOW side on an inverted pool
+ * (physical coinA = quote → base = physical coinB = below-active bins).
  *
  * Per decision-engine-design.md §4.3:
  *   ask_min_price = avg_cost_basis × (1 + 2×fee + min_profit)
  *
  * Since we don't track cost basis in this pure function (it is tracked in
- * inventory.ts), we use the current bin price as a proxy for cost.
- * A bin whose price is below the break-even threshold is skipped.
+ * inventory.ts), we use the current active-bin human price as a proxy for
+ * cost. A bin whose effective fill price is below the break-even threshold is
+ * skipped.
  *
  * Returns true if the bin should be included (passes the ask-min filter).
  */
 function passesAskMinFilter(
   binId: number,
   activeBinId: number,
-  binStep: number,
-  decimalsA: number,
-  decimalsB: number,
+  orientation: PoolOrientation,
   feeRateBps: number,
 ): boolean {
-  // Only ask-side bins (above active) are subject to the ask-min filter.
-  if (binId <= activeBinId) return true;
+  // Ask side in bin space: the direction of RISING human price.
+  const dir = binDirection(orientation);
+  const isAskBin = Math.sign(binId - activeBinId) === dir;
+  if (!isAskBin) return true;
 
-  const binPriceNum = Number(priceFromBinId(binId, binStep, decimalsA, decimalsB));
-  const activePriceNum = Number(priceFromBinId(activeBinId, binStep, decimalsA, decimalsB));
+  const binPriceNum = humanPriceForBin(orientation, binId);
+  const activePriceNum = humanPriceForBin(orientation, activeBinId);
   if (!Number.isFinite(binPriceNum) || !Number.isFinite(activePriceNum) || activePriceNum <= 0) {
     return true; // Can't compute — allow through rather than erroneously blocking
   }
@@ -479,6 +521,50 @@ function pmRange(pm: PMState, activeBin: number, halfWidth: number): { lower: nu
 }
 
 // ---------------------------------------------------------------------------
+// Emergency full-withdrawal plan
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the EXTREME full-withdrawal plan: remove every bin's shares, collect
+ * fees when present, add nothing. Returns null when there is neither an open
+ * position nor uncollected fees (nothing to protect).
+ *
+ * Shared by:
+ *   - diffPlan's EXTREME branch (state-machine-driven, mlAgent path)
+ *   - mlAgent's fallback branch when an L2 veto is active during sidecar
+ *     degradation (the fallback strategy has no EXTREME concept)
+ *   - the rebalancer's rule-strategy pre-tick L2 veto path
+ *
+ * `reason` overrides the journal string; callers should include the trigger.
+ */
+export function buildExtremeWithdrawPlan(
+  pm: PMState,
+  reason = "EXTREME: full withdrawal",
+): RebalancePlan | null {
+  const hasFees = pm.feeBag.a > 0n || pm.feeBag.b > 0n;
+  const hasPosition = pm.positionBins.length > 0;
+  if (!hasPosition && !hasFees) return null;
+
+  const removeShares = new Map<number, bigint>();
+  for (const b of pm.positionBins) {
+    if (b.liquidityShare > 0n) removeShares.set(b.binId, b.liquidityShare);
+  }
+
+  return {
+    pmId: pm.pmId,
+    removeShares,
+    addAmountA: 0n,
+    addAmountB: 0n,
+    addBins: [],
+    addAmountsA: [],
+    addAmountsB: [],
+    collectFees: hasFees,
+    reason,
+    priority: "emergency",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Core diffPlan function
 // ---------------------------------------------------------------------------
 
@@ -494,9 +580,27 @@ function pmRange(pm: PMState, activeBin: number, halfWidth: number): { lower: nu
  * Returns a full-withdrawal plan (removeAll, no add) for EXTREME state.
  */
 export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
-  const { pm, pool, ctx, pred, profile } = input;
+  const { pm, pool, ctx, pred, profile, stopLoss } = input;
 
   const activeBin = pool.activeBinId;
+  const orientation = orientationOf(profile);
+  const dir = binDirection(orientation);
+  const hasForceLiquidation = (stopLoss?.forceLiquidationBins.length ?? 0) > 0;
+
+  /**
+   * Ask-min-filter exemption for stop-loss bins: forced-liquidation bins are
+   * always exempt; when a relaxed floor is set, every ask-side bin at or
+   * beyond it (in the rising-price direction) is exempt too — the relaxed
+   * floor is the operative minimum.
+   */
+  const stopLossExempt = (k: number): boolean => {
+    if (!stopLoss) return false;
+    if (stopLoss.forceLiquidationBins.includes(k)) return true;
+    const floor = stopLoss.relaxedAskFloorBin;
+    if (floor === null) return false;
+    // Beyond-or-at the floor in the +dir (rising human price) direction.
+    return dir === 1 ? k >= floor : k <= floor;
+  };
   const hasFees = pm.feeBag.a > 0n || pm.feeBag.b > 0n;
   const hasBalance = pm.balance.a > 0n || pm.balance.b > 0n;
   const hasPosition = pm.positionBins.length > 0;
@@ -506,24 +610,7 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
 
   // --- EXTREME: full withdrawal, no re-add ---
   if (ctx.state === "EXTREME") {
-    if (!hasPosition && !hasFees) return null;
-
-    const removeShares = new Map<number, bigint>();
-    for (const b of pm.positionBins) {
-      if (b.liquidityShare > 0n) removeShares.set(b.binId, b.liquidityShare);
-    }
-
-    return {
-      pmId: pm.pmId,
-      removeShares,
-      addAmountA: 0n,
-      addAmountB: 0n,
-      addBins: [],
-      addAmountsA: [],
-      addAmountsB: [],
-      collectFees: hasFees,
-      reason: "EXTREME: full withdrawal",
-    };
+    return buildExtremeWithdrawPlan(pm);
   }
 
   // --- maxCenterOffset: read directly from ctx (F5) ---
@@ -547,6 +634,20 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     targetCenterBin = activeBin;
   }
 
+  // --- Inventory imbalance assessment (C1 wiring) ---
+  // Computed on the FULL deployable capital (incl. any injected positionValue)
+  // — capitalScale multiplies both sides equally so the overage ratio is
+  // scale-invariant. Values are converted through the PHYSICAL mid-price.
+  const invGrossA = pm.balance.a + pm.feeBag.a + (pm.positionValue?.a ?? 0n);
+  const invGrossB = pm.balance.b + pm.feeBag.b + (pm.positionValue?.b ?? 0n);
+  const physicalOrientation: PoolOrientation = { ...orientation, poolCoinAIsQuote: false };
+  const invAdj: InventoryAdjustment = computeInventoryAdjustment({
+    availableA: invGrossA,
+    availableB: invGrossB,
+    midPriceNum: humanPriceForBin(physicalOrientation, activeBin),
+    decimalAdj: Math.pow(10, orientation.poolCoinADecimals - orientation.poolCoinBDecimals),
+  });
+
   // --- Tolerance check: is the current position already good enough? ---
   const currentPositionCenter: number | null = (() => {
     if (!hasPosition) return null;
@@ -555,7 +656,11 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     return Math.round((min + max) / 2);
   })();
 
-  if (hasPosition && currentPositionCenter !== null) {
+  // A severe imbalance OR a pending force-liquidation mandates a correction
+  // pass even when the position shape looks fine — the severe regime's
+  // bypassGasFilter flag and §4.2's stale-inventory exception are exactly
+  // these two exceptions.
+  if (hasPosition && currentPositionCenter !== null && !invAdj.bypassGasFilter && !hasForceLiquidation) {
     const centerDrift = Math.abs(currentPositionCenter - targetCenterBin);
     if (centerDrift <= ctx.toleranceBins) {
       // Center is close enough — check shape deviation.
@@ -570,6 +675,8 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
           pred.widthSigma,
           pmLo,
           pmHi,
+          ctx.strongTrend,
+          dir,
         );
         targetWeights = weights;
       } else {
@@ -606,6 +713,8 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
       pred.widthSigma,
       pmLower,
       pmUpper,
+      ctx.strongTrend,
+      dir,
     );
     targetWeights = weights;
     isStrongTrend = strongTrend;
@@ -635,8 +744,13 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
   }
 
   // --- Build add bins, respecting ask-min filter ---
-  const marketCapitalA = BigInt(Math.floor(Number(pm.balance.a) * capitalScale));
-  const marketCapitalB = BigInt(Math.floor(Number(pm.balance.b) * capitalScale));
+  // Principal capital = idle balance + the dryRun-estimated value of the
+  // position being removed (injected by the execution layer's re-plan pass);
+  // capitalScale (strong-trend 25 %) applies to principal, fees ride on top.
+  const principalA = pm.balance.a + (pm.positionValue?.a ?? 0n);
+  const principalB = pm.balance.b + (pm.positionValue?.b ?? 0n);
+  const marketCapitalA = BigInt(Math.floor(Number(principalA) * capitalScale));
+  const marketCapitalB = BigInt(Math.floor(Number(principalB) * capitalScale));
 
   // Include fee bag in available capital.
   const availableA = marketCapitalA + pm.feeBag.a;
@@ -646,21 +760,27 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
   const candidateWeights: number[] = [];
 
   for (const [k, w] of targetWeights) {
-    // Apply ask-min filter (skip ask-side bins that can't meet min profit).
-    if (
-      !passesAskMinFilter(
-        k,
-        activeBin,
-        profile.binStep,
-        profile.decimalsA,
-        profile.decimalsB,
-        pool.feeRateBps,
-      )
-    ) {
+    // Apply ask-min filter (skip ask-side bins that can't meet min profit),
+    // unless a stop-loss directive exempts this bin (relaxed floor / forced).
+    if (!stopLossExempt(k) && !passesAskMinFilter(k, activeBin, orientation, pool.feeRateBps)) {
       continue;
     }
     candidateBins.push(k);
     candidateWeights.push(w);
+  }
+
+  // Force-liquidation bins MUST be candidates even when the target weights
+  // didn't cover them (e.g. a tight halfWidth). Weight = the current max so
+  // the proportional split parks a meaningful share of the stale side there.
+  if (stopLoss) {
+    const maxW = candidateWeights.reduce((m, w) => Math.max(m, w), 0) || 1;
+    for (const k of stopLoss.forceLiquidationBins) {
+      if (k === activeBin) continue; // never place on active
+      if (!candidateBins.includes(k)) {
+        candidateBins.push(k);
+        candidateWeights.push(maxW);
+      }
+    }
   }
 
   // --- PTB shrink if needed ---
@@ -678,69 +798,85 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
   // If nothing to add and nothing to remove (and no fees), return null.
   if (finalBins.length === 0 && removeShares.size === 0 && !hasFees) return null;
 
-  // --- Split available capital across bins by side ---
-  const bidBins: number[] = [];
-  const bidWeights: number[] = [];
-  const askBins: number[] = [];
-  const askWeights: number[] = [];
+  // --- Split available capital across bins by PHYSICAL side ---
+  // Verified on mainnet (scripts/probe-bin-orientation.ts): bins ABOVE the
+  // active bin hold physical coinA only; bins BELOW hold physical coinB only.
+  const aboveBins: number[] = [];
+  const aboveWeights: number[] = [];
+  const belowBins: number[] = [];
+  const belowWeights: number[] = [];
 
   for (let i = 0; i < finalBins.length; i++) {
     const k = finalBins[i]!;
     const w = finalWeights[i] ?? 0;
-    if (k < activeBin) {
-      bidBins.push(k);
-      bidWeights.push(w);
-    } else if (k > activeBin) {
-      askBins.push(k);
-      askWeights.push(w);
+    if (k > activeBin) {
+      aboveBins.push(k);
+      aboveWeights.push(w);
+    } else if (k < activeBin) {
+      belowBins.push(k);
+      belowWeights.push(w);
     }
-    // Skip the active bin itself (CDPM constraint).
+    // Skip the active bin itself (never place on it).
   }
 
   // Renormalize side weights independently.
-  const bidSum = bidWeights.reduce((s, w) => s + w, 0);
-  const askSum = askWeights.reduce((s, w) => s + w, 0);
-  const normBidWeights = bidSum > 0 ? bidWeights.map((w) => w / bidSum) : bidWeights;
-  const normAskWeights = askSum > 0 ? askWeights.map((w) => w / askSum) : askWeights;
+  const aboveSum = aboveWeights.reduce((s, w) => s + w, 0);
+  const belowSum = belowWeights.reduce((s, w) => s + w, 0);
+  const normAboveWeights = aboveSum > 0 ? aboveWeights.map((w) => w / aboveSum) : aboveWeights;
+  const normBelowWeights = belowSum > 0 ? belowWeights.map((w) => w / belowSum) : belowWeights;
 
-  const bidAmounts = splitProportional(availableA, normBidWeights);
-  const askAmounts = splitProportional(availableB, normAskWeights);
+  const aboveAmounts = splitProportional(availableA, normAboveWeights);
+  const belowAmounts = splitProportional(availableB, normBelowWeights);
 
-  // Merge back into ordered output arrays, filtering dust.
+  // Merge back into ordered output arrays (dust filter applied AFTER the
+  // inventory correction below — scaling can push amounts under the floor).
   const allBins: number[] = [];
   const allAmountsA: bigint[] = [];
   const allAmountsB: bigint[] = [];
 
-  for (let i = 0; i < bidBins.length; i++) {
-    const k = bidBins[i]!;
-    const a = bidAmounts[i] ?? 0n;
-    if (a >= MIN_BIN_AMOUNT) {
-      allBins.push(k);
-      allAmountsA.push(a);
-      allAmountsB.push(0n);
-    }
+  for (let i = 0; i < aboveBins.length; i++) {
+    allBins.push(aboveBins[i]!);
+    allAmountsA.push(aboveAmounts[i] ?? 0n);
+    allAmountsB.push(0n);
   }
-  for (let i = 0; i < askBins.length; i++) {
-    const k = askBins[i]!;
-    const b = askAmounts[i] ?? 0n;
-    if (b >= MIN_BIN_AMOUNT) {
-      allBins.push(k);
-      allAmountsA.push(0n);
-      allAmountsB.push(b);
-    }
+  for (let i = 0; i < belowBins.length; i++) {
+    allBins.push(belowBins[i]!);
+    allAmountsA.push(0n);
+    allAmountsB.push(belowAmounts[i] ?? 0n);
   }
 
-  // Sort bins ascending (required by CDPM contract).
-  const sortedIdx = allBins.map((_, i) => i).sort((a, b) => (allBins[a] ?? 0) - (allBins[b] ?? 0));
-  const sortedBins = sortedIdx.map((i) => allBins[i]!);
-  const sortedAmountsA = sortedIdx.map((i) => allAmountsA[i] ?? 0n);
-  const sortedAmountsB = sortedIdx.map((i) => allAmountsB[i] ?? 0n);
+  // --- Inventory correction pass (C1) ---
+  // Scale the overweight side down (×0.7 / ×0 per regime); scale-ups are
+  // clamped back to available, so on the fully-deployed split they are a
+  // no-op — the meaningful effect is the reduction of the overweight side
+  // (the excess stays idle and is swept to lending, the only inventory
+  // response available to an agent that cannot swap).
+  const { adjustedA, adjustedB } = applyInventoryScales(
+    allBins,
+    allAmountsA,
+    allAmountsB,
+    activeBin,
+    invAdj,
+  );
+  const { clampedA, clampedB } = clampToAvailable(adjustedA, adjustedB, availableA, availableB);
+
+  // Dust filter + ascending sort (required by CDPM contract).
+  const keptIdx = allBins
+    .map((_, i) => i)
+    .filter((i) => (clampedA[i] ?? 0n) >= MIN_BIN_AMOUNT || (clampedB[i] ?? 0n) >= MIN_BIN_AMOUNT);
+  keptIdx.sort((a, b) => (allBins[a] ?? 0) - (allBins[b] ?? 0));
+  const sortedBins = keptIdx.map((i) => allBins[i]!);
+  const sortedAmountsA = keptIdx.map((i) => ((clampedA[i] ?? 0n) >= MIN_BIN_AMOUNT ? clampedA[i]! : 0n));
+  const sortedAmountsB = keptIdx.map((i) => ((clampedB[i] ?? 0n) >= MIN_BIN_AMOUNT ? clampedB[i]! : 0n));
 
   const totalAddA = sortedAmountsA.reduce((s, v) => s + v, 0n);
   const totalAddB = sortedAmountsB.reduce((s, v) => s + v, 0n);
 
   const stateLabel = ctx.state === "TREND" ? (isStrongTrend ? "TREND/strong" : "TREND/weak") : "NORMAL";
-  const reason = `diffPlan: ${stateLabel} center=${targetCenterBin} active=${activeBin} bins=${sortedBins.length} halfWidth=${ctx.halfWidth} trendBias=${ctx.trendBias.toFixed(2)}`;
+  const stopLossTag = stopLoss
+    ? `${stopLoss.forceLiquidationBins.length > 0 ? ` stopLoss=force@${stopLoss.forceLiquidationBins.join("/")}` : ""}${stopLoss.relaxedAskFloorBin !== null ? ` stopLoss=relax@${stopLoss.relaxedAskFloorBin}` : ""}`
+    : "";
+  const reason = `diffPlan: ${stateLabel} center=${targetCenterBin} active=${activeBin} bins=${sortedBins.length} halfWidth=${ctx.halfWidth} trendBias=${ctx.trendBias.toFixed(2)} inv=${invAdj.regime}${invAdj.regime !== "balanced" ? ` overage=${invAdj.suiOverage.toFixed(2)}` : ""}${stopLossTag}`;
 
   return {
     pmId: pm.pmId,
@@ -752,5 +888,6 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     addAmountsB: sortedAmountsB,
     collectFees,
     reason,
+    plannedActiveBinId: activeBin,
   };
 }

@@ -4,6 +4,7 @@ import { log } from "../../lib/logger.ts";
 import type { PMState, PositionBin } from "../../domain/types.ts";
 import { emptyLendingState, type LendingState, type LendingPosition } from "../lending/types.ts";
 import { getDb } from "../../db/client.ts";
+import { loadConfig } from "../../config.ts";
 
 // ---- I32 helpers ----
 
@@ -66,6 +67,24 @@ async function readBagAmounts(bagId: string): Promise<Map<string, bigint>> {
   }
 
   return result;
+}
+
+/** Normalize a coin-type tag: pad the address to 64 hex chars, lowercase. */
+function normalizeCoinType(t: string): string {
+  const [addr, ...rest] = t.split("::");
+  if (!addr || !addr.startsWith("0x")) return t.toLowerCase();
+  return ["0x" + addr.slice(2).padStart(64, "0"), ...rest].join("::").toLowerCase();
+}
+
+/** Bag lookup tolerant of short-form vs long-form address encodings. */
+function lookupByNormalizedType(map: Map<string, bigint>, coinType: string): bigint {
+  const direct = map.get(coinType);
+  if (direct !== undefined) return direct;
+  const want = normalizeCoinType(coinType);
+  for (const [key, value] of map) {
+    if (normalizeCoinType(key) === want) return value;
+  }
+  return 0n;
 }
 
 // ---- public API ----
@@ -159,6 +178,24 @@ export async function getPositionManager(pmId: string): Promise<PMState> {
     }
   }
 
+  // When no position is open, the position's coin_type_a/b are unavailable and
+  // the balance-bag lookups below would key on "" — reading every balance as
+  // 0n and making a funded-but-positionless PM look permanently empty (its
+  // first-ever deploy would never fire). Fall back to the configured pool
+  // profile's PHYSICAL coin order: physical A is the QUOTE-side logical coin
+  // when poolCoinAIsQuote, else the base-side one.
+  if (!coinTypeA || !coinTypeB) {
+    const profile = loadConfig().poolProfile;
+    const inverted = profile.poolCoinAIsQuote ?? false;
+    coinTypeA = inverted ? profile.coinTypeB : profile.coinTypeA;
+    coinTypeB = inverted ? profile.coinTypeA : profile.coinTypeB;
+    log.debug("getPositionManager: no open position — using profile physical coin types", {
+      pmId,
+      coinTypeA,
+      coinTypeB,
+    });
+  }
+
   // balance Bag
   const balanceBagRaw = fields["balance"] as { fields?: { id?: { id?: unknown } } } | undefined;
   const balanceBagId = String(
@@ -177,11 +214,14 @@ export async function getPositionManager(pmId: string): Promise<PMState> {
   ]);
 
   // The bag keys are the raw ASCII coin-type strings as Move emits them (e.g.
-  // "0x2::sui::SUI"). We look them up by coinTypeA / coinTypeB; fall back to 0n.
-  const balA = balanceMap.get(coinTypeA) ?? 0n;
-  const balB = balanceMap.get(coinTypeB) ?? 0n;
-  const feeA = feeMap.get(coinTypeA) ?? 0n;
-  const feeB = feeMap.get(coinTypeB) ?? 0n;
+  // "0x2::sui::SUI"). Look up by NORMALIZED comparison (addresses padded to
+  // 64 hex, lowercased) so the profile's long-form types and Move's short-form
+  // keys still match — an exact-string miss here silently reads a funded
+  // balance as 0n.
+  const balA = lookupByNormalizedType(balanceMap, coinTypeA);
+  const balB = lookupByNormalizedType(balanceMap, coinTypeB);
+  const feeA = lookupByNormalizedType(feeMap, coinTypeA);
+  const feeB = lookupByNormalizedType(feeMap, coinTypeB);
 
   log.debug("getPositionManager done", {
     pmId,

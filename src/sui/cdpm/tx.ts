@@ -3,6 +3,7 @@ import { getAgentAddress } from "../keypair.ts";
 import { TARGETS, CLOCK_ID, loadCetusIds } from "./package.ts";
 import { OnchainFailureError } from "../../lib/errors.ts";
 import { loadConfig } from "../../config.ts";
+import { appendValidateActiveIdSlippage } from "./txUnified.ts";
 
 // ---- argument interfaces ----
 
@@ -16,6 +17,12 @@ export interface AddLiquidityArgs {
   bins: number[];
   amountsA: bigint[];
   amountsB: bigint[];
+  /**
+   * When set (and SLIPPAGE_GUARD_ONCHAIN is on), the PTB opens with the DLMM
+   * router's `validate_active_id_slippage` assertion pinned to this bin id ±
+   * `slippageMaxBinDrift`.
+   */
+  plannedActiveBinId?: number;
 }
 
 export interface RemoveLiquidityArgs {
@@ -107,6 +114,18 @@ export function buildAddLiquidityTx(
 
   const tx = new Transaction();
   tx.setSender(agentAddress);
+
+  // On-chain slippage assertion — aborts the PTB when the active bin has
+  // drifted beyond cfg.slippageMaxBinDrift from the planned bin.
+  if (args.plannedActiveBinId !== undefined && cfg.slippageGuardOnchain) {
+    appendValidateActiveIdSlippage(
+      tx,
+      { poolId: args.poolId, coinTypeA: args.coinTypeA, coinTypeB: args.coinTypeB },
+      args.plannedActiveBinId,
+      cfg.slippageMaxBinDrift,
+      cfg.dlmmPublishedAt,
+    );
+  }
 
   tx.moveCall({
     target: TARGETS.agentAddLiquidity,

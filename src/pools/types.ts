@@ -35,6 +35,20 @@ export interface PoolProfile {
    */
   poolCoinADecimals?: number;
   poolCoinBDecimals?: number;
+  /**
+   * True when the pool's PHYSICAL coinA is the QUOTE asset of the pair —
+   * i.e. the DLMM bin price (physical B-per-A) is the INVERSE of the human
+   * pair price. For the mainnet SUI/USDC pool (Pool<USDC, SUI>, label
+   * "SUI/USDC") this is true: bin id ↑ = SUI-per-USDC ↑ = USDC-per-SUI ↓.
+   *
+   * Verified empirically (scripts/probe-bin-orientation.ts): bins ABOVE the
+   * active bin hold physical coinA only, bins BELOW hold physical coinB only.
+   * With poolCoinAIsQuote=true that means above-active = quote = bids and
+   * below-active = base = asks.
+   *
+   * Default (absent) = false: physical order matches the logical convention.
+   */
+  poolCoinAIsQuote?: boolean;
   /** Bin step in basis points (1 = 0.01%). Verified at runtime against on-chain pool. */
   binStep: number;
   /** Used to look up external prices (e.g. "SUI/USDC"). */

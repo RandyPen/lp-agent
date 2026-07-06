@@ -86,7 +86,9 @@ describe("runBacktest", () => {
     expect(result.summary.byKind.plan_and_reconcile).toBe(1);
     // Ticks 1..4: in range, no fees → quiet.
     expect(result.summary.byKind.quiet).toBe(4);
-    expect(result.summary.uniqueBinsTouched).toBe(1);
+    // The straddle touches the two bins adjacent to active (never active
+    // itself — active-bin placement is forbidden by policy).
+    expect(result.summary.uniqueBinsTouched).toBe(2);
   });
 
   it("emits multiple rebalances when the price walks far enough to exit the position", async () => {

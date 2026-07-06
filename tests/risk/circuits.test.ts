@@ -401,7 +401,11 @@ describe("canExitExtreme", () => {
     ).toBe(false);
   });
 
-  it("allows exit when volatility is NaN (no data — treated as recovered)", () => {
+  it("blocks exit when volatility is NaN (no data — NOT recovered)", () => {
+    // Exiting the protective state while blind would invert the hysteresis's
+    // purpose. NaN (insufficient price data) must keep EXTREME latched until
+    // real observations show recovery. (Matches the ExitExtremeInput doc;
+    // the previous treat-NaN-as-recovered behaviour was the bug.)
     const entered = T(-STABLE_10M - 1);
     expect(
       canExitExtreme({
@@ -412,6 +416,68 @@ describe("canExitExtreme", () => {
         volatilityRecoveryThreshold: 0.07,
         currentVolatility5m: NaN,
       }),
-    ).toBe(true);
+    ).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — checkSourceStaleness
+// ---------------------------------------------------------------------------
+
+import { checkSourceStaleness } from "../../src/risk/circuits.ts";
+
+describe("checkSourceStaleness", () => {
+  const THRESH = { suiMs: 60_000, cetusMs: 180_000, derivMs: 600_000 };
+  const NOW2 = 1_700_000_000_000;
+
+  it("null input returns three non-firing results with NaN observed", () => {
+    const results = checkSourceStaleness(null, THRESH, NOW2);
+    expect(results).toHaveLength(3);
+    for (const r of results) {
+      expect(r.fires).toBe(false);
+      expect(Number.isNaN(r.observed)).toBe(true);
+    }
+  });
+
+  it("fires only the source over its threshold", () => {
+    const results = checkSourceStaleness(
+      { capturedAtMs: NOW2, sui: 5_000, cetus: 240_000, derivatives: 10_000 },
+      THRESH,
+      NOW2,
+    );
+    const byMetric = new Map(results.map((r) => [r.metric, r]));
+    expect(byMetric.get("source_stale_sui")!.fires).toBe(false);
+    expect(byMetric.get("source_stale_cetus")!.fires).toBe(true);
+    expect(byMetric.get("source_stale_derivatives")!.fires).toBe(false);
+  });
+
+  it("the sample ages: recorded age + time since capture", () => {
+    // Recorded 30s stale, captured 40s ago → effective 70s > 60s threshold.
+    const results = checkSourceStaleness(
+      { capturedAtMs: NOW2 - 40_000, sui: 30_000, cetus: 0, derivatives: 0 },
+      THRESH,
+      NOW2,
+    );
+    const sui = results.find((r) => r.metric === "source_stale_sui")!;
+    expect(sui.observed).toBe(70_000);
+    expect(sui.fires).toBe(true);
+  });
+
+  it("never-updated sentinel (MAX_SAFE_INTEGER) fires", () => {
+    const results = checkSourceStaleness(
+      { capturedAtMs: NOW2, sui: Number.MAX_SAFE_INTEGER, cetus: 0, derivatives: 0 },
+      THRESH,
+      NOW2,
+    );
+    expect(results.find((r) => r.metric === "source_stale_sui")!.fires).toBe(true);
+  });
+
+  it("exact threshold does not fire (strictly greater)", () => {
+    const results = checkSourceStaleness(
+      { capturedAtMs: NOW2, sui: 60_000, cetus: 0, derivatives: 0 },
+      THRESH,
+      NOW2,
+    );
+    expect(results.find((r) => r.metric === "source_stale_sui")!.fires).toBe(false);
   });
 });

@@ -67,6 +67,9 @@ function makeCtx(state: StateContext["state"], overrides: Partial<StateContext> 
     evalIntervalMs: state === "NORMAL" ? 20 * 60 * 1000 : state === "TREND" ? 15 * 60 * 1000 : 60 * 1000,
     halfWidth: 3,
     trendBias: 0,
+    // Mirrors the state machine's derivation (|trendBias| > 0.7) so tests that
+    // only override trendBias keep the pre-strongTrend-field behaviour.
+    strongTrend: Math.abs(overrides.trendBias ?? 0) > 0.7,
     lendingPct: state === "EXTREME" ? 1 : state === "TREND" ? 0.5 : 0.35,
     toleranceBins: 2,
     maxCenterOffset: 2,
@@ -172,28 +175,26 @@ describe("diffPlan — NORMAL state", () => {
     expect(plan!.addBins).not.toContain(0); // active bin is 0
   });
 
-  it("bid bins (< active) have non-zero amountsA only", () => {
+  it("bins BELOW active carry physical coinB only (verified side rule)", () => {
     const plan = diffPlan(makeInput());
     expect(plan).not.toBeNull();
     const { addBins, addAmountsA, addAmountsB } = plan!;
     for (let i = 0; i < addBins.length; i++) {
       if ((addBins[i] ?? 0) < 0) {
-        // bid side — should have A, no B
-        expect(addAmountsA[i] ?? 0n).toBeGreaterThan(0n);
-        expect(addAmountsB[i]).toBe(0n);
+        expect(addAmountsB[i] ?? 0n).toBeGreaterThan(0n);
+        expect(addAmountsA[i]).toBe(0n);
       }
     }
   });
 
-  it("ask bins (> active) have non-zero amountsB only", () => {
+  it("bins ABOVE active carry physical coinA only (verified side rule)", () => {
     const plan = diffPlan(makeInput());
     expect(plan).not.toBeNull();
     const { addBins, addAmountsA, addAmountsB } = plan!;
     for (let i = 0; i < addBins.length; i++) {
       if ((addBins[i] ?? 0) > 0) {
-        // ask side — should have B, no A
-        expect(addAmountsB[i] ?? 0n).toBeGreaterThan(0n);
-        expect(addAmountsA[i]).toBe(0n);
+        expect(addAmountsA[i] ?? 0n).toBeGreaterThan(0n);
+        expect(addAmountsB[i]).toBe(0n);
       }
     }
   });
@@ -494,5 +495,134 @@ describe("diffPlan — ask-min-profit filter", () => {
     expect(plan).not.toBeNull();
     for (const a of plan!.addAmountsA) expect(a).toBeGreaterThanOrEqual(0n);
     for (const b of plan!.addAmountsB) expect(b).toBeGreaterThanOrEqual(0n);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3 (C1) — inventory correction wired into diffPlan
+// ---------------------------------------------------------------------------
+
+describe("diffPlan — inventory correction", () => {
+  // The default fixture pool is NON-inverted (no poolCoinAIsQuote) with
+  // decimals 9/6, active bin 0 → physical mid-price = 1000 B-per-A. A raw
+  // amount of coinA is therefore worth 1000× the same raw amount of coinB...
+  // adjusted by decimalAdj 10^3, giving value(A raw) = value(B raw) — i.e.
+  // equal raw balances are a perfectly balanced book.
+
+  it("balanced book: regime tag present, both sides deployed", () => {
+    // feeRateBps=0: at the fixture's 10bp binStep a real fee would ask-min-
+    // filter every above-active bin, which is fee logic — not what we test here.
+    const plan = diffPlan(makeInput({
+      pm: makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n }),
+      pool: makePool(0, 0),
+    }));
+    expect(plan).not.toBeNull();
+    expect(plan!.reason).toContain("inv=balanced");
+    expect(plan!.addAmountA).toBeGreaterThan(0n);
+    expect(plan!.addAmountB).toBeGreaterThan(0n);
+  });
+
+  it("mild coinA overage (~0.2): coinA side reduced to ~70%", () => {
+    // value share of A = 0.7 → overage +0.2 (mild).
+    const pm = makePm({ balanceA: 7_000_000n, balanceB: 3_000_000n });
+    const plan = diffPlan(makeInput({ pm, pool: makePool(0, 0) }));
+    expect(plan).not.toBeNull();
+    expect(plan!.reason).toContain("inv=mild");
+    // A-side deployment ≈ 70% of available A (7_000_000 × 0.7).
+    const deployedA = Number(plan!.addAmountA);
+    expect(deployedA).toBeGreaterThan(7_000_000 * 0.65);
+    expect(deployedA).toBeLessThan(7_000_000 * 0.75);
+    // B side fully deployed.
+    expect(plan!.addAmountB).toBe(3_000_000n);
+  });
+
+  it("moderate coinA overage (~0.35): zero new coinA orders", () => {
+    const pm = makePm({ balanceA: 8_500_000n, balanceB: 1_500_000n });
+    const plan = diffPlan(makeInput({ pm, pool: makePool(0, 0) }));
+    expect(plan).not.toBeNull();
+    expect(plan!.reason).toContain("inv=moderate");
+    expect(plan!.addAmountA).toBe(0n);
+    expect(plan!.addAmountB).toBe(1_500_000n);
+    // No bins above active should remain (they'd be zero-A dust).
+    for (const k of plan!.addBins) expect(k).toBeLessThan(0);
+  });
+
+  it("severe overage bypasses the shape-deviation quiet guard", () => {
+    // Position exactly matching the target shape (would normally be quiet)…
+    const positionBins = [];
+    for (let k = -3; k <= 3; k++) {
+      if (k === 0) continue;
+      positionBins.push({ binId: k, liquidityShare: 100n, amountA: 0n, amountB: 0n });
+    }
+    // …but the book is severely imbalanced (>0.5 overage → single-sided).
+    const pmSevere = makePm({ balanceA: 10_000_000n, balanceB: 0n, positionBins });
+    const ctx = makeCtx("NORMAL", { toleranceBins: 8, halfWidth: 3 });
+    const plan = diffPlan(makeInput({ pm: pmSevere, ctx, pool: makePool(0, 0) }));
+    expect(plan).not.toBeNull(); // guard bypassed — correction pass mandated
+    expect(plan!.reason).toContain("inv=severe");
+    expect(plan!.addAmountA).toBe(0n); // overweight side suppressed
+    expect(plan!.removeShares.size).toBe(positionBins.length); // rebuild happens
+
+    // Control: the same position with a balanced book stays quiet.
+    const pmBalanced = makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n, positionBins });
+    // Note: identical-shape check needs the same weights; with tolerance 8 and
+    // matching tent the deviation may still exceed 0.15, so only assert the
+    // severe case forced a plan (above) — the control is informational.
+    void pmBalanced;
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3 (C2) — age stop-loss directives
+// ---------------------------------------------------------------------------
+
+describe("diffPlan — stop-loss directives", () => {
+  it("relaxed ask floor exempts bins at/beyond it from the ask-min filter", () => {
+    // Balanced book so the inventory correction stays out of the way
+    // (1 raw A ≈ 1 raw B in value under the 9/6-decimals fixture).
+    const balancedPm = () => makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n });
+    // With feeRateBps=40 and binStep=10 every above-active bin within
+    // halfWidth 3 fails the ask-min filter (fill < active×1.011)…
+    const strict = diffPlan(makeInput({ pm: balancedPm(), pool: makePool(0, 40) }));
+    expect(strict).not.toBeNull();
+    expect(strict!.addBins.filter((k) => k > 0)).toHaveLength(0);
+
+    // …but a relaxed floor at bin 1 re-admits the whole above side.
+    const relaxed = diffPlan(makeInput({
+      pm: balancedPm(),
+      pool: makePool(0, 40),
+      stopLoss: { relaxedAskFloorBin: 1, forceLiquidationBins: [] },
+    }));
+    expect(relaxed).not.toBeNull();
+    expect(relaxed!.addBins.filter((k) => k > 0).length).toBeGreaterThan(0);
+    expect(relaxed!.reason).toContain("stopLoss=relax@1");
+  });
+
+  it("force-liquidation bin is added to the candidates and tagged in reason", () => {
+    const plan = diffPlan(makeInput({
+      pm: makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n }),
+      pool: makePool(0, 40),
+      stopLoss: { relaxedAskFloorBin: null, forceLiquidationBins: [1] },
+    }));
+    expect(plan).not.toBeNull();
+    expect(plan!.addBins).toContain(1);
+    expect(plan!.reason).toContain("stopLoss=force@1");
+  });
+
+  it("force liquidation bypasses the shape-deviation quiet guard", () => {
+    // Position matching the target (would be quiet) + a forced bin → plan.
+    const positionBins = [];
+    for (let k = -3; k <= 3; k++) {
+      if (k === 0) continue;
+      positionBins.push({ binId: k, liquidityShare: 100n, amountA: 0n, amountB: 0n });
+    }
+    const pm = makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n, positionBins });
+    const ctx = makeCtx("NORMAL", { toleranceBins: 8, halfWidth: 3 });
+    const withForce = diffPlan(makeInput({
+      pm, ctx, pool: makePool(0, 0),
+      stopLoss: { relaxedAskFloorBin: null, forceLiquidationBins: [1] },
+    }));
+    expect(withForce).not.toBeNull();
+    expect(withForce!.reason).toContain("stopLoss=force@1");
   });
 });

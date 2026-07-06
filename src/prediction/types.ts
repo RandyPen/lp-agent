@@ -187,6 +187,13 @@ export interface StateContext {
    */
   trendBias: number;
   /**
+   * Whether |trendBias| exceeds the strong-trend threshold
+   * (`stateParams.trendBiasStrong`, default 0.7). Derived by the state machine
+   * so diffPlanner and downstream consumers share a single source of truth for
+   * the weak-trend/strong-trend regime switch.
+   */
+  strongTrend: boolean;
+  /**
    * Fraction of PM balance that should be parked in lending.
    * Range [0, 1]. In EXTREME state this is 1.0 (100% lending).
    */

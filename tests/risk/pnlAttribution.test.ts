@@ -135,3 +135,43 @@ describe("createPnlAttributor", () => {
     expect(summary.byState.unknown.feeIncome).toBe(5);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — createPnl24hPctSource (the risk-monitor seam)
+// ---------------------------------------------------------------------------
+
+import { createPnl24hPctSource } from "../../src/risk/pnlAttribution.ts";
+
+describe("createPnl24hPctSource", () => {
+  it("returns null when NAV is unknown", () => {
+    const attr = createPnlAttributor({ nowMs: () => NOW });
+    attr.record(tick(POOL_A, NOW - 1000, 10, 0, 0));
+    const src = createPnl24hPctSource({ attributor: attr, getNavUsd: () => null, nowMs: () => NOW });
+    expect(src(POOL_A)).toBe(null);
+  });
+
+  it("returns null when NAV is zero or negative", () => {
+    const attr = createPnlAttributor({ nowMs: () => NOW });
+    attr.record(tick(POOL_A, NOW - 1000, 10, 0, 0));
+    const zero = createPnl24hPctSource({ attributor: attr, getNavUsd: () => 0, nowMs: () => NOW });
+    expect(zero(POOL_A)).toBe(null);
+    const neg = createPnl24hPctSource({ attributor: attr, getNavUsd: () => -5, nowMs: () => NOW });
+    expect(neg(POOL_A)).toBe(null);
+  });
+
+  it("returns null when the 24h window has zero ticks (no data ≠ 0% PnL)", () => {
+    const attr = createPnlAttributor({ nowMs: () => NOW });
+    // Only a tick OUTSIDE the 24h window.
+    attr.record(tick(POOL_A, NOW - 25 * 60 * 60 * 1000, 10, 0, 0));
+    const src = createPnl24hPctSource({ attributor: attr, getNavUsd: () => 1_000, nowMs: () => NOW });
+    expect(src(POOL_A)).toBe(null);
+  });
+
+  it("computes netPnl / nav over the 24h window", () => {
+    const attr = createPnlAttributor({ nowMs: () => NOW });
+    // netPnl = (10 - 2 + (-58)) = -50 over a 1000 NAV → -5%
+    attr.record(tick(POOL_A, NOW - 3600_000, 10, 2, -58));
+    const src = createPnl24hPctSource({ attributor: attr, getNavUsd: () => 1_000, nowMs: () => NOW });
+    expect(src(POOL_A)).toBeCloseTo(-0.05, 10);
+  });
+});

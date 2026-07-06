@@ -22,6 +22,16 @@ export interface PMState {
   positionBins: PositionBin[];
   /** Current lending positions held by this PM (per protocol, per coin type). */
   lending: LendingState;
+  /**
+   * Aggregate value locked in `positionBins`, estimated by the EXECUTION
+   * layer via a remove-all dryRun (per-bin amounts are 0n in v0 chain reads,
+   * so this is the only reliable estimate). A safety haircut is already
+   * applied. Set only during the rebalancer's re-planning pass — strategies
+   * treat `positionValue` as additional deployable capital when their plan
+   * removes the whole position. undefined = unknown (plan from balance+fees
+   * only, as before).
+   */
+  positionValue?: { a: bigint; b: bigint };
 }
 
 export interface PositionBin {
@@ -49,6 +59,13 @@ export interface PriceObservation {
 /**
  * What a Strategy returns. The rebalancer turns this into one or more on-chain transactions.
  * `removeShares` is applied first (drain old position), then `add` (place new position).
+ *
+ * Amount-sizing contract: strategies size `addAmounts*` from the PRE-remove
+ * snapshot (`pm.balance` + fee bag when `collectFees`). The EXECUTION layer
+ * (rebalancer) owns realized-balance sizing — it re-scales the per-bin
+ * amounts to the actual post-remove balances via
+ * `decision/planMath.rescalePlanToAvailable` before submitting, so the value
+ * freed by `removeShares` is redeployed instead of leaking to lending.
  */
 export interface RebalancePlan {
   pmId: string;
@@ -65,6 +82,19 @@ export interface RebalancePlan {
   collectFees: boolean;
   /** Free-form rationale captured into the rebalance journal. */
   reason: string;
+  /**
+   * The pool's active bin id at plan time. The execution layer aborts (and,
+   * when SLIPPAGE_GUARD_ONCHAIN is on, the PTB asserts on-chain) if the live
+   * active bin has drifted more than `slippageMaxBinDrift` bins away — the
+   * pre-computed per-bin split is priced for THIS active bin.
+   */
+  plannedActiveBinId?: number;
+  /**
+   * "emergency" marks protective plans (EXTREME full withdrawal) that must
+   * bypass churn caps and skip the proceeds re-planning pass. Default
+   * (undefined) is treated as "normal".
+   */
+  priority?: "normal" | "emergency";
 }
 
 export interface ExecutionResult {

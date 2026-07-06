@@ -30,6 +30,9 @@ export function buildSuiUsdcProfile(): PoolProfile {
     // Price feeds use these to compute USDC-per-SUI (Binance SUIUSDC convention).
     poolCoinADecimals: 6,
     poolCoinBDecimals: 9,
+    // Physical coinA (USDC) is the quote asset → bin price is the inverse of
+    // the human SUI/USDC price; bin id ↑ = SUI price ↓. See PoolProfile doc.
+    poolCoinAIsQuote: true,
     binStep: 50,
     pricePairLabel: "SUI/USDC",
     defaultStrategyParams: {

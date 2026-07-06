@@ -7,10 +7,11 @@
  *   2. Pick a bin range ±k·σ around the active bin, capped at MAX_HALF_WIDTH.
  *   3. Integrate a log-normal density across each bin's boundaries to compute
  *      a weight; derate boundary bins by the pool fee dead-zone.
- *   4. Split PM balance into per-bin amounts:
- *        - bid side (id < active): coinA only
- *        - ask side (id > active): coinB only
- *        - active bin: both, mid-priced
+ *   4. Split PM capital into per-bin amounts by the PHYSICAL side rule
+ *      (verified on mainnet, scripts/probe-bin-orientation.ts):
+ *        - bins ABOVE active: physical coinA only
+ *        - bins BELOW active: physical coinB only
+ *        - the active bin itself is NEVER placed on (composition-fee policy)
  *
  * Trigger rules (lite version of cdpm_web worker §5.5):
  *   - Active bin not in position range → full recenter.
@@ -31,7 +32,7 @@ import {
   scaleSigmaToHorizon,
 } from "../forecast/volatility.ts";
 import type { OhlcvBar, PriceDistribution } from "../forecast/types.ts";
-import { priceFromBinId } from "../domain/binMath.ts";
+import { humanPriceForBin, orientationOf } from "../domain/binMath.ts";
 import { log } from "../lib/logger.ts";
 
 export interface MultiBinSpotParams {
@@ -156,6 +157,8 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
         }
       }
 
+      const orientation = orientationOf(profile);
+
       const dist = buildDistribution(
         spotPrice,
         [], // OHLC bars are read by the rebalancer if needed; v0 uses raw history.
@@ -172,9 +175,7 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
 
       const weights = computeBinWeights({
         bins: range.bins,
-        binStep: profile.binStep,
-        decimalsA: profile.decimalsA,
-        decimalsB: profile.decimalsB,
+        orientation,
         activeBinId: pool.activeBinId,
         feeRateBps: pool.feeRateBps,
         distribution: dist,
@@ -214,59 +215,41 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
         }
       }
 
-      // Split balance + fees across bins by side.
-      // bid side bins (id < active) absorb coinA; ask side bins absorb coinB;
-      // the active bin gets a half of each at its mid-price.
-      const grossA = pm.balance.a + (hasFees ? pm.feeBag.a : 0n);
-      const grossB = pm.balance.b + (hasFees ? pm.feeBag.b : 0n);
-      const totalA = grossA;
-      const totalB = grossB;
+      // Split capital across bins by the PHYSICAL side rule:
+      //   bins ABOVE active absorb physical coinA; bins BELOW absorb coinB.
+      // The active bin itself is excluded (composition-fee policy) — its
+      // log-normal mass is already zeroed by the feeDerate ramp.
+      // Deployable capital = idle balance + fees (when collecting) + the
+      // dryRun-estimated value of the position being removed (injected by the
+      // execution layer's re-planning pass; see PMState.positionValue).
+      const grossA =
+        pm.balance.a + (hasFees ? pm.feeBag.a : 0n) + (pm.positionValue?.a ?? 0n);
+      const grossB =
+        pm.balance.b + (hasFees ? pm.feeBag.b : 0n) + (pm.positionValue?.b ?? 0n);
 
-      const bidIdx: number[] = [];
-      const askIdx: number[] = [];
-      const activeIdx: number[] = [];
+      const aboveIdx: number[] = [];
+      const belowIdx: number[] = [];
       weights.bins.forEach((b, i) => {
-        if (b.binId < pool.activeBinId) bidIdx.push(i);
-        else if (b.binId > pool.activeBinId) askIdx.push(i);
-        else activeIdx.push(i);
+        if (b.binId > pool.activeBinId) aboveIdx.push(i);
+        else if (b.binId < pool.activeBinId) belowIdx.push(i);
+        // active bin: skipped entirely
       });
 
-      // Reserve a small chunk for the active bin (5 % of each side) so it
-      // isn't a hard 0-weight when σ is small; the active bin's behavior is
-      // captured properly in the post-plan reconcile step (Phase 2 / v2).
-      const activeReserveA = totalA / 20n;
-      const activeReserveB = totalB / 20n;
-      const aForBids = totalA - activeReserveA;
-      const bForAsks = totalB - activeReserveB;
+      const aboveWeights = aboveIdx.map((i) => weights.bins[i]!.weight);
+      const belowWeights = belowIdx.map((i) => weights.bins[i]!.weight);
 
-      const bidWeights = bidIdx.map((i) => weights.bins[i]!.weight);
-      const askWeights = askIdx.map((i) => weights.bins[i]!.weight);
-
-      const bidAmounts = splitProportional(aForBids, bidWeights);
-      const askAmounts = splitProportional(bForAsks, askWeights);
+      const aboveAmounts = splitProportional(grossA, aboveWeights);
+      const belowAmounts = splitProportional(grossB, belowWeights);
 
       const addAmountsA: bigint[] = weights.bins.map(() => 0n);
       const addAmountsB: bigint[] = weights.bins.map(() => 0n);
 
-      bidIdx.forEach((i, j) => {
-        addAmountsA[i] = bidAmounts[j] ?? 0n;
+      aboveIdx.forEach((i, j) => {
+        addAmountsA[i] = aboveAmounts[j] ?? 0n;
       });
-      askIdx.forEach((i, j) => {
-        addAmountsB[i] = askAmounts[j] ?? 0n;
+      belowIdx.forEach((i, j) => {
+        addAmountsB[i] = belowAmounts[j] ?? 0n;
       });
-      if (activeIdx.length === 1 && activeIdx[0] !== undefined) {
-        addAmountsA[activeIdx[0]] = activeReserveA;
-        addAmountsB[activeIdx[0]] = activeReserveB;
-      } else {
-        // No active bin in range (shouldn't happen with pickBinRange) — fold
-        // the reserves back into the side with the most mass.
-        if (bidIdx.length > 0 && bidIdx[0] !== undefined) {
-          addAmountsA[bidIdx[0]] = (addAmountsA[bidIdx[0]] ?? 0n) + activeReserveA;
-        }
-        if (askIdx.length > 0 && askIdx[0] !== undefined) {
-          addAmountsB[askIdx[0]] = (addAmountsB[askIdx[0]] ?? 0n) + activeReserveB;
-        }
-      }
 
       // Drop bins with zero on both sides — saves gas and avoids zero-share moves.
       const finalBins: number[] = [];
@@ -281,7 +264,7 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
         finalB.push(bAmt);
       });
 
-      const reason = `multiBinSpot: ${shouldRecenter ? (outOfRange ? "out-of-range" : driftTriggered ? "drift" : "init") : "fees-only"} σ=${dist.sigma.toFixed(5)} bins=${finalBins.length} center=${pool.activeBinId} priceMid=${priceFromBinId(pool.activeBinId, profile.binStep, profile.decimalsA, profile.decimalsB)}`;
+      const reason = `multiBinSpot: ${shouldRecenter ? (outOfRange ? "out-of-range" : driftTriggered ? "drift" : "init") : "fees-only"} σ=${dist.sigma.toFixed(5)} bins=${finalBins.length} center=${pool.activeBinId} priceMid=${humanPriceForBin(orientation, pool.activeBinId).toPrecision(8)}`;
 
       return {
         kind: "plan_and_reconcile",
@@ -295,6 +278,7 @@ export function createMultiBinSpotStrategy(params: MultiBinSpotParams = {}): Str
           addAmountsB: finalB,
           collectFees: hasFees,
           reason,
+          plannedActiveBinId: pool.activeBinId,
         },
       };
     },

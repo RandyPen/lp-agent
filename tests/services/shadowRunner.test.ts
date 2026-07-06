@@ -62,6 +62,7 @@ function makeCtx(state: StateContext["state"] = "NORMAL"): StateContext {
     evalIntervalMs: 20 * 60 * 1000,
     halfWidth: 3,
     trendBias: 0.1,
+    strongTrend: false,
     lendingPct: 0.35,
     toleranceBins: 2,
     maxCenterOffset: 2,
@@ -324,5 +325,31 @@ describe("shadowRunner — multiple ticks", () => {
       await runner.runShadowTick(makeStrategyInput());
     }
     expect(countShadowRows(db)).toBe(5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4 (D3) — decision-time anchors recorded for later scoring
+// ---------------------------------------------------------------------------
+
+describe("shadow rows carry scoring anchors", () => {
+  it("active_bin and spot_price are persisted", async () => {
+    db = freshDb();
+    const runner = createShadowRunner({
+      mlStrategy: makeQuietStrategy("ml quiet"),
+      ruleStrategy: makeQuietStrategy("rule quiet"),
+      stateMachine: makeMockStateMachine(),
+      db,
+      now: () => BASE_NOW,
+    });
+    await runner.runShadowTick(makeStrategyInput());
+
+    const row = db
+      .prepare<{ active_bin: number | null; spot_price: string | null }, []>(
+        "SELECT active_bin, spot_price FROM shadow_decisions ORDER BY id DESC LIMIT 1",
+      )
+      .get();
+    expect(row?.active_bin).toBe(100);
+    expect(row?.spot_price).toBe("1.0000");
   });
 });

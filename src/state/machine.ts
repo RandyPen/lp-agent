@@ -8,11 +8,14 @@
  *   const ctx = sm.advance(snapshot, pred, input, extremeSignal);
  *
  * Each `advance()` call:
- *   1. Evaluates transition predicates (min-dwell enforced).
+ *   1. Evaluates transition predicates. Min-dwell is enforced for all
+ *      NON-EMERGENCY transitions; EXTREME entry bypasses dwell (an L2 signal
+ *      or p-sum spike must escalate immediately, even 1 minute after a state
+ *      change). EXTREME exit respects dwell + stability + vol recovery.
  *   2. If a transition fires: closes the current DB row (sets exited_at_ms),
  *      inserts a new row, updates internal state.
  *   3. Derives continuous parameters (halfWidth, trendBias, lendingPct, …).
- *   4. Returns a fully populated StateContext.
+ *   4. Returns a fully populated StateContext (also cached for current()).
  *
  * Persistence contract:
  *   - Every state entry inserts a new row into `market_state_history` with
@@ -43,9 +46,10 @@ import type {
 import type { StrategyInput } from "../strategies/types.ts";
 import { log } from "../lib/logger.ts";
 import {
+  DEFAULT_STATE_PARAMS,
   EVAL_INTERVAL_MS,
   MIN_DWELL_MS,
-  U_HIGH,
+  type StateParams,
   deriveHalfWidth,
   deriveLendingPct,
   deriveTrendBias,
@@ -116,14 +120,18 @@ interface InternalState {
  * @param deps.poolId  Pool identifier (key for `market_state_history`).
  * @param deps.db      SQLite database (must have `market_state_history` table).
  * @param deps.now     Injectable clock.  Defaults to `() => Date.now()`.
+ * @param deps.params  Threshold bundle (env-overridable via cfg.stateParams).
+ *                     Defaults to DEFAULT_STATE_PARAMS.
  */
 export function createStateMachine(deps: {
   poolId: string;
   db: Database;
   now?: () => number;
+  params?: StateParams;
 }): StateMachine {
   const { poolId, db } = deps;
   const now = deps.now ?? (() => Date.now());
+  const params = deps.params ?? DEFAULT_STATE_PARAMS;
 
   // Prepared statements — created once, reused on every advance() call.
   const insertRow = db.prepare<
@@ -156,6 +164,9 @@ export function createStateMachine(deps: {
     prevState: null,
   };
 
+  /** Last context produced by advance()/buildContext; null before first advance. */
+  let lastCtx: StateContext | null = null;
+
   // -------------------------------------------------------------------------
   // Internal helpers
   // -------------------------------------------------------------------------
@@ -173,25 +184,31 @@ export function createStateMachine(deps: {
     // L1 bonus is applied by mlAgent after the state machine returns the context;
     // deriveLendingPct no longer accepts an l1Bonus param (F6 dead-code removal).
     const lendingPct = deriveLendingPct(state, trendBias);
-    const halfWidth = deriveHalfWidth(pred.widthSigma);
+    const halfWidth = deriveHalfWidth(pred.widthSigma, params);
     const toleranceBins = deriveToleranceBins(pred.widthSigma, halfWidth);
 
     // F5: populate maxCenterOffset in the context so diffPlanner doesn't need to
     // re-derive it. The state machine owns the derivation; diffPlanner reads it.
-    const uncertaintyHigh = pred.featureCompleteness < U_HIGH;
+    const uncertaintyHigh = pred.featureCompleteness < params.uHigh;
     const maxCenterOffset = deriveMaxCenterOffset(pred.widthSigma, uncertaintyHigh);
 
-    return {
+    const ctx: StateContext = {
       state,
       enteredAtMs,
       evalIntervalMs: EVAL_INTERVAL_MS[state],
       halfWidth,
       trendBias,
+      strongTrend: Math.abs(trendBias) > params.trendBiasStrong,
       lendingPct,
       toleranceBins,
       maxCenterOffset,
       minDwellMs: MIN_DWELL_MS[state],
     };
+    // Cache the advance()-derived context so current() reflects the real
+    // derived parameters (lendingPct ramp, halfWidth, …) instead of the
+    // fabricated bootstrap defaults. See current().
+    lastCtx = ctx;
+    return ctx;
   }
 
   /**
@@ -248,7 +265,7 @@ export function createStateMachine(deps: {
     const { state, enteredAtMs } = internalState;
     const dwellOk = dwellElapsed(state, enteredAtMs, nowMs);
 
-    const uncertaintyHigh = pred.featureCompleteness < U_HIGH;
+    const uncertaintyHigh = pred.featureCompleteness < params.uHigh;
 
     if (uncertaintyHigh) {
       log.debug("state_machine: uncertainty high, tightening maxCenterOffset", {
@@ -257,33 +274,40 @@ export function createStateMachine(deps: {
       });
     }
 
+    // EXTREME entry is an EMERGENCY transition and deliberately bypasses the
+    // min-dwell gate: a flash crash or L2 circuit-breaker signal arriving 1
+    // minute after entering NORMAL/TREND must still escalate immediately.
+    // With dwell applied here (the pre-fix behaviour) the first 15 minutes of
+    // every state entry had EXTREME effectively disabled — the rebalancer's
+    // risk-bypass (G2) would run the tick, but advance() refused to escalate,
+    // so the protective full-withdrawal never fired. EXTREME *exit* below
+    // still respects dwell + stability + vol recovery.
+    if (state !== "EXTREME") {
+      const { enter, trigger } = shouldEnterExtreme(pred, extremeSignal, params);
+      if (enter) {
+        transition("EXTREME", trigger, nowMs);
+        return buildContext("EXTREME", internalState.enteredAtMs, pred);
+      }
+    }
+
     if (dwellOk) {
-      // Evaluate transitions in priority order:
-      //   Any state → EXTREME
+      // Evaluate non-emergency transitions in priority order:
       //   NORMAL → TREND
       //   TREND → NORMAL
       //   EXTREME → (prevState or NORMAL)
 
-      if (state !== "EXTREME") {
-        const { enter, trigger } = shouldEnterExtreme(pred, extremeSignal);
-        if (enter) {
-          transition("EXTREME", trigger, nowMs);
-          return buildContext("EXTREME", internalState.enteredAtMs, pred);
-        }
-      }
-
       if (state === "NORMAL") {
-        if (shouldEnterTrend(snapshot, pred)) {
+        if (shouldEnterTrend(snapshot, pred, params)) {
           const driftStrength = computeDriftStrength(snapshot);
-          const trigger = buildTrendEntryTrigger(snapshot, pred, driftStrength);
+          const trigger = buildTrendEntryTrigger(pred, driftStrength, params);
           transition("TREND", trigger, nowMs);
           return buildContext("TREND", internalState.enteredAtMs, pred);
         }
       }
 
       if (state === "TREND") {
-        // Check for EXTREME escalation first (already handled above for any state)
-        if (shouldExitTrend(snapshot, pred)) {
+        // EXTREME escalation is handled above (before the dwell gate).
+        if (shouldExitTrend(snapshot, pred, params)) {
           transition("NORMAL", "trend_exit: drift_strength and p_break both cleared", nowMs);
           return buildContext("NORMAL", internalState.enteredAtMs, pred);
         }
@@ -292,8 +316,8 @@ export function createStateMachine(deps: {
       if (state === "EXTREME") {
         // volRecovered is supplied by the caller (mlAgent via riskMonitor.volRecovered())
         // which runs the real canExitExtreme circuit-breaker check (F2: replacing the
-        // former p-sum proxy `pred.pAbove + pred.pBelow <= P_BREAK_SUM_EXTREME * (1 + EXTREME_VOL_HYSTERESIS)`
-        // which used hardcoded literals and had no actual volatility measurement).
+        // former p-sum proxy which used hardcoded literals and had no actual
+        // volatility measurement).
         if (
           shouldExitExtreme(
             pred,
@@ -301,6 +325,7 @@ export function createStateMachine(deps: {
             volRecovered,
             enteredAtMs,
             nowMs,
+            params,
           )
         ) {
           // Return to previous state if known, otherwise NORMAL
@@ -323,17 +348,24 @@ export function createStateMachine(deps: {
   }
 
   function current(): StateContext {
-    // Build a minimal context without a prediction (uses zero-defaults).
-    // Callers that need an accurate context should call advance() first.
+    // Return the last advance()-derived context when available — this carries
+    // the real derived parameters (lendingPct ramp, halfWidth from widthSigma)
+    // instead of fabricated defaults. The state fields are refreshed from
+    // internalState in case a transition happened after the cached buildContext.
+    if (lastCtx !== null && lastCtx.state === internalState.state) {
+      return lastCtx;
+    }
+    // Bootstrap (before the first advance()) or state changed without a fresh
+    // buildContext (cannot happen today — every transition rebuilds ctx — but
+    // guarded for safety): minimal conservative context.
     return {
       state: internalState.state,
       enteredAtMs: internalState.enteredAtMs,
       evalIntervalMs: EVAL_INTERVAL_MS[internalState.state],
       halfWidth: 2,           // minimum; real value requires widthSigma
       trendBias: 0,
-      lendingPct: internalState.state === "EXTREME" ? 1.0
-                : internalState.state === "TREND"   ? 0.50
-                : 0.35,
+      strongTrend: false,
+      lendingPct: deriveLendingPct(internalState.state, 0),
       toleranceBins: 1,
       maxCenterOffset: 1,     // conservative default; real value requires featureCompleteness
       minDwellMs: MIN_DWELL_MS[internalState.state],
@@ -348,17 +380,17 @@ export function createStateMachine(deps: {
 // ---------------------------------------------------------------------------
 
 function buildTrendEntryTrigger(
-  snapshot: MarketSnapshot,
   pred: PredictionResponse,
   driftStrength: number,
+  params: StateParams,
 ): string {
   const parts: string[] = [];
-  if (driftStrength > 2.0) {
-    parts.push(`drift_strength=${driftStrength.toFixed(4)}>2.0`);
+  if (driftStrength > params.driftStrengthEntry) {
+    parts.push(`drift_strength=${driftStrength.toFixed(4)}>${params.driftStrengthEntry}`);
   }
   const pBreak = Math.max(pred.pAbove, pred.pBelow);
-  if (pBreak > 0.6) {
-    parts.push(`p_break=${pBreak.toFixed(4)}>0.6`);
+  if (pBreak > params.pBreakEntry) {
+    parts.push(`p_break=${pBreak.toFixed(4)}>${params.pBreakEntry}`);
   }
   if (parts.length === 0) {
     parts.push(`drift_strength=${driftStrength.toFixed(4)}`);

@@ -5,6 +5,7 @@ import type {
   PriceObservation,
   RebalancePlan,
 } from "../domain/types.ts";
+import type { StateContext } from "../prediction/types.ts";
 
 export interface StrategyInput {
   pm: PMState;
@@ -32,11 +33,16 @@ export interface StrategyInput {
  * - `fillBoundary`: a bin id that bid-ask / only-bid strategies persist into
  *   `position_state` so the next tick knows which side of the active bin to
  *   leave idle. v0 strategies (singleBin, multiBinSpot) don't emit this.
+ * - `stateCtx`: the state-machine context that produced this output (mlAgent
+ *   only). Carries the advance()-derived `lendingPct` — including the TREND
+ *   ramp and any L1 soft-circuit bonus — so the rebalancer's lending router
+ *   uses the real target fraction instead of `stateMachine.current()`'s
+ *   coarser value. Rule-based strategies leave it undefined.
  */
 export type StrategyOutput =
-  | { kind: "plan_and_reconcile"; plan: RebalancePlan; fillBoundary?: number }
-  | { kind: "plan_only"; plan: RebalancePlan; fillBoundary?: number }
-  | { kind: "reconcile_only"; reason: string }
+  | { kind: "plan_and_reconcile"; plan: RebalancePlan; fillBoundary?: number; stateCtx?: StateContext }
+  | { kind: "plan_only"; plan: RebalancePlan; fillBoundary?: number; stateCtx?: StateContext }
+  | { kind: "reconcile_only"; reason: string; stateCtx?: StateContext }
   | { kind: "quiet"; reason: string };
 
 export interface Strategy {

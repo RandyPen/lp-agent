@@ -145,13 +145,13 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
           market_state, strategy_output_kind, strategy_output_json,
           rule_output_kind, rule_output_json,
           lending_pct, half_width, trend_bias,
-          model_version, created_at_ms
+          model_version, active_bin, spot_price, created_at_ms
         ) VALUES (
           ?, ?, ?,
           ?, ?, ?,
           ?, ?,
           ?, ?, ?,
-          ?, ?
+          ?, ?, ?, ?
         )
       `);
     }
@@ -208,6 +208,10 @@ export function createShadowRunner(deps: ShadowRunnerDeps): ShadowRunner {
         ctx.halfWidth,
         ctx.trendBias,
         strategyLabel,
+        // Decision-time anchors so the row can be SCORED later against
+        // price_observations (hypothetical in-range time — shadowReport.ts).
+        input.pool.activeBinId,
+        input.spot.price,
         nowFn(),
       );
 

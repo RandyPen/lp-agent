@@ -189,9 +189,19 @@ let _fakeDigestCounter = 0;
 export class FakeExecutorService implements ExecutorService {
   readonly submissions: RecordedPlan[] = [];
   private readonly now: () => number;
+  /** Canned dryRun result for estimateRemoveProceeds. Tests may override. */
+  removeProceeds: { a: bigint; b: bigint } = { a: 0n, b: 0n };
 
   constructor(now: () => number = () => Date.now()) {
     this.now = now;
+  }
+
+  async estimateRemoveProceeds(
+    plan: RebalancePlan,
+    _pm: PMState,
+  ): Promise<{ a: bigint; b: bigint }> {
+    if (plan.removeShares.size === 0) return { a: 0n, b: 0n };
+    return this.removeProceeds;
   }
 
   async submitUnifiedRebalance(input: UnifiedRebalanceInput): Promise<ExecutionResult> {

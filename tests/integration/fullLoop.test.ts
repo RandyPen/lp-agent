@@ -62,6 +62,10 @@ const DEFAULT_THRESHOLDS: RiskThresholds = {
   pnl24hPct: -0.05,
   l1SpreadSoftBandLow: 0.005,
   l1SpreadSoftBandHigh: 0.01,
+  volatilityRecovery: 0.07,
+  sourceStaleSuiMs: 60_000,
+  sourceStaleCetusMs: 180_000,
+  sourceStaleDerivMs: 600_000,
 };
 
 /**

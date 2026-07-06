@@ -30,7 +30,10 @@ import type { RiskMonitor } from "../risk/monitor.ts";
 import type { MarketAggregator } from "../data/marketAggregator.ts";
 import type { Database } from "bun:sqlite";
 import { DataOutageError } from "../data/marketAggregator.ts";
-import { diffPlan } from "../decision/diffPlanner.ts";
+import { buildExtremeWithdrawPlan, diffPlan, type DiffPlanInput } from "../decision/diffPlanner.ts";
+import { evaluateAllLots, getForceLiquidations } from "../decision/ageStopLoss.ts";
+import { loadOpenLots } from "../decision/lotStore.ts";
+import { binDirection, orientationOf } from "../domain/binMath.ts";
 import { log } from "../lib/logger.ts";
 import type { PmRangeContext } from "../prediction/types.ts";
 import type { ExtremeSignal } from "../state/transitions.ts";
@@ -405,8 +408,38 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
 
       // -----------------------------------------------------------------------
       // Delegate to fallback when degraded or in probation.
+      //
+      // CRITICAL: the L2 EXTREME veto must survive delegation. The fallback
+      // strategies have no EXTREME concept, so returning fallback.plan()
+      // unconditionally would drop the protective full-withdrawal exactly when
+      // the sidecar is down — which is often correlated with market stress.
       // -----------------------------------------------------------------------
       if (isFallback || inProbation[poolId]) {
+        if (veto?.kind === "extreme") {
+          const withdrawPlan = buildExtremeWithdrawPlan(
+            input.pm,
+            `EXTREME full withdrawal (L2 during fallback): ${veto.trigger}`,
+          );
+          if (!withdrawPlan) {
+            return {
+              kind: "quiet",
+              reason: `L2 EXTREME active during fallback (nothing to withdraw): ${veto.trigger}`,
+            };
+          }
+          log.warn("mlAgent: L2 EXTREME during fallback — issuing full withdrawal", {
+            poolId,
+            trigger: veto.trigger,
+          });
+          return { kind: "plan_and_reconcile", plan: withdrawPlan, fillBoundary: input.pool.activeBinId };
+        }
+        if (veto?.kind === "soft") {
+          // Rule strategies have no halfWidth knob — the L1 soft adjustments
+          // are not applicable. Logged as a known limitation; the lending-pct
+          // bonus is likewise dropped on this path.
+          log.info("mlAgent: L1 soft circuit active during fallback (adjustments not applicable)", {
+            poolId,
+          });
+        }
         return fallback.plan(input);
       }
 
@@ -450,7 +483,67 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
           profile: input.profile,
         });
         if (!plan) return { kind: "quiet", reason: "EXTREME: below min threshold" };
-        return { kind: "plan_and_reconcile", plan, fillBoundary: input.pool.activeBinId };
+        return {
+          kind: "plan_and_reconcile",
+          plan,
+          fillBoundary: input.pool.activeBinId,
+          stateCtx: adjustedCtx,
+        };
+      }
+
+      // -----------------------------------------------------------------------
+      // Age stop-loss (C2): evaluate the lot book and derive directives for
+      // the planner. Skipped without a DB (no lot persistence) and on the
+      // EXTREME path above (full withdrawal supersedes any stop-loss).
+      // -----------------------------------------------------------------------
+      let stopLoss: DiffPlanInput["stopLoss"];
+      if (db) {
+        try {
+          const lots = loadOpenLots(db, input.pm.pmId);
+          if (lots.length > 0) {
+            const dir = binDirection(orientationOf(input.profile));
+            const priceCtx = {
+              activeBin: input.pool.activeBinId,
+              currentMidPrice: Number(input.spot.price),
+              binStep: input.pool.binStep,
+              direction: dir,
+            };
+            const decisions = evaluateAllLots(lots, priceCtx, nowFn());
+            const forced = getForceLiquidations(decisions);
+            const relaxed = decisions.filter(
+              (d): d is Extract<typeof d, { kind: "relax_ask_floor" }> =>
+                d.kind === "relax_ask_floor",
+            );
+            if (forced.length > 0 || relaxed.length > 0) {
+              // The operative relaxed floor is the one CLOSEST to active in
+              // the rising-price direction (the least demanding minimum).
+              const floors = relaxed.map((d) => d.relaxedAskBinId);
+              const relaxedAskFloorBin =
+                floors.length === 0
+                  ? null
+                  : dir === 1
+                    ? Math.min(...floors)
+                    : Math.max(...floors);
+              stopLoss = {
+                relaxedAskFloorBin,
+                forceLiquidationBins: [...new Set(forced.map((f) => f.forcedAskBinId))],
+              };
+              log.warn("mlAgent: age stop-loss active", {
+                poolId,
+                pmId: input.pm.pmId,
+                forced: forced.length,
+                relaxed: relaxed.length,
+                reasons: [...forced, ...relaxed].slice(0, 3).map((d) => d.reason),
+              });
+            }
+          }
+        } catch (lotErr) {
+          // Lot bookkeeping must never veto a tick — log loudly and proceed.
+          log.error("mlAgent: lot evaluation failed, proceeding without stop-loss", {
+            poolId,
+            err: String(lotErr),
+          });
+        }
       }
 
       // -----------------------------------------------------------------------
@@ -462,6 +555,7 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
         ctx: adjustedCtx,
         pred,
         profile: input.profile,
+        stopLoss,
       });
       if (!plan) return { kind: "quiet", reason: "below min threshold" };
 
@@ -472,6 +566,7 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
         kind: "plan_and_reconcile",
         plan,
         fillBoundary,
+        stateCtx: adjustedCtx,
       };
     },
   };

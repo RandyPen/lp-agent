@@ -34,6 +34,13 @@ export interface RiskObserverDeps {
   intervalMs?: number;
   /** Injectable clock for deterministic tests. */
   now?: () => number;
+  /**
+   * Optional 24h PnL fraction source (from the PnL attribution service).
+   * When it returns a non-null fraction the observer feeds `set24hPnl` on
+   * every sample, keeping the L2 daily-loss circuit live at observer cadence
+   * (~30 s) for ALL strategies — not only on mlAgent plan ticks.
+   */
+  get24hPnlPct?: (poolId: string) => number | null;
 }
 
 export interface RiskObserver {
@@ -61,12 +68,30 @@ export function createRiskObserver(deps: RiskObserverDeps): RiskObserver {
   const intervalMs = resolveInterval(deps.intervalMs);
 
   function sampleOnce(): void {
+    // Feed per-source staleness FIRST — before latest() can throw. During a
+    // total outage this is the only signal the monitor receives, and it is
+    // exactly what lets the staleness circuits (and the L3 outage condition)
+    // fire while no snapshots arrive. staleness() never throws.
+    const staleness = marketAggregator.staleness();
+    riskMonitor.observeSourceStaleness(poolId, staleness);
+    shadowRiskMonitor?.observeSourceStaleness(poolId, staleness);
+
+    // Feed the 24h PnL fraction when a genuine source is wired. null = no
+    // data (never fabricate a value; the circuit stays honestly inert).
+    if (deps.get24hPnlPct) {
+      const pnlPct = deps.get24hPnlPct(poolId);
+      if (pnlPct !== null) {
+        riskMonitor.set24hPnl(poolId, pnlPct);
+        shadowRiskMonitor?.set24hPnl(poolId, pnlPct);
+      }
+    }
+
     let snapshot;
     try {
       snapshot = marketAggregator.latest();
     } catch (err) {
       if (err instanceof DataOutageError) {
-        log.warn("riskObserver: DataOutageError, skipping sample", {
+        log.warn("riskObserver: DataOutageError, skipping snapshot sample", {
           poolId,
           reason: err.message,
         });

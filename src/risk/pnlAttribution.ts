@@ -203,3 +203,51 @@ export function createPnlAttributor(deps: PnlAttributorDeps = {}): PnlAttributor
 
   return { record, summarize, ticks, evictBefore };
 }
+
+// ---------------------------------------------------------------------------
+// 24h PnL-percentage source (the seam the risk monitor consumes)
+// ---------------------------------------------------------------------------
+
+/**
+ * The seam consumed by `mlAgent` (deps.get24hPnlPct) and the riskObserver:
+ * returns the pool's 24h PnL as a FRACTION of NAV (e.g. -0.05 = -5%), or
+ * null when it cannot be computed honestly.
+ */
+export type Get24hPnlPct = (poolId: string) => number | null;
+
+export interface Pnl24hPctSourceDeps {
+  attributor: PnlAttributor;
+  /**
+   * Current portfolio NAV in USD for the pool. Return null when unknown —
+   * the source then returns null rather than fabricating a denominator.
+   */
+  getNavUsd: (poolId: string) => number | null;
+  /** Injectable clock for deterministic tests. Defaults to Date.now. */
+  nowMs?: () => number;
+}
+
+/**
+ * Build a `Get24hPnlPct` from a PnlAttributor + NAV provider.
+ *
+ * Honesty rules (feeds the L2 `pnl_24h` and L3 catastrophic-PnL circuits, so
+ * a fabricated value is worse than no value):
+ *   - null when NAV is unknown or ≤ 0 (no denominator);
+ *   - null when the attributor has zero ticks in the 24h window (no data —
+ *     an empty window must NOT read as "0% PnL");
+ *   - otherwise `summarize(poolId, now-24h).netPnl / nav`.
+ */
+export function createPnl24hPctSource(deps: Pnl24hPctSourceDeps): Get24hPnlPct {
+  const nowMs = deps.nowMs ?? (() => Date.now());
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  return (poolId: string): number | null => {
+    const nav = deps.getNavUsd(poolId);
+    if (nav === null || !Number.isFinite(nav) || nav <= 0) return null;
+
+    const now = nowMs();
+    const summary = deps.attributor.summarize(poolId, now - DAY_MS, now);
+    if (summary.tickCount === 0) return null;
+
+    return summary.netPnl / nav;
+  };
+}

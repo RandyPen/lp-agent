@@ -8,8 +8,11 @@
  *                      → reduce exposure (lendingPctBonusPp=10, halfWidthFactor=0.7)
  *   L2 hard circuit  — EXTREME triggers per §5.3 of implementation-plan-v1.md:
  *                      price volatility, TVL drop, spread sustained, pBreakSum,
- *                      24h PnL, all-source data outage
- *   L3 emergency     — manual trip via EmergencyStop; checked first in checkPreTick
+ *                      24h PnL, all-source data outage, per-source staleness
+ *   L3 emergency     — EmergencyStop latch; auto-tripped by evaluateL3
+ *                      (repeated L2 / outage-with-position / catastrophic PnL,
+ *                      thresholds in cfg.risk.l3) and by the rebalancer on
+ *                      repeated tx failures; manual reset only
  *
  * Every veto is persisted to `risk_events` (pool_id, pm_id nullable, level,
  * kind, metric, threshold, observed, action) and logged via `log`.
@@ -19,18 +22,21 @@
 
 import type { Database } from "bun:sqlite";
 import { log } from "../lib/logger.ts";
-import type { RiskThresholds } from "../config.ts";
+import type { L3Thresholds, RiskThresholds } from "../config.ts";
 import type { MarketSnapshot, PredictionResponse } from "../prediction/types.ts";
 import type { StrategyInput } from "../strategies/types.ts";
+import type { StalenessInfo } from "../data/marketAggregator.ts";
 import {
   checkDataOutage,
   checkPBreakSum,
   checkPnl24h,
+  checkSourceStaleness,
   checkSpreadSustained,
   checkTvlDrop5m,
   checkVolatility5m,
   canExitExtreme,
   type PricePoint,
+  type SourceStalenessInput,
   type SpreadPoint,
   type TvlPoint,
   type TriggerResult,
@@ -66,6 +72,14 @@ export interface RiskMonitor {
    */
   observeForPool(poolId: string, snapshot: MarketSnapshot, pred?: PredictionResponse): void;
   /**
+   * Feed a per-source staleness sample (from `marketAggregator.staleness()`)
+   * for the pool. Unlike `observeForPool` — which requires a successful
+   * `latest()` — this MUST be callable even during a data outage, so a dead
+   * feed can trip the L2 circuit while no snapshots arrive. Immediately
+   * re-evaluates L2 for the pool.
+   */
+  observeSourceStaleness(poolId: string, staleness: StalenessInfo): void;
+  /**
    * Set the 24-hour PnL fraction for a pool. The value must be a fraction
    * (e.g. -0.05 = -5%). Only call this when a genuine PnL-pct figure is
    * available (e.g. from a PnL-attribution service); do not fabricate a value
@@ -89,6 +103,13 @@ export interface RiskMonitor {
    * currently active.
    */
   activeLevel(poolId: string): "L1" | "L2" | "L3" | null;
+  /**
+   * The L3 emergency-stop latch. Exposed so the rebalancer can trip it on
+   * repeated tx failures and so ops tooling gets typed access. Auto-trip
+   * conditions (repeated L2, outage with open position, catastrophic PnL)
+   * are evaluated inside `checkPreTick`.
+   */
+  readonly emergencyStop: EmergencyStop;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,6 +144,13 @@ interface PoolRiskState {
   extremeEnteredAtMs: number | null;
   /** Whether L1 soft circuit is currently active. */
   softActive: boolean;
+  /**
+   * Epoch-ms timestamps of recent L2 EXTREME entries, pruned to the L3
+   * repeated-L2 window. Feeds the L3 repeated-activation trip condition.
+   */
+  l2EnteredTimestamps: number[];
+  /** Latest per-source staleness sample (null before first observation). */
+  latestSourceStaleness: SourceStalenessInput | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,8 +165,6 @@ const SPREAD_LOOKBACK_MS = 2 * 60 * 1000; // 2 min, wider than 30s sustain thres
 const DATA_STALE_THRESHOLD_MS = 60_000;
 /** Stable period required before exiting EXTREME (10 min). */
 const EXTREME_STABLE_REQUIRED_MS = 10 * 60 * 1000;
-/** Volatility hysteresis: exit threshold (7%) vs entry threshold (10%). */
-const VOLATILITY_RECOVERY_THRESHOLD = 0.07;
 /** Max window entries to keep per pool (prune oldest when exceeded). */
 const MAX_WINDOW_ENTRIES = 500;
 /**
@@ -152,13 +178,35 @@ const PRED_STALE_THRESHOLD_MS = 2 * 20 * 60 * 1000; // 40 min
 // Factory
 // ---------------------------------------------------------------------------
 
+/**
+ * Default L3 trip thresholds — mirror the config-level defaults
+ * (RISK_L3_* env vars). Deployments always pass `cfg.risk.l3`; the default
+ * here exists so tests and library consumers get sane protection without
+ * threading the full config.
+ */
+export const DEFAULT_L3_THRESHOLDS: L3Thresholds = {
+  repeatedL2Count: 3,
+  repeatedL2WindowMs: 3_600_000,
+  outageMs: 300_000,
+  pnlPct: -0.15,
+  txFailureCount: 5,
+};
+
 export interface RiskMonitorDeps {
   db: Database;
   thresholds: RiskThresholds;
+  /** L3 emergency trip thresholds. Defaults to DEFAULT_L3_THRESHOLDS. */
+  l3?: L3Thresholds;
   /** Injectable clock for deterministic tests. */
   nowMs?: () => number;
   /** Optional pre-created emergency stop. If omitted, one is created internally. */
   emergencyStop?: EmergencyStop;
+  /**
+   * Origin tag stamped onto every risk_events row this monitor writes.
+   * The shadow risk monitor MUST pass "shadow" so live risk analytics can
+   * filter on source='live' instead of relying on timestamp correlation.
+   */
+  source?: "live" | "shadow";
 }
 
 /**
@@ -167,6 +215,8 @@ export interface RiskMonitorDeps {
  */
 export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   const { db, thresholds } = deps;
+  const l3 = deps.l3 ?? DEFAULT_L3_THRESHOLDS;
+  const source = deps.source ?? "live";
   const nowMs = deps.nowMs ?? (() => Date.now());
   const emergencyStop = deps.emergencyStop ?? createEmergencyStop({ db, nowMs });
 
@@ -186,10 +236,11 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       threshold: number,
       observed: number,
       action: string,
+      source: string,
     ]
   >(
-    `INSERT INTO risk_events (pool_id, pm_id, ts_ms, level, kind, metric, threshold, observed, action)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO risk_events (pool_id, pm_id, ts_ms, level, kind, metric, threshold, observed, action, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
 
   function getOrCreatePoolState(poolId: string): PoolRiskState {
@@ -207,6 +258,8 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         extremeActive: false,
         extremeEnteredAtMs: null,
         softActive: false,
+        l2EnteredTimestamps: [],
+        latestSourceStaleness: null,
       };
       poolStates.set(poolId, state);
     }
@@ -230,7 +283,7 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     action: string,
   ): void {
     try {
-      insertEvent.run(poolId, pmId, nowMs(), level, kind, metric, threshold, observed, action);
+      insertEvent.run(poolId, pmId, nowMs(), level, kind, metric, threshold, observed, action, source);
     } catch (err) {
       log.error("risk/monitor: failed to persist risk_event", {
         level,
@@ -336,9 +389,21 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     const pnlResult = checkPnl24h(state.latest24hPnl, thresholds.pnl24hPct);
     triggerResults.push(pnlResult);
 
-    // --- Data outage trigger ---
-    const outageResult = checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now);
-    triggerResults.push(outageResult);
+    // --- Data outage trigger (aggregate max-of-sources timestamp) ---
+    // Only meaningful once data has flowed at least once: a cold-start monitor
+    // (latestSnapshotTs === null) is "not yet warmed", not "in outage" —
+    // treating it as an outage would flap EXTREME on every process start.
+    // A feed that never comes up IS caught: the per-source staleness triggers
+    // below fire on the real aggregator's never-updated sentinel.
+    if (state.latestSnapshotTs !== null) {
+      triggerResults.push(checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now));
+    }
+
+    // --- Per-source staleness triggers ---
+    // The aggregate check above is masked when any single feed stays fresh;
+    // these fire when an individual source (binance-sui / cetus / derivatives)
+    // goes quiet beyond its own threshold.
+    triggerResults.push(...sourceStalenessResults(state, now));
 
     const anyFires = triggerResults.some((r) => r.fires);
 
@@ -346,6 +411,12 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       // Enter EXTREME
       state.extremeActive = true;
       state.extremeEnteredAtMs = now;
+      // Record the entry for the L3 repeated-L2 trip condition.
+      state.l2EnteredTimestamps.push(now);
+      const l2Cutoff = now - l3.repeatedL2WindowMs;
+      while (state.l2EnteredTimestamps.length > 0 && state.l2EnteredTimestamps[0]! < l2Cutoff) {
+        state.l2EnteredTimestamps.shift();
+      }
       for (const r of triggerResults.filter((x) => x.fires)) {
         persistRiskEvent(
           poolId,
@@ -372,7 +443,7 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         enteredAtMs: state.extremeEnteredAtMs ?? now,
         stableRequiredMs: EXTREME_STABLE_REQUIRED_MS,
         nowMs: now,
-        volatilityRecoveryThreshold: VOLATILITY_RECOVERY_THRESHOLD,
+        volatilityRecoveryThreshold: thresholds.volatilityRecovery,
         currentVolatility5m: volResult5m.observed,
       });
       if (canExit) {
@@ -391,6 +462,33 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         log.info("risk/monitor: L2 EXTREME cleared", { poolId });
       }
     }
+  }
+
+  /** Per-source staleness trigger results for the pool's latest sample. */
+  function sourceStalenessResults(state: PoolRiskState, now: number): TriggerResult[] {
+    return checkSourceStaleness(
+      state.latestSourceStaleness,
+      {
+        suiMs: thresholds.sourceStaleSuiMs,
+        cetusMs: thresholds.sourceStaleCetusMs,
+        derivMs: thresholds.sourceStaleDerivMs,
+      },
+      now,
+    );
+  }
+
+  function observeSourceStaleness(poolId: string, staleness: StalenessInfo): void {
+    const state = getOrCreatePoolState(poolId);
+    state.latestSourceStaleness = {
+      capturedAtMs: nowMs(),
+      sui: staleness.sui,
+      cetus: staleness.cetus,
+      derivatives: staleness.derivatives,
+    };
+    // Re-evaluate L2 immediately: during a feed outage `observeForPool` never
+    // fires (marketAggregator.latest() throws), so this is the only path that
+    // can trip the circuit while data is missing.
+    evaluateL2(poolId, state);
   }
 
   function evaluateL1(poolId: string, state: PoolRiskState, spread: number): void {
@@ -436,7 +534,80 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   // checkPreTick()
   // ---------------------------------------------------------------------------
 
+  /**
+   * Evaluate the automatic L3 trip conditions for a pool. Called at the top of
+   * every checkPreTick, BEFORE the isTripped() gate, so a freshly-satisfied
+   * condition trips the latch and the same tick returns the emergency veto.
+   *
+   * Conditions (any one trips):
+   *   1. Repeated L2: EXTREME entered ≥ l3.repeatedL2Count times within
+   *      l3.repeatedL2WindowMs — the market (or a flapping feed) keeps
+   *      breaching hard circuits; stop trusting automation.
+   *   2. Data outage with an open position: no snapshot for > l3.outageMs
+   *      while the PM still has liquidity deployed — we are blind AND exposed.
+   *      Requires data to have flowed at least once (a never-fed monitor on a
+   *      cold start must not trip).
+   *   3. Catastrophic 24h PnL: latest24hPnl < l3.pnlPct (more negative than
+   *      the L2 daily-loss threshold). Inert until a PnL source is wired.
+   */
+  function evaluateL3(input: StrategyInput, state: PoolRiskState): void {
+    if (emergencyStop.isTripped()) return;
+    const poolId = input.pm.poolId;
+    const pmId = input.pm.pmId;
+    const now = nowMs();
+
+    // 1. Repeated L2 within window
+    const cutoff = now - l3.repeatedL2WindowMs;
+    const recentL2 = state.l2EnteredTimestamps.filter((t) => t >= cutoff);
+    if (recentL2.length >= l3.repeatedL2Count) {
+      persistRiskEvent(
+        poolId, pmId, "L3", "emergency_trip", "repeated_l2",
+        l3.repeatedL2Count, recentL2.length, "trip_emergency_stop",
+      );
+      emergencyStop.trip(
+        `repeated L2: ${recentL2.length} EXTREME activations within ${l3.repeatedL2WindowMs}ms for pool ${poolId}`,
+      );
+      return;
+    }
+
+    // 2. Data outage while a position is open
+    if (
+      state.latestSnapshotTs !== null &&
+      now - state.latestSnapshotTs > l3.outageMs &&
+      input.pm.positionBins.length > 0
+    ) {
+      const observed = now - state.latestSnapshotTs;
+      persistRiskEvent(
+        poolId, pmId, "L3", "emergency_trip", "outage_with_position",
+        l3.outageMs, observed, "trip_emergency_stop",
+      );
+      emergencyStop.trip(
+        `data outage ${observed}ms (> ${l3.outageMs}ms) with open position on pool ${poolId}`,
+      );
+      return;
+    }
+
+    // 3. Catastrophic PnL
+    if (state.latest24hPnl < l3.pnlPct) {
+      persistRiskEvent(
+        poolId, pmId, "L3", "emergency_trip", "pnl_catastrophic",
+        l3.pnlPct, state.latest24hPnl, "trip_emergency_stop",
+      );
+      emergencyStop.trip(
+        `24h PnL ${state.latest24hPnl} below catastrophic threshold ${l3.pnlPct} for pool ${poolId}`,
+      );
+    }
+  }
+
   function checkPreTick(input: StrategyInput): RiskVeto | null {
+    const poolId = input.pm.poolId;
+    const pmId = input.pm.pmId;
+    const state = getOrCreatePoolState(poolId);
+
+    // Evaluate automatic L3 trip conditions before the latch gate — a
+    // condition satisfied right now must veto this very tick.
+    evaluateL3(input, state);
+
     // L3 check first — highest priority
     if (emergencyStop.isTripped()) {
       return {
@@ -445,10 +616,6 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         reason: "emergency stop is active",
       };
     }
-
-    const poolId = input.pm.poolId;
-    const pmId = input.pm.pmId;
-    const state = getOrCreatePoolState(poolId);
 
     // L2 check
     if (state.extremeActive) {
@@ -461,7 +628,6 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         thresholds.spreadSustainMs,
         now,
       );
-      const outageResult = checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now);
       const pnlResult = checkPnl24h(state.latest24hPnl, thresholds.pnl24hPct);
       // Only include the pBreakSum check when the stored prediction is fresh
       // enough to be meaningful (F7: skip when older than 2× NORMAL eval interval).
@@ -473,7 +639,12 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         : null;
 
       // Find the first firing trigger for the reason string
-      const allTriggers = [volResult, tvlResult, spreadResult, outageResult, pnlResult];
+      const allTriggers = [volResult, tvlResult, spreadResult, pnlResult];
+      // Cold-start guard: see evaluateL2 — never-fed ≠ outage.
+      if (state.latestSnapshotTs !== null) {
+        allTriggers.push(checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now));
+      }
+      allTriggers.push(...sourceStalenessResults(state, now));
       if (pBreakResult !== null) allTriggers.push(pBreakResult);
       const firing = allTriggers.find((r) => r.fires);
 
@@ -562,9 +733,13 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       thresholds.spreadSustainMs,
       now,
     );
-    const outageResult = checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now);
     const pnlResult = checkPnl24h(state.latest24hPnl, thresholds.pnl24hPct);
-    const triggerResults = [volResult, tvlResult, spreadResult, outageResult, pnlResult];
+    const triggerResults = [volResult, tvlResult, spreadResult, pnlResult];
+    // Cold-start guard: see evaluateL2 — never-fed ≠ outage.
+    if (state.latestSnapshotTs !== null) {
+      triggerResults.push(checkDataOutage(state.latestSnapshotTs, DATA_STALE_THRESHOLD_MS, now));
+    }
+    triggerResults.push(...sourceStalenessResults(state, now));
     const predIsFresh =
       state.latestPredTs !== null &&
       now - state.latestPredTs < PRED_STALE_THRESHOLD_MS;
@@ -577,7 +752,7 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
       enteredAtMs: state.extremeEnteredAtMs ?? now,
       stableRequiredMs: EXTREME_STABLE_REQUIRED_MS,
       nowMs: now,
-      volatilityRecoveryThreshold: VOLATILITY_RECOVERY_THRESHOLD,
+      volatilityRecoveryThreshold: thresholds.volatilityRecovery,
       currentVolatility5m: volResult.observed,
     });
   }
@@ -586,9 +761,10 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   // Return the RiskMonitor interface
   // ---------------------------------------------------------------------------
 
-  const monitor: RiskMonitor & { emergencyStop: EmergencyStop } = {
+  const monitor: RiskMonitor = {
     checkPreTick,
     observeForPool,
+    observeSourceStaleness,
     set24hPnl(poolId: string, pnlFraction: number): void {
       const state = getOrCreatePoolState(poolId);
       state.latest24hPnl = pnlFraction;

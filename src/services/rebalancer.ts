@@ -5,10 +5,15 @@ import { getPositionManager, isAgentAuthorized } from "../sui/cdpm/read.ts";
 import { getPoolState } from "../sui/pool.ts";
 import { withLock } from "../lib/locks.ts";
 import { log } from "../lib/logger.ts";
-import { buildStrategy } from "../strategies/registry.ts";
+import { buildStrategy, type StrategyName } from "../strategies/registry.ts";
 import type { MlAgentDeps } from "../strategies/registry.ts";
 import { saveFillBoundary } from "../strategies/positionState.ts";
-import type { Strategy } from "../strategies/types.ts";
+import type { Strategy, StrategyInput, StrategyOutput } from "../strategies/types.ts";
+import { buildExtremeWithdrawPlan } from "../decision/diffPlanner.ts";
+import { rescalePlanToAvailable } from "../decision/planMath.ts";
+import { syncLotsAfterRebalance } from "../decision/lotStore.ts";
+import type { PnlService } from "./pnlService.ts";
+import type { RiskMonitor } from "../risk/monitor.ts";
 import { decide as routeLending } from "../sui/lending/router.ts";
 import { canLend } from "../sui/lending/lendingConfig.ts";
 import type { LendingDecision } from "../sui/lending/types.ts";
@@ -45,6 +50,8 @@ function serializePlan(plan: RebalancePlan): string {
     addAmountsB: plan.addAmountsB,
     collectFees: plan.collectFees,
     reason: plan.reason,
+    plannedActiveBinId: plan.plannedActiveBinId ?? null,
+    priority: plan.priority ?? "normal",
   };
   return JSON.stringify(plain, bigintReplacer);
 }
@@ -88,12 +95,15 @@ function recordLendingAction(
  */
 export function getEffectiveCooldownMs(
   cfg: ReturnType<typeof loadConfig>,
+  liveStrategyName: StrategyName,
   mlDeps?: MlAgentDeps,
 ): number {
-  // When mlAgent is active, the state machine drives evaluation timing.
-  // `current()` is always callable — before the first `advance()` it returns
-  // the machine's minimum viable NORMAL context.
-  if (cfg.strategy === "mlAgent" && mlDeps) {
+  // When mlAgent is the LIVE strategy, the state machine drives evaluation
+  // timing. `current()` is always callable — before the first `advance()` it
+  // returns the machine's minimum viable NORMAL context. Note: this keys off
+  // the live strategy, not cfg.strategy — in shadow mode the live strategy is
+  // the fallback even when cfg.strategy === "mlAgent".
+  if (liveStrategyName === "mlAgent" && mlDeps) {
     return mlDeps.stateMachine.current().evalIntervalMs;
   }
   return cfg.perPmCooldownMs;
@@ -205,14 +215,39 @@ export function computeShortfall(
   return needed > usable ? needed - usable : 0n;
 }
 
+export interface RebalancerOpts {
+  /**
+   * Risk monitor for the live path — REQUIRED. Risk controls apply to every
+   * live strategy, not only mlAgent: the rebalancer runs the pre-tick veto
+   * for rule-based strategies (mlAgent runs it internally) and trips the L3
+   * latch on repeated tx failures.
+   */
+  riskMonitor: RiskMonitor;
+  /**
+   * The strategy that actually trades. Differs from cfg.strategy when shadow
+   * mode is on with STRATEGY=mlAgent (live runs the fallback strategy).
+   */
+  liveStrategyName: StrategyName;
+  /** ML dependency graph — required when liveStrategyName === "mlAgent". */
+  mlDeps?: MlAgentDeps;
+  /**
+   * PnL accounting (D1). When present, every evaluated tick records a
+   * `pnl_ticks` NAV sample (quiet ticks included — the 24h mark-to-market
+   * window needs continuous coverage) and executed rebalances additionally
+   * record fee income, treasury cost, and realized IL.
+   */
+  pnlService?: PnlService;
+}
+
 export function createRebalancerService(
   subscriptions: SubscriptionsService,
   executor: ExecutorService,
   priceFeed: PriceFeed,
-  mlDeps?: MlAgentDeps,
+  opts: RebalancerOpts,
 ): RebalancerService {
   const cfg = loadConfig();
-  const strategy: Strategy = buildStrategy(cfg.strategy, mlDeps);
+  const { riskMonitor, liveStrategyName, mlDeps, pnlService } = opts;
+  const strategy: Strategy = buildStrategy(liveStrategyName, mlDeps);
   log.info("rebalancer: strategy selected", { name: strategy.name });
   const agentAddress = getAgentAddress();
 
@@ -223,6 +258,46 @@ export function createRebalancerService(
   // immediately on the first scheduler heartbeat.
   const lastEvalMs = new Map<string, number>();
 
+  // Consecutive on-chain failure counter per PM. Reaching
+  // cfg.risk.l3.txFailureCount trips the L3 emergency stop — repeated tx
+  // failures mean something is systematically wrong (RPC, contract upgrade,
+  // corrupted plan math) and automation must stop until an operator looks.
+  const consecutiveTxFailures = new Map<string, number>();
+
+  /**
+   * Record a pnl_ticks NAV sample (D1). Accounting must never abort a tick —
+   * failures are logged at error level and swallowed.
+   */
+  function recordPnlTick(args: {
+    pm: PMState;
+    spotPrice: number;
+    feeIncomeUsd?: number;
+    costCredits?: number;
+    ilUsd?: number | null;
+    marketState?: "NORMAL" | "TREND" | "EXTREME";
+    rebalanceId?: number | null;
+  }): void {
+    if (!pnlService) return;
+    try {
+      pnlService.recordTick({
+        poolId: args.pm.poolId || cfg.poolProfile.poolId,
+        pmId: args.pm.pmId,
+        tsMs: Date.now(),
+        feeIncomeUsd: args.feeIncomeUsd ?? 0,
+        costCredits: args.costCredits ?? 0,
+        navUsd: pnlService.computeNavUsd(args.pm, args.spotPrice),
+        ilUsd: args.ilUsd ?? null,
+        marketState: args.marketState ?? null,
+        rebalanceId: args.rebalanceId ?? null,
+      });
+    } catch (err: unknown) {
+      log.error("rebalancer: pnl tick recording failed", {
+        pmId: args.pm.pmId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   async function tickOne(pmId: string): Promise<void> {
     // Short correlation id so every log line + DB row produced by this tick
     // can be threaded together. Crockford-base32-ish — readable in journals.
@@ -231,7 +306,7 @@ export function createRebalancerService(
       const db = getDb();
 
       // Effective cooldown — for mlAgent the state machine provides the interval.
-      const effectiveCooldown = getEffectiveCooldownMs(cfg, mlDeps);
+      const effectiveCooldown = getEffectiveCooldownMs(cfg, liveStrategyName, mlDeps);
 
       // G2 fix: when L2 or L3 risk is active for the pool, bypass the eval-interval
       // cooldown so the next scheduler heartbeat evaluates immediately. We check the
@@ -244,9 +319,7 @@ export function createRebalancerService(
       // slot — anchoring on last-success would re-evaluate immediately after every
       // quiet tick, defeating the cooldown.
       const poolIdForPm = subscriptions.listActive().find((s) => s.pmId === pmId)?.poolId;
-      const riskLevel = poolIdForPm && mlDeps
-        ? mlDeps.riskMonitor.activeLevel(poolIdForPm)
-        : null;
+      const riskLevel = poolIdForPm ? riskMonitor.activeLevel(poolIdForPm) : null;
       const riskActive = riskLevel === "L2" || riskLevel === "L3";
 
       const lastEval = lastEvalMs.get(pmId) ?? 0;
@@ -293,18 +366,64 @@ export function createRebalancerService(
       const spot = await priceFeed.getSpot();
       const history = await priceFeed.getHistory(5 * 60 * 1000); // 5-minute window
 
-      // Strategy decision.
-      const output = await strategy.plan({
+      const strategyInput: StrategyInput = {
         pm,
         pool,
         spot,
         history,
         profile: cfg.poolProfile,
-      });
+      };
 
-      // Quiet path: nothing to do.
+      // Pre-tick risk veto for RULE-BASED strategies. mlAgent runs
+      // checkPreTick internally (and persists its own veto rows), so running
+      // it here too would double-persist; every other strategy has no risk
+      // awareness at all and gets it from the rebalancer:
+      //   L3 → no on-chain operations this tick.
+      //   L2 → bypass the strategy entirely; issue the protective
+      //        full-withdrawal plan (lendingPct 1.0 comes from the EXTREME
+      //        semantics of deployIdleViaLending post-remove).
+      //   L1 → log and proceed (rule strategies have no halfWidth knob).
+      let output: StrategyOutput;
+      if (strategy.name !== "mlAgent") {
+        const veto = riskMonitor.checkPreTick(strategyInput);
+        if (veto?.kind === "emergency") {
+          log.warn("rebalancer: L3 emergency veto — skipping tick", {
+            tickId, pmId, reason: veto.reason,
+          });
+          return;
+        }
+        if (veto?.kind === "extreme") {
+          const withdrawPlan = buildExtremeWithdrawPlan(
+            pm,
+            `EXTREME full withdrawal (L2, rule path): ${veto.trigger}`,
+          );
+          if (!withdrawPlan) {
+            log.info("rebalancer: L2 EXTREME active but nothing to withdraw", {
+              tickId, pmId, trigger: veto.trigger,
+            });
+            return;
+          }
+          log.warn("rebalancer: L2 EXTREME — issuing full withdrawal (rule path)", {
+            tickId, pmId, trigger: veto.trigger,
+          });
+          output = { kind: "plan_and_reconcile", plan: withdrawPlan };
+        } else {
+          if (veto?.kind === "soft") {
+            log.info("rebalancer: L1 soft circuit active (rule path — no adjustments applicable)", {
+              tickId, pmId, reason: veto.reason,
+            });
+          }
+          output = await strategy.plan(strategyInput);
+        }
+      } else {
+        output = await strategy.plan(strategyInput);
+      }
+
+      // Quiet path: nothing to do on-chain — still sample NAV (the 24h
+      // mark-to-market window needs continuous coverage).
       if (output.kind === "quiet") {
         log.debug("rebalancer: quiet tick", { tickId, pmId, reason: output.reason });
+        recordPnlTick({ pm, spotPrice: Number(spot.price) });
         return;
       }
 
@@ -316,16 +435,23 @@ export function createRebalancerService(
           reason: output.reason,
         });
         if (cfg.lending.enabled) {
-          // For mlAgent, thread the state machine context so the router respects lendingPct.
-          const stateBias = cfg.strategy === "mlAgent" && mlDeps
-            ? mlDeps.stateMachine.current()
-            : undefined;
+          // Prefer the strategy-emitted ctx (carries the L1 lending bonus);
+          // fall back to the state machine's last advanced ctx for mlAgent.
+          const stateBias = output.stateCtx ??
+            (liveStrategyName === "mlAgent" && mlDeps
+              ? mlDeps.stateMachine.current()
+              : undefined);
           await deployIdleViaLending(pm, executor, stateBias);
         }
+        recordPnlTick({
+          pm,
+          spotPrice: Number(spot.price),
+          marketState: output.stateCtx?.state,
+        });
         return;
       }
 
-      const plan = output.plan;
+      let plan = output.plan;
       const skipReconcile = output.kind === "plan_only";
       log.info("rebalancer: plan computed", {
         tickId,
@@ -333,6 +459,84 @@ export function createRebalancerService(
         reason: plan.reason,
         kind: output.kind,
       });
+
+      // ----------------------------------------------------------------
+      // Proceeds re-planning pass
+      // ----------------------------------------------------------------
+      // Strategies size their add amounts from the PRE-remove snapshot; the
+      // capital freed by removeShares is invisible to them (per-bin position
+      // amounts are 0n in v0 chain reads). Without this pass, every recenter
+      // re-adds only the previously-idle balance and the removed principal
+      // leaks into the lending sweep — for a fully-locked position the
+      // "recenter" would silently CLOSE the LP position.
+      //
+      // Flow: dryRun the collect+remove prefix → exact freed amounts → apply
+      // the safety haircut → re-run the (deterministic) strategy with
+      // pm.positionValue injected so the plan's amounts include the freed
+      // capital. Skipped for emergency plans (nothing is re-added anyway).
+      let removeProceedsForIl: { a: bigint; b: bigint } | null = null;
+      if (plan.removeShares.size > 0 && plan.priority !== "emergency") {
+        const proceeds = await executor.estimateRemoveProceeds(plan, pm);
+        removeProceedsForIl = proceeds;
+        if (proceeds.a > 0n || proceeds.b > 0n) {
+          const haircutBps = BigInt(cfg.readdProceedsHaircutBps);
+          const positionValue = {
+            a: proceeds.a - (proceeds.a * haircutBps) / 10_000n,
+            b: proceeds.b - (proceeds.b * haircutBps) / 10_000n,
+          };
+          const enrichedOutput = await strategy.plan({
+            ...strategyInput,
+            pm: { ...pm, positionValue },
+          });
+          if (enrichedOutput.kind === "plan_and_reconcile" || enrichedOutput.kind === "plan_only") {
+            plan = enrichedOutput.plan;
+            log.info("rebalancer: re-planned with remove proceeds", {
+              tickId,
+              pmId,
+              proceedsA: positionValue.a.toString(),
+              proceedsB: positionValue.b.toString(),
+              addAmountA: plan.addAmountA.toString(),
+              addAmountB: plan.addAmountB.toString(),
+            });
+          } else {
+            // A deterministic strategy going quiet on strictly-more capital is
+            // unexpected — keep the original plan and say so loudly.
+            log.warn("rebalancer: re-plan with proceeds returned no plan — keeping original", {
+              tickId,
+              pmId,
+              rePlanKind: enrichedOutput.kind,
+            });
+          }
+        }
+      }
+
+      // ----------------------------------------------------------------
+      // Churn cap (C3)
+      // ----------------------------------------------------------------
+      // The risk-active cooldown bypass above means a flapping L2 boundary
+      // could drive a rebalance every heartbeat — each costing gas and a
+      // treasury charge. Cap NON-emergency executions per rolling hour,
+      // counting every rebalances row (failed attempts burned resources too).
+      // EXTREME full-withdrawals (priority=emergency) are always exempt.
+      // Placed BEFORE the treasury charge so capped ticks never debit users.
+      if (plan.priority !== "emergency") {
+        const oneHourAgo = Date.now() - 3_600_000;
+        const row = db
+          .prepare<{ n: number }, [string, number]>(
+            `SELECT COUNT(*) AS n FROM rebalances WHERE pm_id = ? AND planned_at_ms >= ?`,
+          )
+          .get(pmId, oneHourAgo);
+        const recentCount = row?.n ?? 0;
+        if (recentCount >= cfg.rebalanceMaxPerHour) {
+          log.warn("rebalancer: churn cap reached — skipping non-emergency rebalance", {
+            tickId,
+            pmId,
+            recentCount,
+            cap: cfg.rebalanceMaxPerHour,
+          });
+          return;
+        }
+      }
 
       // ----------------------------------------------------------------
       // Treasury gate + pre-charge
@@ -343,6 +547,7 @@ export function createRebalancerService(
       //   - Pre-debit credits before submitting the PTB. On PTB failure we
       //     refund this nonce so the user pays only for executed work.
       let chargeNonce: string | null = null;
+      let chargedCredits = 0;
       if (cfg.treasury.enabled) {
         const registered = findUserBySuiAddress(pm.owner) !== null;
         if (!registered && cfg.treasury.requireRegistration) {
@@ -379,6 +584,7 @@ export function createRebalancerService(
               return;
             }
             chargeNonce = charge.chargeNonce;
+            chargedCredits = cost;
           }
         }
       }
@@ -406,20 +612,43 @@ export function createRebalancerService(
 
       const rebalanceId = insertResult.lastInsertRowid;
 
-      // Snapshot the state machine context once for this tick (mlAgent only).
-      const stateBias = cfg.strategy === "mlAgent" && mlDeps
-        ? mlDeps.stateMachine.current()
-        : undefined;
+      // Snapshot the state context once for this tick. The strategy-emitted
+      // ctx (output.stateCtx) is authoritative — it carries the advance()-
+      // derived lendingPct including the TREND ramp and the L1 soft-circuit
+      // bonus. current() is the fallback (last advanced ctx, no L1 bonus).
+      const stateBias = output.stateCtx ??
+        (liveStrategyName === "mlAgent" && mlDeps
+          ? mlDeps.stateMachine.current()
+          : undefined);
 
       let finalStatus: "succeeded" | "failed" = "succeeded";
       let finalDigest = "";
       let finalError: string | undefined;
 
       try {
+        // Client-side slippage check: the per-bin split is priced for the
+        // planned active bin. Re-fetch the pool right before submitting and
+        // abort when it drifted beyond tolerance — the on-chain guard would
+        // abort anyway, this saves the gas and gives a clean journal entry.
+        if (
+          plan.plannedActiveBinId !== undefined &&
+          plan.addBins.length > 0 &&
+          (plan.addAmountA > 0n || plan.addAmountB > 0n)
+        ) {
+          const poolNow = await getPoolState(cfg.poolProfile.poolId);
+          const drift = Math.abs(poolNow.activeBinId - plan.plannedActiveBinId);
+          if (drift > cfg.slippageMaxBinDrift) {
+            throw new Error(
+              `active bin drifted ${drift} bins (planned ${plan.plannedActiveBinId}, now ${poolNow.activeBinId}, max ${cfg.slippageMaxBinDrift}) between plan and execution`,
+            );
+          }
+        }
+
         if (cfg.unifiedTx) {
-          // Unified PTB path: DLMM ops (collect + remove + transfer + add)
-          // run atomically. Lending stays as separate post-hoc transactions
-          // so the post-add residual can be observed before sizing supplies.
+          // Unified PTB path (the default): DLMM ops (collect + remove +
+          // transfer + add) run atomically. Lending stays as separate
+          // post-hoc transactions so the post-add residual can be observed
+          // before sizing supplies.
           const unifiedResult = await executor.submitUnifiedRebalance({
             plan,
             pm,
@@ -436,9 +665,9 @@ export function createRebalancerService(
             if (supplyDigest) finalDigest = supplyDigest;
           }
         } else {
-          // Legacy multi-tx path. Preserved as the default until the unified
-          // path is mainnet-validated. Flip UNIFIED_TX=true to use the
-          // atomic single-PTB rebalance instead.
+          // Legacy multi-tx path (opt-out via UNIFIED_TX=false). NON-ATOMIC:
+          // a failed add after a successful remove leaves the position closed
+          // — see the recovery handling below.
 
           // Step 1: collect + transfer fees if needed.
           if (plan.collectFees || pm.feeBag.a > 0n || pm.feeBag.b > 0n) {
@@ -449,32 +678,66 @@ export function createRebalancerService(
           }
 
           // Step 2: remove old position.
+          let removedOk = false;
           if (plan.removeShares.size > 0) {
             const removeResult = await executor.removeLiquidity(plan, pm);
             if (removeResult.status === "failed") {
               throw new Error(removeResult.error ?? "removeLiquidity failed");
             }
+            removedOk = true;
             finalDigest = removeResult.digest;
           }
 
-          // Step 3: re-fetch PM to get updated balances after remove + fee transfer.
-          let freshPm = await getPositionManager(pmId);
+          try {
+            // Step 3: re-fetch PM to get updated balances after remove + fee transfer.
+            let freshPm = await getPositionManager(pmId);
 
-          // Step 3.5: cover any shortfall for the planned add by redeeming from lending.
-          if (cfg.lending.enabled) {
-            const redeemDigest = await coverShortfallViaLending(freshPm, plan, executor, stateBias);
-            if (redeemDigest) {
-              finalDigest = redeemDigest;
-              freshPm = await getPositionManager(pmId);
+            // Step 3.5: cover any shortfall for the planned add by redeeming from lending.
+            if (cfg.lending.enabled) {
+              const redeemDigest = await coverShortfallViaLending(freshPm, plan, executor, stateBias);
+              if (redeemDigest) {
+                finalDigest = redeemDigest;
+                freshPm = await getPositionManager(pmId);
+              }
             }
-          }
 
-          // Step 4: add new position.
-          const addResult = await executor.addLiquidity(plan, freshPm);
-          if (addResult.status === "failed") {
-            throw new Error(addResult.error ?? "addLiquidity failed");
+            // Step 4: add new position. The plan is re-scaled to the REAL
+            // post-remove balances (exact — no estimate needed on this path);
+            // the pre-remove plan's amounts already target balance+proceeds,
+            // this trues them up to what actually landed.
+            const execPlan = rescalePlanToAvailable(plan, freshPm.balance.a, freshPm.balance.b);
+            const addResult = await executor.addLiquidity(execPlan, freshPm);
+            if (addResult.status === "failed") {
+              throw new Error(addResult.error ?? "addLiquidity failed");
+            }
+            if (addResult.digest) finalDigest = addResult.digest;
+          } catch (addErr: unknown) {
+            // Recovery: the remove landed but the re-add (or a step before
+            // it) failed — the position is CLOSED and the freed capital sits
+            // idle. Best-effort sweep it into lending so it at least earns
+            // until the next tick recenters; then rethrow so the tick is
+            // recorded failed and the treasury charge refunded.
+            if (removedOk) {
+              const msg = addErr instanceof Error ? addErr.message : String(addErr);
+              log.error(
+                "rebalancer: LEGACY ADD FAILED AFTER REMOVE — position closed, sweeping idle capital to lending",
+                { tickId, pmId, error: msg },
+              );
+              if (cfg.lending.enabled) {
+                try {
+                  const strandedPm = await getPositionManager(pmId);
+                  await deployIdleViaLending(strandedPm, executor, stateBias);
+                } catch (sweepErr: unknown) {
+                  log.error("rebalancer: post-failure lending sweep also failed", {
+                    tickId,
+                    pmId,
+                    error: sweepErr instanceof Error ? sweepErr.message : String(sweepErr),
+                  });
+                }
+              }
+            }
+            throw addErr;
           }
-          if (addResult.digest) finalDigest = addResult.digest;
 
           // Step 5: park residual idle balance into lending (skipped when the
           // strategy signalled plan_only — the strategy intends to keep the
@@ -486,16 +749,75 @@ export function createRebalancerService(
           }
         }
 
+        consecutiveTxFailures.delete(pmId);
         log.info("rebalancer: tick succeeded", {
           tickId,
           pmId,
           digest: finalDigest,
           path: cfg.unifiedTx ? "unified" : "legacy",
         });
+
+        // Reconcile the age-stop-loss lot book (C2). Carries lot age + cost
+        // basis forward across the full rebuild — see lotStore.ts. A failure
+        // here must not mask the succeeded rebalance, but must be loud.
+        try {
+          syncLotsAfterRebalance(db, pmId, plan, Number(spot.price), Date.now());
+        } catch (lotErr: unknown) {
+          log.error("rebalancer: lot bookkeeping failed after succeeded rebalance", {
+            tickId,
+            pmId,
+            error: lotErr instanceof Error ? lotErr.message : String(lotErr),
+          });
+        }
+
+        // PnL accounting (D1/D2): realized IL from the remove (hold-value of
+        // the entry vs the dryRun-estimated proceeds, both at the current
+        // spot), then refresh the entry snapshot to what was just deployed,
+        // then record the tick with fees + treasury cost + fresh NAV.
+        if (pnlService) {
+          try {
+            const spotPrice = Number(spot.price);
+            const ilUsd =
+              removeProceedsForIl !== null
+                ? pnlService.computeIlUsd(pmId, removeProceedsForIl, spotPrice)
+                : null;
+            const feeIncomeUsd = plan.collectFees
+              ? pnlService.valuePhysicalUsd(pm.feeBag.a, pm.feeBag.b, spotPrice)
+              : 0;
+            pnlService.snapshotEntry(pmId, plan, spotPrice, Date.now());
+            const postPm = await getPositionManager(pmId);
+            recordPnlTick({
+              pm: postPm,
+              spotPrice,
+              feeIncomeUsd,
+              costCredits: chargedCredits,
+              ilUsd,
+              marketState: output.stateCtx?.state,
+              rebalanceId: Number(rebalanceId),
+            });
+          } catch (pnlErr: unknown) {
+            log.error("rebalancer: pnl accounting failed after succeeded rebalance", {
+              tickId,
+              pmId,
+              error: pnlErr instanceof Error ? pnlErr.message : String(pnlErr),
+            });
+          }
+        }
       } catch (err: unknown) {
         finalStatus = "failed";
         finalError = err instanceof Error ? err.message : String(err);
         log.error("rebalancer: tick failed", { tickId, pmId, error: finalError });
+
+        // L3 escalation on repeated failures: something is systematically
+        // broken (RPC, contract, plan math) — halt automation for a human.
+        const failures = (consecutiveTxFailures.get(pmId) ?? 0) + 1;
+        consecutiveTxFailures.set(pmId, failures);
+        if (failures >= cfg.risk.l3.txFailureCount) {
+          riskMonitor.emergencyStop.trip(
+            `${failures} consecutive failed rebalance attempts for pm ${pmId} (last: ${finalError})`,
+          );
+        }
+
         // On PTB failure, refund the pre-debited credits so the user only
         // pays for executed work.
         if (chargeNonce) {

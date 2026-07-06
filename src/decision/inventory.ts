@@ -26,18 +26,22 @@
 
 export interface InventoryState {
   /**
-   * Available coinA (base token, e.g. SUI) in raw units.
-   * Includes PM balance + any fee bag amounts.
+   * Available PHYSICAL coinA in raw units (for the mainnet SUI/USDC pool the
+   * physical coinA is USDC). Includes PM balance + fee bag + any injected
+   * positionValue.
    */
   availableA: bigint;
   /**
-   * Available coinB (quote token, e.g. USDC) in raw units.
-   * Includes PM balance + any fee bag amounts.
+   * Available PHYSICAL coinB in raw units.
+   * Includes PM balance + fee bag + any injected positionValue.
    */
   availableB: bigint;
-  /** Mid-price as a plain number (coinB per coinA), used to convert to a common unit. */
+  /**
+   * Mid-price as a plain number in PHYSICAL human units (coinB per coinA,
+   * decimal-adjusted with the physical pool decimals).
+   */
   midPriceNum: number;
-  /** Decimal adjustment: 10^(decimalsA - decimalsB). */
+  /** Decimal adjustment: 10^(physicalDecimalsA - physicalDecimalsB). */
   decimalAdj: number;
 }
 
@@ -54,19 +58,23 @@ export type InventoryRegime =
 
 /**
  * Adjustment factors produced by computeInventoryAdjustment.
- * Applied to the amount split: multiply bid amounts by bidScale, ask amounts by askScale.
+ * Applied to the amount split: multiply coinA amounts by bidScale, coinB
+ * amounts by askScale.
  *
- * Convention:
- *   bid bins (k < active) consume coinA → bidScale applies to coinA allocation
- *   ask bins (k > active) consume coinB → askScale applies to coinB allocation
+ * PHYSICAL side convention (verified on mainnet,
+ * scripts/probe-bin-orientation.ts):
+ *   bins ABOVE active (k > active) consume physical coinA → bidScale applies
+ *   bins BELOW active (k < active) consume physical coinB → askScale applies
+ * (The historical field names bidScale/askScale are kept for API stability;
+ * read them as "scale for coinA allocation" / "scale for coinB allocation".)
  */
 export interface InventoryAdjustment {
-  /** Scaling factor for bid-side (coinA) amounts. Range [0, ∞). */
+  /** Scaling factor for physical-coinA amounts (bins above active). Range [0, ∞). */
   bidScale: number;
-  /** Scaling factor for ask-side (coinB) amounts. Range [0, ∞). */
+  /** Scaling factor for physical-coinB amounts (bins below active). Range [0, ∞). */
   askScale: number;
   regime: InventoryRegime;
-  /** Signed overage in [-1, 1]: positive = too much coinA. */
+  /** Signed overage in [-1, 1]: positive = too much physical coinA. */
   suiOverage: number;
   /** When true, only the under-stocked side should place orders. */
   singleSidedOnly: boolean;
@@ -213,11 +221,11 @@ export function applyInventoryScales(
   const bidScaleFixed = BigInt(Math.round(adj.bidScale * Number(SCALE)));
   const askScaleFixed = BigInt(Math.round(adj.askScale * Number(SCALE)));
 
+  // Physical side rule: coinA lives in bins ABOVE active, coinB in bins BELOW.
   const adjustedA = amountsA.map((a, i) => {
     if (a === 0n) return 0n;
     const k = bins[i]!;
-    if (k >= activeBin) return a; // ask-side bin, A should be 0 anyway
-    // bid-side: apply bidScale
+    if (k <= activeBin) return a; // below/active bin — A should be 0 anyway
     const scaled = (a * bidScaleFixed) / SCALE;
     return scaled < 0n ? 0n : scaled;
   });
@@ -225,8 +233,7 @@ export function applyInventoryScales(
   const adjustedB = amountsB.map((b, i) => {
     if (b === 0n) return 0n;
     const k = bins[i]!;
-    if (k < activeBin) return b; // bid-side bin, B should be 0 anyway
-    // ask-side: apply askScale
+    if (k > activeBin) return b; // above-active bin — B should be 0 anyway
     const scaled = (b * askScaleFixed) / SCALE;
     return scaled < 0n ? 0n : scaled;
   });

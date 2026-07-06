@@ -1,15 +1,24 @@
 /**
  * EMA trend strategy.
  *
- * Computes fast/slow EMAs on close-to-close prices and biases the deployed
- * bin range toward the trend direction:
- *   - bullish (EMA_fast > EMA_slow × (1 + threshold)): shift center +k bins up
- *   - bearish (EMA_fast < EMA_slow × (1 − threshold)): shift center −k bins down
- *   - neutral: symmetric around active bin
+ * Computes fast/slow EMAs on close-to-close prices (HUMAN pair price,
+ * quote-per-base) and biases the deployed bin range toward the trend
+ * direction:
+ *   - bullish (EMA_fast > EMA_slow × (1 + threshold)): shift the center k bins
+ *     in the direction the HUMAN price is rising — in BIN space that is
+ *     `binDirection(orientation)` (an inverted pool's bin id FALLS as the
+ *     human price rises).
+ *   - bearish: the mirror shift.
+ *   - neutral: symmetric around the active bin.
  *
  * Weights inside the range are tent-shaped (max at center, linear falloff to
- * the edges) with an additional multiplicative skew on the trend side so the
- * agent captures fees from continued movement before re-pricing.
+ * the edges) with an additional multiplicative skew on the trend side (the
+ * bins the price is expected to move INTO) so the agent captures fees from
+ * continued movement before re-pricing.
+ *
+ * Per-bin coin assignment follows the PHYSICAL side rule (verified on
+ * mainnet): bins above active take physical coinA, bins below take coinB;
+ * the active bin is never placed on.
  *
  * Like all closed-form forecasters in this template, EMA does not require
  * training — `k = 2/(period+1)` is a fixed decay constant chosen by `period`.
@@ -19,6 +28,7 @@
  */
 
 import type { Strategy, StrategyInput, StrategyOutput } from "./types.ts";
+import { binDirection, orientationOf } from "../domain/binMath.ts";
 import { log } from "../lib/logger.ts";
 
 export interface EmaTrendParams {
@@ -117,7 +127,7 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
     name: "emaTrend",
 
     async plan(input: StrategyInput): Promise<StrategyOutput> {
-      const { pm, pool, history } = input;
+      const { pm, pool, history, profile } = input;
 
       const hasBalance = pm.balance.a > 0n || pm.balance.b > 0n;
       const hasPosition = pm.positionBins.length > 0;
@@ -125,6 +135,10 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
       if (!hasBalance && !hasPosition && !hasFees) {
         return { kind: "quiet", reason: "emaTrend: empty PM" };
       }
+
+      const orientation = orientationOf(profile);
+      // +1 when the human price rises with bin id, −1 on inverted pools.
+      const dir = binDirection(orientation);
 
       const prices = history
         .map((h) => Number(h.price))
@@ -141,12 +155,11 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
         }
       }
 
+      // Shift the range center toward where the price is heading — in BIN
+      // space: bullish = human price rising = bin id moving by `dir`.
+      const shiftMag = Math.max(1, Math.floor(p.halfWidthBins / 2));
       const centerOffset =
-        trend === "bullish"
-          ? Math.max(1, Math.floor(p.halfWidthBins / 2))
-          : trend === "bearish"
-            ? -Math.max(1, Math.floor(p.halfWidthBins / 2))
-            : 0;
+        trend === "bullish" ? dir * shiftMag : trend === "bearish" ? -dir * shiftMag : 0;
       const center = pool.activeBinId + centerOffset;
       const lower = center - p.halfWidthBins;
       const upper = center + p.halfWidthBins;
@@ -186,23 +199,23 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
         };
       }
 
-      // Tent weights skewed toward trend side.
-      const skewTrendSide = trend === "bullish" ? p.trendSkew : 1;
-      const skewOtherSide = trend === "bearish" ? p.trendSkew : 1;
+      // Tent weights skewed toward the bins the price is expected to move
+      // INTO. Bullish → human price rises → bin id moves by `dir`; the bins
+      // on that side of active get the skew multiplier (they hold the
+      // inventory that fills as the move continues).
+      const trendSign = trend === "bullish" ? 1 : trend === "bearish" ? -1 : 0;
       const weights = bins.map((binId) => {
         const distFromCenter = Math.abs(binId - center);
         const tent = Math.max(0, 1 - distFromCenter / Math.max(p.halfWidthBins, 1));
+        const binSide = Math.sign(binId - pool.activeBinId);
         const sideMult =
-          binId > pool.activeBinId
-            ? skewTrendSide
-            : binId < pool.activeBinId
-              ? skewOtherSide
-              : 1;
+          trendSign !== 0 && binSide === dir * trendSign ? p.trendSkew : 1;
         return Math.max(tent * sideMult, 1e-6);
       });
 
-      // Split balance: bid bins (id < active) take A; ask bins (id > active)
-      // take B; active bin gets a small reserve from each.
+      // Split capital by the PHYSICAL side rule: bins above active take
+      // physical coinA, bins below take coinB. The active bin is excluded —
+      // never place on it (composition-fee policy).
       const removeShares = new Map<number, bigint>();
       if (hasPosition) {
         for (const bin of pm.positionBins) {
@@ -210,50 +223,34 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
         }
       }
 
-      const grossA = pm.balance.a + (hasFees ? pm.feeBag.a : 0n);
-      const grossB = pm.balance.b + (hasFees ? pm.feeBag.b : 0n);
-      const reserveA = grossA / 20n;
-      const reserveB = grossB / 20n;
-      const aForBids = grossA - reserveA;
-      const bForAsks = grossB - reserveB;
+      // Deployable = idle + fees (when collecting) + dryRun-estimated value of
+      // the removed position (injected by the execution layer's re-plan pass).
+      const grossA =
+        pm.balance.a + (hasFees ? pm.feeBag.a : 0n) + (pm.positionValue?.a ?? 0n);
+      const grossB =
+        pm.balance.b + (hasFees ? pm.feeBag.b : 0n) + (pm.positionValue?.b ?? 0n);
 
-      const bidIdx: number[] = [];
-      const askIdx: number[] = [];
-      let activeIdx = -1;
+      const aboveIdx: number[] = [];
+      const belowIdx: number[] = [];
       bins.forEach((binId, i) => {
-        if (binId < pool.activeBinId) bidIdx.push(i);
-        else if (binId > pool.activeBinId) askIdx.push(i);
-        else activeIdx = i;
+        if (binId > pool.activeBinId) aboveIdx.push(i);
+        else if (binId < pool.activeBinId) belowIdx.push(i);
+        // active bin: excluded
       });
 
-      const bidWeights = bidIdx.map((i) => weights[i] ?? 0);
-      const askWeights = askIdx.map((i) => weights[i] ?? 0);
-      const bidAmounts = splitProportional(aForBids, bidWeights);
-      const askAmounts = splitProportional(bForAsks, askWeights);
+      const aboveWeights = aboveIdx.map((i) => weights[i] ?? 0);
+      const belowWeights = belowIdx.map((i) => weights[i] ?? 0);
+      const aboveAmounts = splitProportional(grossA, aboveWeights);
+      const belowAmounts = splitProportional(grossB, belowWeights);
 
       const addAmountsA: bigint[] = bins.map(() => 0n);
       const addAmountsB: bigint[] = bins.map(() => 0n);
-      bidIdx.forEach((i, j) => {
-        addAmountsA[i] = bidAmounts[j] ?? 0n;
+      aboveIdx.forEach((i, j) => {
+        addAmountsA[i] = aboveAmounts[j] ?? 0n;
       });
-      askIdx.forEach((i, j) => {
-        addAmountsB[i] = askAmounts[j] ?? 0n;
+      belowIdx.forEach((i, j) => {
+        addAmountsB[i] = belowAmounts[j] ?? 0n;
       });
-      if (activeIdx >= 0) {
-        addAmountsA[activeIdx] = reserveA;
-        addAmountsB[activeIdx] = reserveB;
-      } else {
-        // Active bin outside our chosen range (large trend offset). Drop the
-        // reserves into the nearest bin on each side.
-        if (bidIdx.length > 0 && bidIdx[bidIdx.length - 1] !== undefined) {
-          const lastBid = bidIdx[bidIdx.length - 1]!;
-          addAmountsA[lastBid] = (addAmountsA[lastBid] ?? 0n) + reserveA;
-        }
-        if (askIdx.length > 0 && askIdx[0] !== undefined) {
-          const firstAsk = askIdx[0]!;
-          addAmountsB[firstAsk] = (addAmountsB[firstAsk] ?? 0n) + reserveB;
-        }
-      }
 
       const finalBins: number[] = [];
       const finalA: bigint[] = [];
@@ -296,6 +293,7 @@ export function createEmaTrendStrategy(params: EmaTrendParams = {}): Strategy {
           addAmountsB: finalB,
           collectFees: hasFees,
           reason,
+          plannedActiveBinId: pool.activeBinId,
         },
       };
     },

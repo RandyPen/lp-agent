@@ -52,12 +52,20 @@ export interface PriceContext {
   /** Current pool active bin ID. */
   activeBin: number;
   /**
-   * Mid-price of the active bin as a plain number (coinB per coinA).
-   * Used to estimate the current mark-to-market for each lot.
+   * Mid-price of the active bin as a plain number in HUMAN pair units
+   * (quote-per-base — the spot convention). Used to estimate the current
+   * mark-to-market for each lot.
    */
   currentMidPrice: number;
   /** Pool bin step in basis points (needed to price adjacent bins). */
   binStep: number;
+  /**
+   * Bin-space direction of a RISING human price: +1 when price rises with
+   * bin id, −1 on inverted pools (physical coinA = quote) — see
+   * binMath.binDirection. Default +1 preserves the historical behaviour for
+   * non-inverted fixtures.
+   */
+  direction?: 1 | -1;
 }
 
 /**
@@ -110,17 +118,20 @@ const RELAX_ASK_FACTOR = 1.005;
 // ---------------------------------------------------------------------------
 
 /**
- * Estimate the current bin mid-price relative to the active bin.
+ * Estimate the current bin mid-price (HUMAN pair units) relative to the
+ * active bin.
  *
- * price(k) ≈ currentMidPrice × (1 + binStepBps/10000)^(k - activeBin)
- * This geometric approximation matches priceFromBinId for nearby bins.
+ * price(k) ≈ currentMidPrice × (1 + binStepBps/10000)^(direction × (k − activeBin))
+ * This geometric approximation matches humanPriceForBin for nearby bins; on
+ * an inverted pool (direction = −1) the human price FALLS as bin id rises.
  */
 export function estimateBinPrice(
   binId: number,
   priceCtx: PriceContext,
 ): number {
   const step = priceCtx.binStep / 10_000;
-  const offset = binId - priceCtx.activeBin;
+  const dir = priceCtx.direction ?? 1;
+  const offset = (binId - priceCtx.activeBin) * dir;
   return priceCtx.currentMidPrice * Math.pow(1 + step, offset);
 }
 
@@ -166,15 +177,17 @@ export function relaxedAskBinId(
 ): number {
   const targetPrice = costBasis * RELAX_ASK_FACTOR;
   const step = priceCtx.binStep / 10_000;
+  // Ask bins sit in the direction of RISING human price: +dir from active.
+  const dir = priceCtx.direction ?? 1;
 
-  // Geometric: k = activeBin + ceil(log(target/current) / log(1+step))
+  // Geometric: k = activeBin + dir × ceil(log(target/current) / log(1+step))
   if (priceCtx.currentMidPrice <= 0 || !Number.isFinite(priceCtx.currentMidPrice)) {
-    return priceCtx.activeBin + 1;
+    return priceCtx.activeBin + dir;
   }
   const ratio = targetPrice / priceCtx.currentMidPrice;
-  if (ratio <= 1) return priceCtx.activeBin + 1;
+  if (ratio <= 1) return priceCtx.activeBin + dir;
   const offset = Math.ceil(Math.log(ratio) / Math.log(1 + step));
-  return priceCtx.activeBin + Math.max(1, offset);
+  return priceCtx.activeBin + dir * Math.max(1, offset);
 }
 
 /**
@@ -182,8 +195,8 @@ export function relaxedAskBinId(
  *
  * The caller provides `nowMs` (no Date.now() inside this module).
  *
- * For bid lots (binId < activeBin): loss = price decline below cost.
- * For ask lots (binId > activeBin): loss = price rise above cost (opportunity).
+ * For bid lots (the −direction side of active): loss = price decline below cost.
+ * For ask lots (the +direction side): loss = price rise above cost (opportunity).
  */
 export function evaluateLot(
   lot: LotRecord,
@@ -197,12 +210,16 @@ export function evaluateLot(
     return { kind: "hold", binId: lot.binId, lotIdx };
   }
 
-  const isBidLot = lot.binId < priceCtx.activeBin;
+  // Bid lots sit at HUMAN prices BELOW the mid (buy side): in bin space that
+  // is the −direction side of active. On a non-inverted pool this is the
+  // historical `binId < activeBin`; on an inverted pool bids are ABOVE.
+  const dir = priceCtx.direction ?? 1;
+  const isBidLot = Math.sign(lot.binId - priceCtx.activeBin) * dir === -1;
   const loss = isBidLot ? bidLotLoss(lot, priceCtx) : askLotLoss(lot, priceCtx);
 
   // 12h forced liquidation check.
   if (ageMs >= AGE_12H_MS && loss > LOSS_5_PCT) {
-    const forcedAskBinId = priceCtx.activeBin + 1;
+    const forcedAskBinId = priceCtx.activeBin + dir;
     return {
       kind: "force_liquidate",
       binId: lot.binId,

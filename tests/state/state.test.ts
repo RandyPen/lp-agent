@@ -24,7 +24,7 @@ import {
   deriveMaxCenterOffset,
   deriveTrendBias,
   deriveLendingPct,
-  K_W,
+  DEFAULT_STATE_PARAMS,
   HALF_WIDTH_MIN,
   HALF_WIDTH_MAX,
   MAX_CENTER_OFFSET_MIN,
@@ -259,7 +259,7 @@ describe("deriveHalfWidth", () => {
 
   it("uses K_W multiplier", () => {
     // K_W=2.0, so widthSigma=1.75 → round(3.5)=4
-    expect(deriveHalfWidth(1.75)).toBe(Math.max(HALF_WIDTH_MIN, Math.min(HALF_WIDTH_MAX, Math.round(K_W * 1.75))));
+    expect(deriveHalfWidth(1.75)).toBe(Math.max(HALF_WIDTH_MIN, Math.min(HALF_WIDTH_MAX, Math.round(DEFAULT_STATE_PARAMS.kW * 1.75))));
   });
 });
 
@@ -1087,5 +1087,186 @@ describe("StateMachine — StateContext fields", () => {
 
     expect(ctx.state).toBe("TREND");
     expect(ctx.trendBias).toBeCloseTo(1.0, 10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — EXTREME dwell bypass, exit hysteresis, NaN guards,
+// injectable StateParams, current() caching.
+// ---------------------------------------------------------------------------
+
+describe("machine.ts — EXTREME entry bypasses min-dwell (emergency escalation)", () => {
+  let db: Database;
+  beforeEach(() => { db = openTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it("L2 extremeSignal 1 min after boot (NORMAL dwell NOT elapsed) → EXTREME", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "bypass1", db, now: () => t });
+    t = 60_000; // 1 min — far below the 15-min NORMAL dwell
+    const signal: ExtremeSignal = { active: true, trigger: "vol_5m>0.10" };
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred(), makeInput(), signal);
+    expect(ctx.state).toBe("EXTREME");
+    const rows = getRows(db, "bypass1");
+    expect(rows[rows.length - 1]!.state).toBe("EXTREME");
+    expect(rows[rows.length - 1]!.trigger).toBe("vol_5m>0.10");
+  });
+
+  it("local p-sum spike 1 min after boot → EXTREME", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "bypass2", db, now: () => t });
+    t = 60_000;
+    const pred = makePred({ pAbove: 0.5, pBelow: 0.4 }); // sum 0.9 > 0.7
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput());
+    expect(ctx.state).toBe("EXTREME");
+  });
+
+  it("L2 signal 1 min after entering TREND (TREND dwell NOT elapsed) → EXTREME", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "bypass3", db, now: () => t });
+    // Enter TREND via p_break (after the NORMAL dwell elapses)
+    t = MIN_DWELL_MS.NORMAL + 1_000;
+    sm.advance(makeSnapshot(flatBars(30)), makePred({ pAbove: 0.65, pBelow: 0.04 }), makeInput());
+    expect(sm.current().state).toBe("TREND");
+    // 1 minute later, L2 fires — must escalate despite TREND's 15-min dwell.
+    t += 60_000;
+    const signal: ExtremeSignal = { active: true, trigger: "spread_sustained" };
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred(), makeInput(), signal);
+    expect(ctx.state).toBe("EXTREME");
+  });
+
+  it("regression: NORMAL→TREND is still blocked before the NORMAL dwell elapses", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "bypass4", db, now: () => t });
+    t = 60_000;
+    // p_break entry condition satisfied but sum < 0.7 (no EXTREME)
+    const pred = makePred({ pAbove: 0.65, pBelow: 0.04 });
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), pred, makeInput());
+    expect(ctx.state).toBe("NORMAL"); // dwell blocks the non-emergency transition
+  });
+
+  it("regression: EXTREME exit is still blocked before the EXTREME dwell elapses", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "bypass5", db, now: () => t });
+    t = 60_000;
+    sm.advance(makeSnapshot(flatBars(30)), makePred(), makeInput(), { active: true, trigger: "x" });
+    expect(sm.current().state).toBe("EXTREME");
+    // 5 minutes later: signal cleared, vol recovered — but dwell (10 min) not elapsed.
+    t += 5 * 60_000;
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred({ pAbove: 0.1, pBelow: 0.1 }), makeInput(), null, true);
+    expect(ctx.state).toBe("EXTREME");
+  });
+});
+
+describe("shouldExitExtreme — p-sum exit hysteresis band", () => {
+  const entered = 0;
+  const now = 11 * 60_000; // stability window elapsed
+
+  it("pSum in the hysteresis band (0.6 < 0.65 ≤ 0.7) blocks exit", () => {
+    const pred = makePred({ pAbove: 0.35, pBelow: 0.30 }); // 0.65
+    expect(shouldExitExtreme(pred, null, true, entered, now)).toBe(false);
+  });
+
+  it("pSum below the exit threshold (0.55 < 0.6) allows exit", () => {
+    const pred = makePred({ pAbove: 0.30, pBelow: 0.25 }); // 0.55
+    expect(shouldExitExtreme(pred, null, true, entered, now)).toBe(true);
+  });
+});
+
+describe("params.ts / transitions.ts — non-finite input guards (fail loud)", () => {
+  it("deriveHalfWidth(NaN) throws", () => {
+    expect(() => deriveHalfWidth(NaN)).toThrow(RangeError);
+  });
+
+  it("deriveHalfWidth(Infinity) throws", () => {
+    expect(() => deriveHalfWidth(Infinity)).toThrow(RangeError);
+  });
+
+  it("deriveToleranceBins(NaN, 4) throws", () => {
+    expect(() => deriveToleranceBins(NaN, 4)).toThrow(RangeError);
+  });
+
+  it("deriveMaxCenterOffset(NaN, false) throws", () => {
+    expect(() => deriveMaxCenterOffset(NaN, false)).toThrow(RangeError);
+  });
+
+  it("deriveTrendBias(NaN, 0.3) throws", () => {
+    expect(() => deriveTrendBias(NaN, 0.3)).toThrow(RangeError);
+  });
+
+  it("deriveLendingPct('TREND', NaN) throws", () => {
+    expect(() => deriveLendingPct("TREND", NaN)).toThrow(RangeError);
+  });
+
+  it("computeDriftStrength throws on a NaN close mid-series", () => {
+    const bars = flatBars(30);
+    bars[15] = { ...bars[15]!, close: NaN };
+    expect(() => computeDriftStrength(makeSnapshot(bars))).toThrow(RangeError);
+  });
+});
+
+describe("machine.ts — injectable StateParams + current() caching", () => {
+  let db: Database;
+  beforeEach(() => { db = openTestDb(); });
+  afterEach(() => { db.close(); });
+
+  it("honours an injected pBreakEntry override for TREND entry", () => {
+    let t = 0;
+    const sm = createStateMachine({
+      poolId: "params1",
+      db,
+      now: () => t,
+      params: { ...DEFAULT_STATE_PARAMS, pBreakEntry: 0.5 },
+    });
+    t = MIN_DWELL_MS.NORMAL + 1_000;
+    // pAbove=0.55 would NOT trigger with the default 0.6 threshold.
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred({ pAbove: 0.55, pBelow: 0.1 }), makeInput());
+    expect(ctx.state).toBe("TREND");
+  });
+
+  it("honours an injected pBreakSumExtreme override for EXTREME entry", () => {
+    let t = 60_000;
+    const sm = createStateMachine({
+      poolId: "params2",
+      db,
+      now: () => t,
+      params: { ...DEFAULT_STATE_PARAMS, pBreakSumExtreme: 0.5, pBreakSumExtremeExit: 0.4 },
+    });
+    // sum=0.6 — below the default 0.7, above the injected 0.5.
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred({ pAbove: 0.3, pBelow: 0.3 }), makeInput());
+    expect(ctx.state).toBe("EXTREME");
+  });
+
+  it("current() reflects the advance()-derived TREND lendingPct ramp (C4)", () => {
+    let t = 0;
+    const sm = createStateMachine({ poolId: "params3", db, now: () => t });
+    t = MIN_DWELL_MS.NORMAL + 1_000;
+    // trendBias = clamp((0.65-0.04)/0.5) = 1.0 → lendingPct = 0.5 + 0.2×1 = 0.70
+    const ctx = sm.advance(makeSnapshot(flatBars(30)), makePred({ pAbove: 0.65, pBelow: 0.04 }), makeInput());
+    expect(ctx.state).toBe("TREND");
+    expect(ctx.lendingPct).toBeCloseTo(0.70, 10);
+    // Pre-fix, current() returned the hardcoded 0.50 — the ramp never reached
+    // the lending router. Now it returns the cached advance() context.
+    expect(sm.current().lendingPct).toBeCloseTo(0.70, 10);
+    expect(sm.current().strongTrend).toBe(true);
+  });
+
+  it("strongTrend derives from the injected trendBiasStrong threshold", () => {
+    let t = 0;
+    const sm = createStateMachine({
+      poolId: "params4",
+      db,
+      now: () => t,
+      params: { ...DEFAULT_STATE_PARAMS, trendBiasStrong: 0.99 },
+    });
+    t = MIN_DWELL_MS.NORMAL + 1_000;
+    // Enter TREND via drift strength (p stays below all p-break thresholds);
+    // trendBias = clamp((0.50-0.08)/0.5)=0.84 — strong under the default 0.7,
+    // weak under the injected 0.99.
+    const driftSnap = makeSnapshot(highDriftBars(26, 2.5, 0.0002, 0.02));
+    const ctx = sm.advance(driftSnap, makePred({ pAbove: 0.50, pBelow: 0.08 }), makeInput());
+    expect(ctx.state).toBe("TREND");
+    expect(ctx.trendBias).toBeCloseTo(0.84, 10);
+    expect(ctx.strongTrend).toBe(false);
   });
 });

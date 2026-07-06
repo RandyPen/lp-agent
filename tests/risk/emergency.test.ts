@@ -144,3 +144,69 @@ describe("createEmergencyStop", () => {
     expect(row?.ts_ms).toBe(fixedNow);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — DB rehydration + out-of-process operator reset
+// ---------------------------------------------------------------------------
+
+import { resolveEmergencyStopInDb } from "../../src/risk/emergency.ts";
+
+describe("emergency stop rehydration (restart survival)", () => {
+  it("a tripped latch survives a process restart via DB rehydration", () => {
+    const stop1 = createEmergencyStop({ db, nowMs });
+    stop1.trip("first process trips");
+    expect(stop1.isTripped()).toBe(true);
+
+    // Simulate a restart: a NEW latch over the same DB must come up tripped.
+    const stop2 = createEmergencyStop({ db, nowMs });
+    expect(stop2.isTripped()).toBe(true);
+  });
+
+  it("a resolved (operator-reset) trip does NOT re-trip on restart", () => {
+    const stop1 = createEmergencyStop({ db, nowMs });
+    stop1.trip("trip then resolve");
+    resolveEmergencyStopInDb(db, "verified safe to resume", nowMs());
+
+    const stop2 = createEmergencyStop({ db, nowMs });
+    expect(stop2.isTripped()).toBe(false);
+  });
+
+  it("a fresh DB (no trips ever) rehydrates un-tripped", () => {
+    const stop = createEmergencyStop({ db, nowMs });
+    expect(stop.isTripped()).toBe(false);
+  });
+});
+
+describe("resolveEmergencyStopInDb (operator reset path)", () => {
+  it("resolves the unresolved row and writes an audit row with the ack reason", () => {
+    const stop = createEmergencyStop({ db, nowMs });
+    stop.trip("something bad");
+
+    const { resolvedEventId } = resolveEmergencyStopInDb(db, "rpc outage over", nowMs());
+
+    const resolved = db
+      .prepare<{ resolved_at_ms: number | null }, [number]>(
+        "SELECT resolved_at_ms FROM risk_events WHERE id = ?",
+      )
+      .get(resolvedEventId);
+    expect(resolved?.resolved_at_ms).toBe(nowMs());
+
+    const audit = db
+      .prepare<{ kind: string; action: string }, []>(
+        "SELECT kind, action FROM risk_events ORDER BY id DESC LIMIT 1",
+      )
+      .get();
+    expect(audit?.kind).toBe("emergency_stop_reset");
+    expect(audit?.action).toBe("manual_reset:rpc outage over");
+  });
+
+  it("throws when no unresolved emergency_stop row exists", () => {
+    expect(() => resolveEmergencyStopInDb(db, "nothing to reset")).toThrow(/no unresolved/);
+  });
+
+  it("throws on an empty ack reason", () => {
+    const stop = createEmergencyStop({ db, nowMs });
+    stop.trip("x");
+    expect(() => resolveEmergencyStopInDb(db, "  ")).toThrow(/ackReason/);
+  });
+});

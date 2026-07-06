@@ -177,10 +177,11 @@ describe("applyInventoryScales", () => {
     expect(adjustedB).toEqual([0n, 0n, 150n, 100n]);
   });
 
-  it("reduces bid amounts and increases ask amounts for bullish overage", () => {
+  it("reduces coinA amounts and increases coinB amounts for coinA overage", () => {
+    // Physical side rule: coinA lives in bins ABOVE active, coinB below.
     const bins = [-2, -1, 1, 2];
-    const amountsA = [200n, 200n, 0n, 0n];
-    const amountsB = [0n, 0n, 200n, 200n];
+    const amountsA = [0n, 0n, 200n, 200n];
+    const amountsB = [200n, 200n, 0n, 0n];
     const adj = {
       bidScale: 0.7,
       askScale: 1.5,
@@ -190,18 +191,19 @@ describe("applyInventoryScales", () => {
       bypassGasFilter: false,
     };
     const { adjustedA, adjustedB } = applyInventoryScales(bins, amountsA, amountsB, 0, adj);
-    // Bid (coinA): 200 × 0.7 = 140
-    expect(adjustedA[0]).toBe(140n);
-    expect(adjustedA[1]).toBe(140n);
-    // Ask (coinB): 200 × 1.5 = 300
-    expect(adjustedB[2]).toBe(300n);
-    expect(adjustedB[3]).toBe(300n);
+    // coinA (above active): 200 × 0.7 = 140
+    expect(adjustedA[2]).toBe(140n);
+    expect(adjustedA[3]).toBe(140n);
+    // coinB (below active): 200 × 1.5 = 300
+    expect(adjustedB[0]).toBe(300n);
+    expect(adjustedB[1]).toBe(300n);
   });
 
-  it("zeroes bid amounts for moderate/severe SUI overage", () => {
+  it("zeroes coinA amounts for moderate/severe coinA overage", () => {
+    // Physical side rule: coinA above active, coinB below.
     const bins = [-1, 1];
-    const amountsA = [500n, 0n];
-    const amountsB = [0n, 500n];
+    const amountsA = [0n, 500n];
+    const amountsB = [500n, 0n];
     const adj = {
       bidScale: 0,
       askScale: 1,
@@ -211,8 +213,8 @@ describe("applyInventoryScales", () => {
       bypassGasFilter: false,
     };
     const { adjustedA, adjustedB } = applyInventoryScales(bins, amountsA, amountsB, 0, adj);
-    expect(adjustedA[0]).toBe(0n);
-    expect(adjustedB[1]).toBe(500n);
+    expect(adjustedA[1]).toBe(0n);
+    expect(adjustedB[0]).toBe(500n);
   });
 
   it("throws on length mismatch", () => {

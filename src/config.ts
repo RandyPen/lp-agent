@@ -1,6 +1,7 @@
 import { ConfigError } from "./lib/errors.ts";
 import { loadPoolProfile, type PoolProfile } from "./pools/index.ts";
 import { isStrategyName, listStrategyNames, type StrategyName } from "./strategies/registry.ts";
+import { DEFAULT_STATE_PARAMS, type StateParams } from "./state/params.ts";
 
 export type Network = "mainnet" | "testnet" | "devnet";
 
@@ -128,10 +129,51 @@ export interface RiskThresholds {
    * (below spreadExtreme which triggers L2). Default 0.01 (1%).
    */
   l1SpreadSoftBandHigh: number;
+  /**
+   * L2 exit hysteresis: 5-minute volatility must recede below this before an
+   * EXTREME exit is allowed. Must be strictly below `extremeVolatility5m`
+   * (validated at load) or the hysteresis silently degenerates. Default 0.07.
+   */
+  volatilityRecovery: number;
+  /**
+   * Per-source staleness thresholds (ms). A single dead feed must trip L2 even
+   * while the other feeds keep the aggregate snapshot timestamp fresh — the
+   * max-of-sources `snapshot.ts` masks exactly this failure.
+   */
+  sourceStaleSuiMs: number;
+  /** Cetus event feed can be legitimately quiet longer than Binance. */
+  sourceStaleCetusMs: number;
+  /** Derivatives feed is the least decision-critical; widest threshold. */
+  sourceStaleDerivMs: number;
+}
+
+/**
+ * L3 emergency-stop trip conditions. Once any of these fires, the
+ * EmergencyStop latch trips and all on-chain operations halt until an
+ * operator resets it (scripts/risk-reset-emergency.ts + restart).
+ */
+export interface L3Thresholds {
+  /** Trip when L2 EXTREME was entered this many times within the window. */
+  repeatedL2Count: number;
+  /** Window (ms) for `repeatedL2Count`. */
+  repeatedL2WindowMs: number;
+  /**
+   * Trip when market data has been stale longer than this (ms) while the PM
+   * still has an open position. Must exceed `sourceStaleSuiMs`.
+   */
+  outageMs: number;
+  /**
+   * Trip when 24h PnL fraction falls below this (catastrophic loss).
+   * Must be more negative than the L2 `pnl24hPct` threshold.
+   */
+  pnlPct: number;
+  /** Trip after this many consecutive failed on-chain rebalance attempts. */
+  txFailureCount: number;
 }
 
 export interface RiskAppConfig {
   thresholds: RiskThresholds;
+  l3: L3Thresholds;
 }
 
 export interface AppConfig {
@@ -152,12 +194,45 @@ export interface AppConfig {
   priceFeed: "onchain" | "pyth" | "binance";
   strategy: StrategyName;
   /**
-   * When true, the rebalancer submits a single unified PTB per tick
-   * (collect_fee → remove → transfer → redeem → add → supply, atomic).
-   * When false, falls back to the per-op transaction sequence (5+ PTBs).
-   * Default false until the unified path is mainnet-validated.
+   * When true (the default), the rebalancer submits a single unified PTB per
+   * tick (collect_fee → remove → transfer → redeem → add → supply, atomic).
+   * Set UNIFIED_TX=false for the legacy per-op transaction sequence — that
+   * path is non-atomic: a failed add after a successful remove leaves the
+   * position closed with capital idling until the next tick.
    */
   unifiedTx: boolean;
+  /**
+   * Safety margin (bps) applied to dryRun-estimated remove proceeds before
+   * they are counted into the unified add amounts. Guards against swaps
+   * landing between the dryRun and execution shifting the active bin's
+   * internal composition. Undershoot is safe (dust → balance → lending).
+   */
+  readdProceedsHaircutBps: number;
+  /**
+   * Max active-bin drift (bins) between plan time and execution. Checked
+   * client-side right before submit, and enforced on-chain via
+   * `validate_active_id_slippage` when `slippageGuardOnchain` is true.
+   */
+  slippageMaxBinDrift: number;
+  /** Append the on-chain active-id slippage assertion to add PTBs. */
+  slippageGuardOnchain: boolean;
+  /**
+   * DLMM router package (published_at) providing utils::validate_active_id_slippage.
+   * Defaults to the verified mainnet address; override for testnet/devnet.
+   */
+  dlmmPublishedAt: string;
+  /** Extra resubmits of identical signed bytes on transient RPC errors. */
+  rpcRetryAttempts: number;
+  /** Delay (ms) before each retry / digest check. */
+  rpcRetryBackoffMs: number;
+  /**
+   * Churn cap: max NON-emergency rebalances per PM per rolling hour, counted
+   * over ALL `rebalances` rows (failed ones burned gas/eval slots too). The
+   * risk-active cooldown bypass can otherwise drive unbounded rebalances when
+   * an L2 boundary flaps; EXTREME full-withdrawals are exempt. Checked BEFORE
+   * the treasury charge so capped ticks never debit the user.
+   */
+  rebalanceMaxPerHour: number;
   lending: LendingAppConfig;
   treasury: TreasuryAppConfig;
   /** Python prediction sidecar config (v1 ML layer). */
@@ -174,6 +249,12 @@ export interface AppConfig {
   risk: RiskAppConfig;
   /** How often the background riskObserver loop samples market data (ms). */
   riskObserverIntervalMs: number;
+  /**
+   * State-machine threshold bundle (STATE_* env vars). Defaults preserve the
+   * v1 hardcoded values; W5 grid-search results are deployed by setting the
+   * env vars, not by editing src/state/params.ts.
+   */
+  stateParams: StateParams;
 }
 
 function required(name: string): string {
@@ -427,6 +508,10 @@ export function loadConfig(): AppConfig {
   const pnl24hPct = Number(optional("RISK_PNL_24H_PCT", "-0.05"));
   const l1SpreadSoftBandLow = Number(optional("RISK_L1_SPREAD_SOFT_BAND_LOW", "0.005"));
   const l1SpreadSoftBandHigh = Number(optional("RISK_L1_SPREAD_SOFT_BAND_HIGH", "0.01"));
+  const volatilityRecovery = Number(optional("RISK_VOLATILITY_RECOVERY", "0.07"));
+  const sourceStaleSuiMs = Number(optional("RISK_SOURCE_STALE_SUI_MS", "60000"));
+  const sourceStaleCetusMs = Number(optional("RISK_SOURCE_STALE_CETUS_MS", "180000"));
+  const sourceStaleDerivMs = Number(optional("RISK_SOURCE_STALE_DERIV_MS", "600000"));
 
   for (const [name, value] of [
     ["RISK_EXTREME_VOLATILITY_5M", extremeVolatility5m],
@@ -443,6 +528,128 @@ export function loadConfig(): AppConfig {
   }
   if (!Number.isFinite(pnl24hPct)) {
     errs.push(`RISK_PNL_24H_PCT must be a finite number, got '${process.env.RISK_PNL_24H_PCT ?? ""}'`);
+  }
+  if (!Number.isFinite(volatilityRecovery) || volatilityRecovery <= 0) {
+    errs.push(`RISK_VOLATILITY_RECOVERY must be a positive number, got '${process.env.RISK_VOLATILITY_RECOVERY ?? ""}'`);
+  } else if (Number.isFinite(extremeVolatility5m) && volatilityRecovery >= extremeVolatility5m) {
+    errs.push(
+      `RISK_VOLATILITY_RECOVERY (${volatilityRecovery}) must be strictly below RISK_EXTREME_VOLATILITY_5M (${extremeVolatility5m}) — the exit threshold must sit below the entry threshold or the hysteresis degenerates`,
+    );
+  }
+  for (const [name, value] of [
+    ["RISK_SOURCE_STALE_SUI_MS", sourceStaleSuiMs],
+    ["RISK_SOURCE_STALE_CETUS_MS", sourceStaleCetusMs],
+    ["RISK_SOURCE_STALE_DERIV_MS", sourceStaleDerivMs],
+  ] as const) {
+    if (!Number.isFinite(value) || value <= 0) {
+      errs.push(`${name} must be a positive number, got '${process.env[name] ?? ""}'`);
+    }
+  }
+
+  // L3 emergency-stop trip thresholds.
+  const l3RepeatedL2Count = Number(optional("RISK_L3_REPEATED_L2_COUNT", "3"));
+  const l3RepeatedL2WindowMs = Number(optional("RISK_L3_REPEATED_L2_WINDOW_MS", "3600000"));
+  const l3OutageMs = Number(optional("RISK_L3_OUTAGE_MS", "300000"));
+  const l3PnlPct = Number(optional("RISK_L3_PNL_PCT", "-0.15"));
+  const l3TxFailureCount = Number(optional("RISK_L3_TX_FAILURE_COUNT", "5"));
+
+  if (!Number.isInteger(l3RepeatedL2Count) || l3RepeatedL2Count < 1) {
+    errs.push(`RISK_L3_REPEATED_L2_COUNT must be a positive integer, got '${process.env.RISK_L3_REPEATED_L2_COUNT ?? ""}'`);
+  }
+  if (!Number.isFinite(l3RepeatedL2WindowMs) || l3RepeatedL2WindowMs <= 0) {
+    errs.push(`RISK_L3_REPEATED_L2_WINDOW_MS must be a positive number, got '${process.env.RISK_L3_REPEATED_L2_WINDOW_MS ?? ""}'`);
+  }
+  if (!Number.isFinite(l3OutageMs) || l3OutageMs <= 0) {
+    errs.push(`RISK_L3_OUTAGE_MS must be a positive number, got '${process.env.RISK_L3_OUTAGE_MS ?? ""}'`);
+  } else if (Number.isFinite(sourceStaleSuiMs) && l3OutageMs <= sourceStaleSuiMs) {
+    errs.push(
+      `RISK_L3_OUTAGE_MS (${l3OutageMs}) must exceed RISK_SOURCE_STALE_SUI_MS (${sourceStaleSuiMs}) — L3 escalates only after the L2 staleness circuit has had a chance to fire`,
+    );
+  }
+  if (!Number.isFinite(l3PnlPct)) {
+    errs.push(`RISK_L3_PNL_PCT must be a finite number, got '${process.env.RISK_L3_PNL_PCT ?? ""}'`);
+  } else if (Number.isFinite(pnl24hPct) && l3PnlPct >= pnl24hPct) {
+    errs.push(
+      `RISK_L3_PNL_PCT (${l3PnlPct}) must be more negative than RISK_PNL_24H_PCT (${pnl24hPct}) — L3 is the catastrophic tier above the L2 daily-loss circuit`,
+    );
+  }
+  if (!Number.isInteger(l3TxFailureCount) || l3TxFailureCount < 1) {
+    errs.push(`RISK_L3_TX_FAILURE_COUNT must be a positive integer, got '${process.env.RISK_L3_TX_FAILURE_COUNT ?? ""}'`);
+  }
+
+  // State-machine threshold bundle (STATE_* env vars, defaults = v1 values).
+  const d = DEFAULT_STATE_PARAMS;
+  const stateParams: StateParams = {
+    kW: Number(optional("STATE_K_W", String(d.kW))),
+    uHigh: Number(optional("STATE_U_HIGH", String(d.uHigh))),
+    driftStrengthEntry: Number(optional("STATE_DRIFT_STRENGTH_ENTRY", String(d.driftStrengthEntry))),
+    driftStrengthExit: Number(optional("STATE_DRIFT_STRENGTH_EXIT", String(d.driftStrengthExit))),
+    pBreakEntry: Number(optional("STATE_P_BREAK_ENTRY", String(d.pBreakEntry))),
+    pBreakSumExtreme: Number(optional("STATE_P_BREAK_SUM_EXTREME", String(d.pBreakSumExtreme))),
+    pBreakSumExtremeExit: Number(optional("STATE_P_BREAK_SUM_EXTREME_EXIT", String(d.pBreakSumExtremeExit))),
+    trendBiasStrong: Number(optional("STATE_TREND_BIAS_STRONG", String(d.trendBiasStrong))),
+  };
+  for (const [name, value, min, max] of [
+    ["STATE_K_W", stateParams.kW, 0, Infinity],
+    ["STATE_U_HIGH", stateParams.uHigh, 0, 1],
+    ["STATE_DRIFT_STRENGTH_ENTRY", stateParams.driftStrengthEntry, 0, Infinity],
+    ["STATE_DRIFT_STRENGTH_EXIT", stateParams.driftStrengthExit, 0, Infinity],
+    ["STATE_P_BREAK_ENTRY", stateParams.pBreakEntry, 0, 1],
+    ["STATE_P_BREAK_SUM_EXTREME", stateParams.pBreakSumExtreme, 0, 2],
+    ["STATE_P_BREAK_SUM_EXTREME_EXIT", stateParams.pBreakSumExtremeExit, 0, 2],
+    ["STATE_TREND_BIAS_STRONG", stateParams.trendBiasStrong, 0, 1],
+  ] as const) {
+    if (!Number.isFinite(value) || value <= min || value > max) {
+      errs.push(`${name} must be a number in (${min}, ${max}], got '${process.env[name] ?? value}'`);
+    }
+  }
+  if (
+    Number.isFinite(stateParams.driftStrengthExit) &&
+    Number.isFinite(stateParams.driftStrengthEntry) &&
+    stateParams.driftStrengthExit >= stateParams.driftStrengthEntry
+  ) {
+    errs.push(
+      `STATE_DRIFT_STRENGTH_EXIT (${stateParams.driftStrengthExit}) must be strictly below STATE_DRIFT_STRENGTH_ENTRY (${stateParams.driftStrengthEntry}) — the TREND hysteresis band requires exit < entry`,
+    );
+  }
+  if (
+    Number.isFinite(stateParams.pBreakSumExtremeExit) &&
+    Number.isFinite(stateParams.pBreakSumExtreme) &&
+    stateParams.pBreakSumExtremeExit >= stateParams.pBreakSumExtreme
+  ) {
+    errs.push(
+      `STATE_P_BREAK_SUM_EXTREME_EXIT (${stateParams.pBreakSumExtremeExit}) must be strictly below STATE_P_BREAK_SUM_EXTREME (${stateParams.pBreakSumExtreme}) — the EXTREME hysteresis band requires exit < entry`,
+    );
+  }
+
+  // Execution-path knobs (unified PTB, slippage guard, retry).
+  const readdProceedsHaircutBps = Number(optional("READD_PROCEEDS_HAIRCUT_BPS", "10"));
+  if (!Number.isFinite(readdProceedsHaircutBps) || readdProceedsHaircutBps < 0 || readdProceedsHaircutBps >= 10_000) {
+    errs.push(`READD_PROCEEDS_HAIRCUT_BPS must be in [0, 10000), got '${process.env.READD_PROCEEDS_HAIRCUT_BPS ?? ""}'`);
+  }
+  const slippageMaxBinDrift = Number(optional("SLIPPAGE_MAX_BIN_DRIFT", "1"));
+  if (!Number.isInteger(slippageMaxBinDrift) || slippageMaxBinDrift < 0) {
+    errs.push(`SLIPPAGE_MAX_BIN_DRIFT must be a non-negative integer, got '${process.env.SLIPPAGE_MAX_BIN_DRIFT ?? ""}'`);
+  }
+  const slippageGuardOnchain = optional("SLIPPAGE_GUARD_ONCHAIN", "true").toLowerCase() !== "false";
+  // Verified mainnet DLMM router published_at (utils::validate_active_id_slippage;
+  // on-chain normalized signature checked 2026-07-06 — note: this is the ROUTER
+  // package, not the DLMM core package).
+  const dlmmPublishedAt = optional(
+    "DLMM_PUBLISHED_AT",
+    "0x36d7c12e8497cee9259dd6b0da9f8bbe955134d658a1e3e7c682d43c7a955125",
+  );
+  const rpcRetryAttempts = Number(optional("RPC_RETRY_ATTEMPTS", "1"));
+  if (!Number.isInteger(rpcRetryAttempts) || rpcRetryAttempts < 0) {
+    errs.push(`RPC_RETRY_ATTEMPTS must be a non-negative integer, got '${process.env.RPC_RETRY_ATTEMPTS ?? ""}'`);
+  }
+  const rpcRetryBackoffMs = Number(optional("RPC_RETRY_BACKOFF_MS", "2000"));
+  if (!Number.isFinite(rpcRetryBackoffMs) || rpcRetryBackoffMs < 0) {
+    errs.push(`RPC_RETRY_BACKOFF_MS must be a non-negative number, got '${process.env.RPC_RETRY_BACKOFF_MS ?? ""}'`);
+  }
+  const rebalanceMaxPerHour = Number(optional("REBALANCE_MAX_PER_HOUR", "4"));
+  if (!Number.isInteger(rebalanceMaxPerHour) || rebalanceMaxPerHour < 1) {
+    errs.push(`REBALANCE_MAX_PER_HOUR must be a positive integer, got '${process.env.REBALANCE_MAX_PER_HOUR ?? ""}'`);
   }
 
   // Risk observer sampling interval.
@@ -463,6 +670,17 @@ export function loadConfig(): AppConfig {
       pnl24hPct,
       l1SpreadSoftBandLow,
       l1SpreadSoftBandHigh,
+      volatilityRecovery,
+      sourceStaleSuiMs,
+      sourceStaleCetusMs,
+      sourceStaleDerivMs,
+    },
+    l3: {
+      repeatedL2Count: l3RepeatedL2Count,
+      repeatedL2WindowMs: l3RepeatedL2WindowMs,
+      outageMs: l3OutageMs,
+      pnlPct: l3PnlPct,
+      txFailureCount: l3TxFailureCount,
     },
   };
 
@@ -500,7 +718,14 @@ export function loadConfig(): AppConfig {
     perPmCooldownMs,
     priceFeed: parsePriceFeed(optional("PRICE_FEED", "onchain")),
     strategy: parseStrategy(optional("STRATEGY", "singleBin")),
-    unifiedTx: optional("UNIFIED_TX", "false").toLowerCase() === "true",
+    unifiedTx: optional("UNIFIED_TX", "true").toLowerCase() !== "false",
+    readdProceedsHaircutBps,
+    slippageMaxBinDrift,
+    slippageGuardOnchain,
+    dlmmPublishedAt,
+    rpcRetryAttempts,
+    rpcRetryBackoffMs,
+    rebalanceMaxPerHour,
     lending,
     treasury,
     prediction,
@@ -508,6 +733,7 @@ export function loadConfig(): AppConfig {
     fallbackStrategy,
     risk,
     riskObserverIntervalMs,
+    stateParams,
   };
 
   return cached;

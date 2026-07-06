@@ -280,6 +280,70 @@ export function checkDataOutage(
 }
 
 // ---------------------------------------------------------------------------
+// L2 trigger: per-source feed staleness
+// ---------------------------------------------------------------------------
+
+/**
+ * A staleness sample captured from `marketAggregator.staleness()` at
+ * `capturedAtMs`. Each field is "ms since that source last updated" AT capture
+ * time — consumers must add `nowMs - capturedAtMs` to get the effective age,
+ * because the sample itself ages between observer ticks.
+ */
+export interface SourceStalenessInput {
+  /** When the staleness sample itself was captured (epoch ms). */
+  capturedAtMs: number;
+  /** ms since the last Binance SUIUSDC update, at capture time. */
+  sui: number;
+  /** ms since the last Cetus pool-event update, at capture time. */
+  cetus: number;
+  /** ms since the last derivatives update, at capture time. */
+  derivatives: number;
+}
+
+/**
+ * Per-source staleness triggers. The aggregate `checkDataOutage` compares the
+ * max-of-sources snapshot timestamp — which a single live feed keeps fresh,
+ * masking a dead sibling (e.g. Cetus events stop while Binance keeps polling:
+ * the pool price is frozen but no outage fires). These per-source checks close
+ * that hole.
+ *
+ * `input === null` (staleness never observed) returns three non-firing results
+ * with `observed: NaN` — callers that never feed staleness (old paths, some
+ * tests) see unchanged behaviour.
+ */
+export function checkSourceStaleness(
+  input: SourceStalenessInput | null,
+  thresholds: { suiMs: number; cetusMs: number; derivMs: number },
+  nowMs: number,
+): TriggerResult[] {
+  const metricFor = (src: string) => `source_stale_${src}`;
+  if (input === null) {
+    return [
+      { fires: false, metric: metricFor("sui"), threshold: thresholds.suiMs, observed: NaN },
+      { fires: false, metric: metricFor("cetus"), threshold: thresholds.cetusMs, observed: NaN },
+      { fires: false, metric: metricFor("derivatives"), threshold: thresholds.derivMs, observed: NaN },
+    ];
+  }
+  // The sample itself ages: recorded age + time since capture.
+  const drift = Math.max(0, nowMs - input.capturedAtMs);
+  const results: TriggerResult[] = [];
+  for (const [src, age, threshold] of [
+    ["sui", input.sui, thresholds.suiMs],
+    ["cetus", input.cetus, thresholds.cetusMs],
+    ["derivatives", input.derivatives, thresholds.derivMs],
+  ] as const) {
+    const observed = age + drift;
+    results.push({
+      fires: Number.isFinite(observed) && observed > threshold,
+      metric: metricFor(src),
+      threshold,
+      observed,
+    });
+  }
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // Hysteresis / exit logic
 // ---------------------------------------------------------------------------
 
@@ -321,8 +385,11 @@ export function canExitExtreme(input: ExitExtremeInput): boolean {
   // 1. All triggers must be clear
   if (triggerResults.some((r) => r.fires)) return false;
 
-  // 2. Volatility hysteresis: must have recovered below recovery threshold
-  if (Number.isFinite(currentVolatility5m) && currentVolatility5m >= volatilityRecoveryThreshold) {
+  // 2. Volatility hysteresis: must have recovered below recovery threshold.
+  //    NaN (no data) counts as NOT recovered — exiting the protective state
+  //    while blind would invert the hysteresis's purpose (matches the
+  //    ExitExtremeInput doc: "NaN means no data — treated as not recovered").
+  if (!Number.isFinite(currentVolatility5m) || currentVolatility5m >= volatilityRecoveryThreshold) {
     return false;
   }
 

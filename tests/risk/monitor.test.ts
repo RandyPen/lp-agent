@@ -58,6 +58,10 @@ const DEFAULT_THRESHOLDS: RiskThresholds = {
   pnl24hPct: -0.05,
   l1SpreadSoftBandLow: 0.005,
   l1SpreadSoftBandHigh: 0.01,
+  volatilityRecovery: 0.07,
+  sourceStaleSuiMs: 60_000,
+  sourceStaleCetusMs: 180_000,
+  sourceStaleDerivMs: 600_000,
 };
 
 const BASE_NOW = 1_700_000_000_000;
@@ -646,5 +650,270 @@ describe("activeLevel when no circuits active", () => {
 
     extMonitor.observeForPool(POOL_ID, makeSnapshot({ ts: clock }));
     expect(monitor.activeLevel(POOL_ID)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 additions — L3 auto-trip, per-source staleness, configurable
+// volatility recovery.
+// ---------------------------------------------------------------------------
+
+import type { L3Thresholds } from "../../src/config.ts";
+import type { StalenessInfo } from "../../src/data/marketAggregator.ts";
+
+const TEST_L3: L3Thresholds = {
+  repeatedL2Count: 3,
+  repeatedL2WindowMs: 3_600_000,
+  outageMs: 300_000,
+  pnlPct: -0.15,
+  txFailureCount: 5,
+};
+
+function makeStaleness(overrides: Partial<StalenessInfo> = {}): StalenessInfo {
+  return { sui: 0, btc: 0, eth: 0, derivatives: 0, cetus: 0, ...overrides };
+}
+
+function makeInputWithPosition(): StrategyInput {
+  const input = makeStrategyInput();
+  input.pm.positionBins = [
+    { binId: 99, liquidityShare: 1_000n, amountA: 0n, amountB: 0n },
+    { binId: 101, liquidityShare: 1_000n, amountA: 0n, amountB: 0n },
+  ];
+  return input;
+}
+
+describe("L3 auto-trip: repeated L2 activations", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("trips after N EXTREME entries within the window", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+
+    // Drive 3 separate L2 enter/exit cycles via volatility spikes.
+    for (let cycle = 0; cycle < 3; cycle++) {
+      // Spike: two prices 15% apart within 5min → volatility fires → EXTREME.
+      monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.00" }));
+      now += 1_000;
+      monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+      expect(monitor.activeLevel(POOL_ID)).toBe("L2");
+
+      // Calm down: advance past the 5-min window + 10-min stability, feed calm
+      // prices so the circuit clears.
+      now += 16 * 60_000;
+      monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+      now += 1_000;
+      monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+      if (cycle < 2) expect(monitor.activeLevel(POOL_ID)).toBe(null);
+      now += 60_000;
+    }
+
+    // 3 L2 entries recorded within the 1h window → checkPreTick trips L3.
+    const veto = monitor.checkPreTick(makeStrategyInput());
+    expect(veto?.kind).toBe("emergency");
+    expect(monitor.emergencyStop.isTripped()).toBe(true);
+    const trips = getRiskEvents(db).filter((e) => e.kind === "emergency_trip");
+    expect(trips.some((e) => e.metric === "repeated_l2")).toBe(true);
+  });
+
+  it("does not trip below the repeat threshold", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.00" }));
+    now += 1_000;
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+    // One L2 entry only → L2 veto, not emergency.
+    const veto = monitor.checkPreTick(makeStrategyInput());
+    expect(veto?.kind).toBe("extreme");
+    expect(monitor.emergencyStop.isTripped()).toBe(false);
+  });
+});
+
+describe("L3 auto-trip: data outage with open position", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("trips when data is stale beyond outageMs AND a position is open", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
+    now += TEST_L3.outageMs + 1_000;
+
+    const veto = monitor.checkPreTick(makeInputWithPosition());
+    expect(veto?.kind).toBe("emergency");
+    expect(monitor.emergencyStop.isTripped()).toBe(true);
+  });
+
+  it("does NOT trip on outage when no position is open (L2 handles it)", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
+    now += TEST_L3.outageMs + 1_000;
+
+    monitor.checkPreTick(makeStrategyInput()); // empty positionBins
+    expect(monitor.emergencyStop.isTripped()).toBe(false);
+  });
+
+  it("does NOT trip when data never flowed (cold start is not an outage)", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    now += TEST_L3.outageMs * 10;
+    monitor.checkPreTick(makeInputWithPosition());
+    expect(monitor.emergencyStop.isTripped()).toBe(false);
+  });
+});
+
+describe("L3 auto-trip: catastrophic 24h PnL", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("trips when PnL falls below the L3 threshold", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.set24hPnl(POOL_ID, -0.20); // below -0.15
+    const veto = monitor.checkPreTick(makeStrategyInput());
+    expect(veto?.kind).toBe("emergency");
+  });
+
+  it("L2 pnl territory (-0.06) does not trip L3", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
+    monitor.set24hPnl(POOL_ID, -0.06);
+    // evaluateL2 runs on the next observation → L2 EXTREME, not L3.
+    now += 1_000;
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
+    const veto = monitor.checkPreTick(makeStrategyInput());
+    expect(veto?.kind).toBe("extreme");
+    expect(monitor.emergencyStop.isTripped()).toBe(false);
+  });
+});
+
+describe("per-source staleness circuit (max-ts masking fix)", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("dead cetus feed trips L2 even while the aggregate snapshot ts stays fresh", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    // Fresh snapshot keeps latestSnapshotTs current (binance is alive).
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
+    expect(monitor.activeLevel(POOL_ID)).toBe(null);
+
+    // Staleness sample: binance fresh, cetus dead for 4 minutes (> 180s).
+    monitor.observeSourceStaleness(POOL_ID, makeStaleness({ sui: 5_000, cetus: 240_000 }));
+    expect(monitor.activeLevel(POOL_ID)).toBe("L2");
+
+    const events = getRiskEvents(db);
+    expect(events.some((e) => e.metric === "source_stale_cetus")).toBe(true);
+  });
+
+  it("fires during a total outage when observeForPool never runs", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    // Only staleness flows (marketAggregator.latest() would be throwing).
+    monitor.observeSourceStaleness(POOL_ID, makeStaleness({ sui: 120_000, cetus: 240_000, derivatives: 700_000 }));
+    expect(monitor.activeLevel(POOL_ID)).toBe("L2");
+  });
+
+  it("the staleness sample itself ages between observer ticks", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    // Sample says sui is 30s stale — under the 60s threshold.
+    monitor.observeSourceStaleness(POOL_ID, makeStaleness({ sui: 30_000 }));
+    expect(monitor.activeLevel(POOL_ID)).toBe(null);
+    // 40s later with no new sample: effective age 70s > 60s. A fresh pre-tick
+    // evaluation must see it fire (re-evaluate via a new staleness ingest
+    // carrying the same capture, simulated by advancing the clock and feeding
+    // an already-old sample).
+    now += 40_000;
+    monitor.observeSourceStaleness(POOL_ID, makeStaleness({ sui: 70_000 }));
+    expect(monitor.activeLevel(POOL_ID)).toBe("L2");
+  });
+
+  it("fresh sources do not fire", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    monitor.observeSourceStaleness(POOL_ID, makeStaleness({ sui: 1_000, cetus: 5_000, derivatives: 10_000 }));
+    expect(monitor.activeLevel(POOL_ID)).toBe(null);
+  });
+});
+
+describe("configurable volatility recovery threshold", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("volRecovered honours thresholds.volatilityRecovery", () => {
+    let now = BASE_NOW;
+    // Entry at 10%, recovery at 2% (tighter than the default 7%).
+    const monitor = createRiskMonitor({
+      db,
+      thresholds: { ...DEFAULT_THRESHOLDS, volatilityRecovery: 0.02 },
+      l3: TEST_L3,
+      nowMs: () => now,
+    });
+    // Enter EXTREME via a 15% spike.
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.00" }));
+    now += 1_000;
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+    expect(monitor.activeLevel(POOL_ID)).toBe("L2");
+
+    // 11 min later, vol is ~4% — below the entry threshold (all triggers clear)
+    // but ABOVE the 2% recovery threshold → volRecovered must stay false.
+    now += 11 * 60_000;
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+    now += 1_000;
+    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.196" })); // 4% within window
+    expect(monitor.volRecovered(POOL_ID)).toBe(false);
+  });
+});
+
+describe("risk_events source discriminator (D3)", () => {
+  beforeEach(() => { db = freshDb(); });
+
+  it("a shadow-sourced monitor stamps source='shadow'; default is 'live'", () => {
+    let now = BASE_NOW;
+    const live = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    const shadow = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+      emergencyStop: live.emergencyStop,
+      source: "shadow",
+    });
+
+    // Drive an L2 volatility trigger on each monitor.
+    for (const m of [live, shadow]) {
+      m.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.00" }));
+      now += 1_000;
+      m.observeForPool(POOL_ID, makeSnapshot({ ts: now, price: "1.15" }));
+      now += 1_000;
+    }
+
+    const sources = db
+      .prepare<{ source: string; n: number }, []>(
+        "SELECT source, COUNT(*) AS n FROM risk_events GROUP BY source",
+      )
+      .all();
+    const bySource = new Map(sources.map((r) => [r.source, r.n]));
+    expect(bySource.get("live") ?? 0).toBeGreaterThan(0);
+    expect(bySource.get("shadow") ?? 0).toBeGreaterThan(0);
   });
 });

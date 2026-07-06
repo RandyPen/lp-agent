@@ -12,19 +12,62 @@
 import type { MarketState } from "../prediction/types.ts";
 
 // ---------------------------------------------------------------------------
-// Named constants (W5 grid-search will update these)
+// Tunable threshold bundle (env-overridable via cfg.stateParams)
 // ---------------------------------------------------------------------------
 
-/** Multiplier applied to widthSigma to get halfWidth. k_w = 2.0 initial. */
-export const K_W = 2.0;
-
 /**
- * Uncertainty high threshold: when featureCompleteness falls below this,
- * the prediction is considered high-uncertainty and maxCenterOffset tightens
- * to 1 bin.  Initial value is P75 of the walk-forward completeness series;
- * hardcoded as 0.8 for v1 until W5 calibration.
+ * All grid-search-calibratable state-machine thresholds, bundled so they can
+ * be overridden per-deployment via env vars (`STATE_*`, see src/config.ts)
+ * instead of requiring a code edit + redeploy for every W5 recalibration.
+ *
+ * Every derivation / transition function accepts an optional `params` argument
+ * defaulting to `DEFAULT_STATE_PARAMS`, which carries the original v1 values.
  */
-export const U_HIGH = 0.8;
+export interface StateParams {
+  /** Multiplier applied to widthSigma to get halfWidth. */
+  kW: number;
+  /**
+   * Uncertainty high threshold: when featureCompleteness falls below this,
+   * the prediction is considered high-uncertainty and maxCenterOffset tightens
+   * to 1 bin. Initial value is P75 of the walk-forward completeness series.
+   */
+  uHigh: number;
+  /** TREND entry: drift_strength threshold. */
+  driftStrengthEntry: number;
+  /** TREND exit: drift_strength hysteresis threshold (below this → can exit). */
+  driftStrengthExit: number;
+  /** TREND / NORMAL entry: p_break threshold (max(pAbove, pBelow) > this). */
+  pBreakEntry: number;
+  /**
+   * EXTREME entry via local prediction: pAbove + pBelow > this triggers
+   * EXTREME regardless of external risk signal.
+   */
+  pBreakSumExtreme: number;
+  /**
+   * EXTREME exit hysteresis: p-sum must recede below this (strictly lower
+   * than `pBreakSumExtreme`) before an exit is allowed. Prevents flapping
+   * when the p-sum oscillates around the entry threshold.
+   */
+  pBreakSumExtremeExit: number;
+  /** trendBias magnitude above which strong-trend mode activates. */
+  trendBiasStrong: number;
+}
+
+/** v1 initial values (pre-W5-grid-search). */
+export const DEFAULT_STATE_PARAMS: StateParams = {
+  kW: 2.0,
+  uHigh: 0.8,
+  driftStrengthEntry: 2.0,
+  driftStrengthExit: 1.5,
+  pBreakEntry: 0.6,
+  pBreakSumExtreme: 0.7,
+  pBreakSumExtremeExit: 0.6,
+  trendBiasStrong: 0.7,
+};
+
+// ---------------------------------------------------------------------------
+// Fixed structural constants (not part of the grid search)
+// ---------------------------------------------------------------------------
 
 /** Minimum allowed halfWidth in bins. */
 export const HALF_WIDTH_MIN = 2;
@@ -40,31 +83,6 @@ export const MAX_CENTER_OFFSET_MAX = 3;
 
 /** Denominator used to normalise (pAbove - pBelow) into trendBias. */
 export const TREND_BIAS_NORMALISER = 0.5;
-
-/** TREND entry: drift_strength threshold. */
-export const DRIFT_STRENGTH_ENTRY = 2.0;
-
-/** TREND exit: drift_strength hysteresis threshold (below this → can exit). */
-export const DRIFT_STRENGTH_EXIT = 1.5;
-
-/** TREND / NORMAL entry: p_break threshold (max(pAbove, pBelow) > this). */
-export const P_BREAK_ENTRY = 0.6;
-
-/**
- * EXTREME entry via local prediction: pAbove + pBelow > this triggers EXTREME
- * regardless of external risk signal.
- */
-export const P_BREAK_SUM_EXTREME = 0.7;
-
-/**
- * EXTREME exit: volatility recovery hysteresis.  The rolling volatility must
- * have receded to within (1 + EXTREME_VOL_HYSTERESIS) of its pre-extreme
- * baseline before the exit clearance is considered valid.  Value 0.07 = 7%.
- */
-export const EXTREME_VOL_HYSTERESIS = 0.07;
-
-/** trendBias magnitude above which strong-trend mode activates. */
-export const TREND_BIAS_STRONG = 0.7;
 
 // ---------------------------------------------------------------------------
 // Per-state fixed parameters
@@ -110,14 +128,29 @@ export const LENDING_PCT_BASE: Record<MarketState, number> = {
 // ---------------------------------------------------------------------------
 
 /**
+ * Throw when a prediction-derived input is NaN/Infinity. The sidecar layer
+ * already validates finiteness (sidecarProvider), so a non-finite value here
+ * is an invariant violation — fail loudly instead of silently clamping NaN
+ * into a plan. The throw propagates out of mlAgent.plan() into the
+ * rebalancer's tickOne catch, which marks the tick failed and logs at error.
+ */
+function assertFinite(value: number, fn: string, arg: string): void {
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`state/params: ${fn} received non-finite ${arg}: ${value}`);
+  }
+}
+
+/**
  * Derive the target half-width (in bins) from model width uncertainty.
  *
  *   halfWidth = clamp(round(k_w × widthSigma), HALF_WIDTH_MIN, HALF_WIDTH_MAX)
- *
- * k_w = 2.0 (W5 grid-search calibrated).
  */
-export function deriveHalfWidth(widthSigma: number): number {
-  const raw = Math.round(K_W * widthSigma);
+export function deriveHalfWidth(
+  widthSigma: number,
+  params: StateParams = DEFAULT_STATE_PARAMS,
+): number {
+  assertFinite(widthSigma, "deriveHalfWidth", "widthSigma");
+  const raw = Math.round(params.kW * widthSigma);
   return Math.max(HALF_WIDTH_MIN, Math.min(HALF_WIDTH_MAX, raw));
 }
 
@@ -141,6 +174,8 @@ export function deriveHalfWidth(widthSigma: number): number {
  * @param halfWidth  - derived halfWidth for this tick (from deriveHalfWidth)
  */
 export function deriveToleranceBins(widthSigma: number, halfWidth: number): number {
+  assertFinite(widthSigma, "deriveToleranceBins", "widthSigma");
+  assertFinite(halfWidth, "deriveToleranceBins", "halfWidth");
   const raw = Math.max(1, Math.round(widthSigma));
   return Math.min(raw, halfWidth);
 }
@@ -161,6 +196,7 @@ export function deriveMaxCenterOffset(
   widthSigma: number,
   uncertaintyHigh: boolean,
 ): number {
+  assertFinite(widthSigma, "deriveMaxCenterOffset", "widthSigma");
   if (uncertaintyHigh) return 1;
   const raw = Math.round(widthSigma);
   return Math.max(MAX_CENTER_OFFSET_MIN, Math.min(MAX_CENTER_OFFSET_MAX, raw));
@@ -175,6 +211,8 @@ export function deriveMaxCenterOffset(
  * Used only in TREND state.
  */
 export function deriveTrendBias(pAbove: number, pBelow: number): number {
+  assertFinite(pAbove, "deriveTrendBias", "pAbove");
+  assertFinite(pBelow, "deriveTrendBias", "pBelow");
   const raw = (pAbove - pBelow) / TREND_BIAS_NORMALISER;
   return Math.max(-1, Math.min(1, raw));
 }
@@ -196,6 +234,7 @@ export function deriveLendingPct(
   state: MarketState,
   trendBias: number,
 ): number {
+  assertFinite(trendBias, "deriveLendingPct", "trendBias");
   let base: number;
   if (state === "EXTREME") {
     base = LENDING_PCT_BASE.EXTREME;  // 1.0

@@ -37,9 +37,64 @@ export function resetDbCacheForTests(): void {
  * Non-goal: in-place ALTER for production data. Until the project ships, the
  * DB is considered disposable; `rm ./data/app.db` is the recovery path for any
  * incompatible schema change.
+ *
+ * DOCUMENTED DEVIATION — `ensureColumns` below: a minimal ADDITIVE-ONLY guard
+ * (PRAGMA table_info check → ALTER TABLE ADD COLUMN). It exists because some
+ * data must survive mid-flight schema additions — e.g. a 14-day shadow-mode
+ * validation window or the live risk_events history — where `rm app.db` would
+ * destroy the very evidence being collected. It is NOT a migration system: no
+ * version table, additions only, and a failed ALTER throws (fail loud).
  */
 function applySchema(db: Database): void {
   const here = dirname(fileURLToPath(import.meta.url));
   const sql = readFileSync(resolve(here, SCHEMA_FILE), "utf8");
   db.exec(sql);
+  ensureColumns(db, ADDITIVE_COLUMNS);
+}
+
+interface AdditiveColumn {
+  table: string;
+  column: string;
+  /** Full ALTER TABLE … ADD COLUMN statement. */
+  ddl: string;
+}
+
+/**
+ * Columns added AFTER a table first shipped. Fresh DBs get them from the
+ * CREATE TABLE in schema.sql; pre-existing DBs get them via ALTER here.
+ */
+const ADDITIVE_COLUMNS: AdditiveColumn[] = [
+  {
+    table: "shadow_decisions",
+    column: "active_bin",
+    ddl: "ALTER TABLE shadow_decisions ADD COLUMN active_bin INTEGER",
+  },
+  {
+    table: "shadow_decisions",
+    column: "spot_price",
+    ddl: "ALTER TABLE shadow_decisions ADD COLUMN spot_price TEXT",
+  },
+  {
+    table: "risk_events",
+    column: "source",
+    ddl: "ALTER TABLE risk_events ADD COLUMN source TEXT NOT NULL DEFAULT 'live' CHECK(source IN ('live','shadow'))",
+  },
+];
+
+/** Test hook: run the additive-column guard against an arbitrary DB. */
+export function ensureColumnsForTests(db: Database): void {
+  ensureColumns(db, ADDITIVE_COLUMNS);
+}
+
+function ensureColumns(db: Database, columns: AdditiveColumn[]): void {
+  for (const spec of columns) {
+    const info = db
+      .prepare<{ name: string }, []>(`PRAGMA table_info(${spec.table})`)
+      .all();
+    if (info.length === 0) continue; // table absent (schema.sql just created it — impossible; guard anyway)
+    if (info.some((c) => c.name === spec.column)) continue;
+    // Throw on failure — a silently-missing column would surface later as
+    // confusing INSERT errors.
+    db.exec(spec.ddl);
+  }
 }

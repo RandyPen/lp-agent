@@ -1,5 +1,6 @@
-import { getSuiClient } from "../sui/client.ts";
+import { getSuiClient, type SuiClient } from "../sui/client.ts";
 import { getAgentKeypair, getAgentAddress } from "../sui/keypair.ts";
+import { submitWithRetry } from "../sui/submit.ts";
 import {
   buildCollectFeeTx,
   buildTransferFeeToBalanceTx,
@@ -13,6 +14,7 @@ import {
   buildKaiRedeemTx,
 } from "../sui/cdpm/tx_lending.ts";
 import {
+  buildRemoveProbeTx,
   buildUnifiedRebalanceTx,
   type UnifiedRebalanceInput,
 } from "../sui/cdpm/txUnified.ts";
@@ -35,6 +37,50 @@ export interface ExecutorService {
    * any decoded agent events.
    */
   submitUnifiedRebalance(input: UnifiedRebalanceInput): Promise<ExecutionResult>;
+  /**
+   * DryRun the plan's collect+remove prefix and decode the exact amounts the
+   * remove would free (from the AgentLiquidityRemoved event). Used by the
+   * unified path to include just-removed capital in the add amounts —
+   * per-bin position amounts are 0n in v0 chain reads, so this dryRun is the
+   * only reliable estimator. Returns {0n, 0n} when the plan removes nothing.
+   * Throws on dryRun failure (fail loud — the caller decides whether to
+   * proceed without the proceeds).
+   */
+  estimateRemoveProceeds(plan: RebalancePlan, pm: PMState): Promise<{ a: bigint; b: bigint }>;
+}
+
+export interface ExecutorDeps {
+  /** Injectable Sui client (tests). Defaults to the shared singleton. */
+  client?: SuiClient;
+}
+
+/**
+ * Decode the freed amounts from a remove-probe dryRun result (pure — split
+ * out from estimateRemoveProceeds for unit testing). Sums every
+ * AgentLiquidityRemoved event; throws when the dryRun did not succeed.
+ */
+export function decodeRemoveProceedsFromDryRun(
+  dryRun: unknown,
+  pmId: string,
+): { a: bigint; b: bigint } {
+  const status = (dryRun as { effects?: { status?: { status?: string; error?: string } } })
+    .effects?.status;
+  if (status?.status !== "success") {
+    throw new Error(
+      `estimateRemoveProceeds: dryRun failed for pm ${pmId}: ${status?.error ?? "unknown"}`,
+    );
+  }
+
+  let a = 0n;
+  let b = 0n;
+  for (const rawEv of (dryRun as { events?: Array<unknown> | null }).events ?? []) {
+    const decoded = decodeEvent(rawEv);
+    if (decoded?.payload.name === "AgentLiquidityRemoved") {
+      a += decoded.payload.data.amountA;
+      b += decoded.payload.data.amountB;
+    }
+  }
+  return { a, b };
 }
 
 /** Extract the Move event types that were emitted by our agent address (or for this PM). */
@@ -68,9 +114,14 @@ function extractAgentEvents(
   return types;
 }
 
-export function createExecutorService(): ExecutorService {
-  const client = getSuiClient();
+export function createExecutorService(deps: ExecutorDeps = {}): ExecutorService {
+  const client = deps.client ?? getSuiClient();
   const agentAddress = getAgentAddress();
+
+  /** Submit with idempotent retry (build once, sign once, resubmit same bytes). */
+  function submit(tx: Transaction) {
+    return submitWithRetry(client, tx, getAgentKeypair());
+  }
 
   async function runLendingTx(
     pmId: string,
@@ -79,11 +130,7 @@ export function createExecutorService(): ExecutorService {
   ): Promise<ExecutionResult> {
     log.info(`executor: ${op}ToLending`, { pmId, description: built.description });
     try {
-      const result = await client.signAndExecuteTransaction({
-        transaction: built.tx,
-        signer: getAgentKeypair(),
-        options: { showEvents: true },
-      });
+      const result = await submit(built.tx);
       log.info(`executor: ${op}ToLending executed`, { pmId, digest: result.digest });
       return {
         pmId,
@@ -121,11 +168,7 @@ export function createExecutorService(): ExecutorService {
 
         log.info("executor: collectAndTransferFees", { pmId, description: collectDesc });
 
-        const collectResult = await client.signAndExecuteTransaction({
-          transaction: collectTx,
-          signer: getAgentKeypair(),
-          options: { showEvents: true },
-        });
+        const collectResult = await submit(collectTx);
 
         log.info("executor: collect fee executed", { pmId, digest: collectResult.digest });
 
@@ -146,11 +189,7 @@ export function createExecutorService(): ExecutorService {
 
           log.info("executor: transferFeeToBalance", { pmId, description: transferDesc });
 
-          const transferResult = await client.signAndExecuteTransaction({
-            transaction: transferTx,
-            signer: getAgentKeypair(),
-            options: { showEvents: true },
-          });
+          const transferResult = await submit(transferTx);
 
           log.info("executor: transfer fee executed", { pmId, digest: transferResult.digest });
 
@@ -205,11 +244,7 @@ export function createExecutorService(): ExecutorService {
 
         log.info("executor: removeLiquidity", { pmId: plan.pmId, description });
 
-        const result = await client.signAndExecuteTransaction({
-          transaction: tx,
-          signer: getAgentKeypair(),
-          options: { showEvents: true },
-        });
+        const result = await submit(tx);
 
         log.info("executor: removeLiquidity executed", {
           pmId: plan.pmId,
@@ -301,11 +336,7 @@ export function createExecutorService(): ExecutorService {
       });
 
       try {
-        const result = await client.signAndExecuteTransaction({
-          transaction: built.tx,
-          signer: getAgentKeypair(),
-          options: { showEvents: true },
-        });
+        const result = await submit(built.tx);
         log.info("executor: submitUnifiedRebalance executed", {
           pmId,
           digest: result.digest,
@@ -340,15 +371,12 @@ export function createExecutorService(): ExecutorService {
           bins: plan.addBins,
           amountsA: plan.addAmountsA,
           amountsB: plan.addAmountsB,
+          plannedActiveBinId: plan.plannedActiveBinId,
         });
 
         log.info("executor: addLiquidity", { pmId: plan.pmId, description });
 
-        const result = await client.signAndExecuteTransaction({
-          transaction: tx,
-          signer: getAgentKeypair(),
-          options: { showEvents: true },
-        });
+        const result = await submit(tx);
 
         log.info("executor: addLiquidity executed", {
           pmId: plan.pmId,
@@ -366,6 +394,28 @@ export function createExecutorService(): ExecutorService {
         log.error("executor: addLiquidity failed", { pmId: plan.pmId, error: msg });
         return { pmId: plan.pmId, digest: "", status: "failed", error: msg, emittedAgentEvents: [] };
       }
+    },
+
+    async estimateRemoveProceeds(
+      plan: RebalancePlan,
+      pm: PMState,
+    ): Promise<{ a: bigint; b: bigint }> {
+      if (plan.removeShares.size === 0) return { a: 0n, b: 0n };
+
+      const { tx, commandCount } = buildRemoveProbeTx(pm, plan);
+      if (commandCount === 0) return { a: 0n, b: 0n };
+
+      const bytes = await tx.build({ client });
+      const dryRun = await client.dryRunTransactionBlock({ transactionBlock: bytes });
+
+      const { a, b } = decodeRemoveProceedsFromDryRun(dryRun, pm.pmId);
+      log.debug("executor: estimateRemoveProceeds", {
+        pmId: pm.pmId,
+        bins: plan.removeShares.size,
+        a: a.toString(),
+        b: b.toString(),
+      });
+      return { a, b };
     },
   };
 }

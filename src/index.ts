@@ -8,10 +8,16 @@ import { createSubscriptionsService } from "./services/subscriptions.ts";
 import { createExecutorService } from "./services/executor.ts";
 import { createRebalancerService } from "./services/rebalancer.ts";
 import { startTreasuryService, type TreasuryService } from "./services/treasuryService.ts";
+import { createMarketAggregator } from "./data/marketAggregator.ts";
+import { createBinanceMultiFeed } from "./data/feeds/binanceMulti.ts";
+import { createDerivativesFeed } from "./data/feeds/derivatives.ts";
+import { createCetusEventsFeed } from "./data/feeds/cetusEvents.ts";
+import { createRiskMonitor } from "./risk/monitor.ts";
+import { createRiskObserver } from "./services/riskObserver.ts";
 import { log } from "./lib/logger.ts";
 
 // ML / shadow mode imports — only used when STRATEGY=mlAgent or ML_SHADOW_MODE=true.
-import type { MlAgentDeps } from "./strategies/registry.ts";
+import type { MlAgentDeps, StrategyName } from "./strategies/registry.ts";
 
 async function main(): Promise<void> {
   // 1. Load config — fails fast on missing env vars.
@@ -70,60 +76,81 @@ async function main(): Promise<void> {
     });
   }, cfg.eventPollIntervalMs);
 
-  // 7a. Decide whether we need the ML dependency graph.
+  // 7a. Market data + risk layer — UNCONDITIONAL for the live process.
+  //
+  // The risk circuits are the product: they must protect every live strategy,
+  // not only mlAgent. The aggregator feeds (Binance/derivatives/Cetus) are the
+  // price of that protection and run on rule-only deployments too.
+  const db = getDb();
+
+  const binanceFeed = createBinanceMultiFeed();
+  const derivFeed = createDerivativesFeed();
+  const cetusFeed = createCetusEventsFeed({
+    poolId: cfg.poolProfile.poolId,
+    poolCoinADecimals: cfg.poolProfile.poolCoinADecimals,
+    poolCoinBDecimals: cfg.poolProfile.poolCoinBDecimals,
+  });
+
+  const marketAggregator = createMarketAggregator({
+    binance: binanceFeed,
+    derivatives: derivFeed,
+    cetus: cetusFeed,
+  });
+
+  // Start the feeds (returns a composite stop function).
+  // Hoisted to stopFeeds so shutdown() can call it directly (F3 fix).
+  const stopFeeds: () => void = marketAggregator.start();
+
+  // Live risk monitor — construction also rehydrates the L3 emergency-stop
+  // latch from the DB (an unresolved trip survives restarts).
+  const riskMonitor = createRiskMonitor({
+    db,
+    thresholds: cfg.risk.thresholds,
+    l3: cfg.risk.l3,
+  });
+
+  // PnL accounting (D1): NAV sampling + fee/cost/IL attribution. Its
+  // get24hPnlPct closes the daily-loss circuits (L2 pnl_24h + L3
+  // catastrophic) — fed to the risk observer below and to mlAgent's deps.
+  const { createPnlService } = await import("./services/pnlService.ts");
+  const pnlService = createPnlService({ db, profile: cfg.poolProfile });
+  const get24hPnlPct: ((poolId: string) => number | null) | undefined =
+    pnlService.get24hPnlPct;
+
+  // 7a-post. Risk observer background loop (G1 fix).
+  //
+  // L2 rolling-window circuits (checkVolatility5m, checkTvlDrop5m,
+  // checkSpreadSustained) need ~30 s samples to build their 5-min windows,
+  // and the per-source staleness feed must keep flowing even during a data
+  // outage. The observer is restarted below if a shadow monitor is created.
+  let stopRiskObserver: () => void = createRiskObserver({
+    poolId: cfg.poolProfile.poolId,
+    marketAggregator,
+    riskMonitor,
+    intervalMs: cfg.riskObserverIntervalMs,
+    get24hPnlPct,
+  }).start();
+
+  // 7b. Decide whether we need the ML dependency graph.
   //
   // We build ML deps when:
   //   (a) STRATEGY=mlAgent — live ML inference
   //   (b) ML_SHADOW_MODE=true — shadow runner observes what mlAgent WOULD do
   //       (this applies even when the live strategy is a rule-based strategy)
-  //
-  // Feeds are NOT started when neither (a) nor (b) is true.
   const needsMlGraph = cfg.strategy === "mlAgent" || cfg.ml.shadowMode;
 
   let mlDeps: MlAgentDeps | undefined;
-  let stopFeeds: (() => void) | null = null;
-  let stopRiskObserver: (() => void) | null = null;
   let stopShadowRunner: (() => void) | null = null;
 
   if (needsMlGraph) {
-    const { createMarketAggregator } = await import("./data/marketAggregator.ts");
-    const { createBinanceMultiFeed } = await import("./data/feeds/binanceMulti.ts");
-    const { createDerivativesFeed } = await import("./data/feeds/derivatives.ts");
-    const { createCetusEventsFeed } = await import("./data/feeds/cetusEvents.ts");
     const { createStateMachine } = await import("./state/machine.ts");
-    const { createRiskMonitor } = await import("./risk/monitor.ts");
     const { buildStrategy } = await import("./strategies/registry.ts");
 
-    const db = getDb();
-
-    // Build the market aggregator feeds.
-    const binanceFeed = createBinanceMultiFeed();
-    const derivFeed = createDerivativesFeed();
-    const cetusFeed = createCetusEventsFeed({
-      poolId: cfg.poolProfile.poolId,
-      poolCoinADecimals: cfg.poolProfile.poolCoinADecimals,
-      poolCoinBDecimals: cfg.poolProfile.poolCoinBDecimals,
-    });
-
-    const marketAggregator = createMarketAggregator({
-      binance: binanceFeed,
-      derivatives: derivFeed,
-      cetus: cetusFeed,
-    });
-
-    // Start the feeds (returns a composite stop function).
-    // Hoisted to stopFeeds so shutdown() can call it directly (F3 fix).
-    stopFeeds = marketAggregator.start();
-
-    // Live state machine and risk monitor — used by the mlAgent live path.
+    // Live state machine — used by the mlAgent live path.
     const stateMachine = createStateMachine({
       poolId: cfg.poolProfile.poolId,
       db,
-    });
-
-    const riskMonitor = createRiskMonitor({
-      db,
-      thresholds: cfg.risk.thresholds,
+      params: cfg.stateParams,
     });
 
     // Prediction provider: sidecar in production; null provider if sidecar not configured.
@@ -146,6 +173,7 @@ async function main(): Promise<void> {
       marketAggregator,
       fallback: fallbackStrategy,
       db,
+      get24hPnlPct,
     };
 
     log.info("liquidity-manager: ML graph wired up", {
@@ -154,27 +182,6 @@ async function main(): Promise<void> {
       liveStrategy: cfg.strategy,
       shadowMode: cfg.ml.shadowMode,
     });
-
-    // 7b-pre. Start the risk observer background loop (G1 fix).
-    //
-    // L2 rolling-window circuits (checkVolatility5m, checkTvlDrop5m,
-    // checkSpreadSustained) need ~30 s samples to build their 5-min windows.
-    // Without this loop the windows are only populated when mlAgent.plan()
-    // fires — every 20 min in NORMAL state — which starves the circuits.
-    //
-    // The shadow risk monitor is wired in below after the shadow runner is
-    // built, so we start the observer here with only the live monitor and
-    // re-create it with the shadow monitor once available.
-    {
-      const { createRiskObserver } = await import("./services/riskObserver.ts");
-      const riskObserver = createRiskObserver({
-        poolId: cfg.poolProfile.poolId,
-        marketAggregator,
-        riskMonitor,
-        intervalMs: cfg.riskObserverIntervalMs,
-      });
-      stopRiskObserver = riskObserver.start();
-    }
 
     // 7b. Shadow runner — built when ML_SHADOW_MODE=true, regardless of live strategy.
     //
@@ -207,6 +214,7 @@ async function main(): Promise<void> {
       const shadowStateMachine = createStateMachine({
         poolId: cfg.poolProfile.poolId,
         db,
+        params: cfg.stateParams,
       });
 
       // DEDICATED shadow risk monitor — shadow ticks must not persist risk_events
@@ -214,9 +222,15 @@ async function main(): Promise<void> {
       // writes to the same risk_events table but is scoped to shadow state only.
       // Shadow entries are distinguishable by the pool_id/pm_id + timestamp
       // correlation with shadow_decisions rows.
+      // Share the LIVE emergency stop: L3 is process-wide (a tripped latch
+      // must halt everything), and a second createEmergencyStop would
+      // double-rehydrate from the same risk_events rows.
       const shadowRiskMonitor = createRiskMonitor({
         db,
         thresholds: cfg.risk.thresholds,
+        l3: cfg.risk.l3,
+        emergencyStop: riskMonitor.emergencyStop,
+        source: "shadow",
       });
 
       // Shadow mlAgent uses the shadow-dedicated deps.
@@ -282,33 +296,47 @@ async function main(): Promise<void> {
       stopShadowRunner = () => clearInterval(shadowHandle);
 
       // Restart the risk observer so it also feeds the shadow risk monitor.
-      // The observer started in 7b-pre feeds only the live monitor; now that
+      // The observer started in 7a-post feeds only the live monitor; now that
       // the shadow monitor exists, rebuild with both wired in.
-      stopRiskObserver?.();
-      {
-        const { createRiskObserver } = await import("./services/riskObserver.ts");
-        const riskObserver = createRiskObserver({
-          poolId: cfg.poolProfile.poolId,
-          marketAggregator,
-          riskMonitor,
-          shadowRiskMonitor,
-          intervalMs: cfg.riskObserverIntervalMs,
-        });
-        stopRiskObserver = riskObserver.start();
-      }
+      stopRiskObserver();
+      stopRiskObserver = createRiskObserver({
+        poolId: cfg.poolProfile.poolId,
+        marketAggregator,
+        riskMonitor,
+        shadowRiskMonitor,
+        intervalMs: cfg.riskObserverIntervalMs,
+        get24hPnlPct,
+      }).start();
     }
   }
 
   // 8. Create and start the rebalancer.
-  //    When shadow mode is active and strategy === "mlAgent", the live rebalancer
-  //    runs the fallback (rule-based) strategy, not the mlAgent. This ensures
-  //    live trading continues unchanged during the validation window.
+  //
+  // Live strategy resolution: when shadow mode is active and STRATEGY=mlAgent,
+  // the live rebalancer runs the FALLBACK (rule-based) strategy — live trading
+  // continues unchanged during the validation window. (Passing mlAgent without
+  // mlDeps used to crash at startup here; resolving the name explicitly fixes
+  // that.) The risk monitor is threaded unconditionally — rule strategies get
+  // their pre-tick veto from the rebalancer itself.
+  const liveStrategyName: StrategyName =
+    cfg.ml.shadowMode && cfg.strategy === "mlAgent" ? cfg.fallbackStrategy : cfg.strategy;
+  if (liveStrategyName !== cfg.strategy) {
+    log.info("liquidity-manager: shadow mode — live rebalancer runs the fallback strategy", {
+      configured: cfg.strategy,
+      live: liveStrategyName,
+    });
+  }
   const executorService = createExecutorService();
   const rebalancerService = createRebalancerService(
     subscriptionsService,
     executorService,
     priceFeed,
-    cfg.ml.shadowMode ? undefined : mlDeps,
+    {
+      riskMonitor,
+      liveStrategyName,
+      mlDeps: liveStrategyName === "mlAgent" ? mlDeps : undefined,
+      pnlService,
+    },
   );
   const stopRebalancer = rebalancerService.start();
 
@@ -338,8 +366,8 @@ async function main(): Promise<void> {
   function shutdown(signal: string): void {
     log.info("received signal, shutting down", { signal });
     clearInterval(subHandle);
-    stopFeeds?.();
-    stopRiskObserver?.();
+    stopFeeds();
+    stopRiskObserver();
     stopRebalancer();
     stopShadowRunner?.();
     treasuryService?.stop();
