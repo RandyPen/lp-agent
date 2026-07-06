@@ -198,4 +198,15 @@ describe("get24hPnlPct", () => {
     tickAt(NOW - 1 * HOUR, 100);
     expect(svc.get24hPnlPct(POOL_ID)).toBe(null);
   });
+
+  it("one under-covered PM does not blind the pool: returns the covered PM's pnl, not null", () => {
+    // Covered PM: full 23h window, −5% NAV decline.
+    tickAt(NOW - 23 * HOUR, 1_000, "0xcovered");
+    tickAt(NOW - 12 * HOUR, 980, "0xcovered");
+    tickAt(NOW - 1 * HOUR, 950, "0xcovered");
+    // Fresh PM: only 1h of coverage (recently onboarded) — must be excluded,
+    // not cause the whole pool to go null.
+    tickAt(NOW - 1 * HOUR, 10_000, "0xfresh");
+    expect(svc.get24hPnlPct(POOL_ID)).toBeCloseTo(-0.05, 10);
+  });
 });

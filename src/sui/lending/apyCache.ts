@@ -1,5 +1,4 @@
 import { loadConfig } from "../../config.ts";
-import { log } from "../../lib/logger.ts";
 import type { ApySnapshot, LendingProtocol } from "./types.ts";
 import { getScallopAdapter } from "./scallop.ts";
 import { getKaiAdapter } from "./kai.ts";
@@ -10,10 +9,20 @@ import { canonicalType } from "./typeNorm.ts";
  * for `getApy(protocol, coinType)`; we serve from cache when fresh, otherwise
  * fetch concurrently. SDK calls hit upstream RPC + APIs and shouldn't run every
  * 60s rebalancer heartbeat.
+ *
+ * A legitimate `null` result (e.g. the coin isn't listed on the protocol) is
+ * cached just like a real snapshot — otherwise the TTL never actually bounds
+ * RPC load for coins that simply aren't supported. A fetch ERROR is a
+ * different thing entirely: it is never cached and never coerced to `null`
+ * here — it propagates to the caller so the real cause stays visible (house
+ * rule: no silent fallbacks). Only the adapters' own logging (`scallop.ts` /
+ * `kai.ts`) decide whether a lookup failure becomes a thrown error or a
+ * legitimate `null`; this cache does not reinterpret that.
  */
 
 interface CacheEntry {
-  snapshot: ApySnapshot;
+  snapshot: ApySnapshot | null;
+  observedAtMs: number;
 }
 
 const cache = new Map<string, CacheEntry>();
@@ -32,7 +41,7 @@ export async function getApy(
   const now = Date.now();
 
   const hit = cache.get(key);
-  if (hit && now - hit.snapshot.observedAtMs < cfg.lending.apyCacheTtlMs) {
+  if (hit && now - hit.observedAtMs < cfg.lending.apyCacheTtlMs) {
     return hit.snapshot;
   }
 
@@ -45,14 +54,10 @@ export async function getApy(
         protocol === "scallop"
           ? await getScallopAdapter().getSupplyApy(coinType)
           : await getKaiAdapter().getSupplyApy(coinType);
-      if (snapshot) {
-        cache.set(key, { snapshot });
-      }
+      // Cache both real snapshots and legitimate nulls — only a thrown error
+      // (below) skips the cache.
+      cache.set(key, { snapshot, observedAtMs: Date.now() });
       return snapshot;
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log.warn("apyCache: fetch failed", { protocol, coinType, error: msg });
-      return null;
     } finally {
       inflight.delete(key);
     }

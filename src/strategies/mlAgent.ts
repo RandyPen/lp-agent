@@ -30,7 +30,12 @@ import type { RiskMonitor } from "../risk/monitor.ts";
 import type { MarketAggregator } from "../data/marketAggregator.ts";
 import type { Database } from "bun:sqlite";
 import { DataOutageError } from "../data/marketAggregator.ts";
-import { buildExtremeWithdrawPlan, diffPlan, type DiffPlanInput } from "../decision/diffPlanner.ts";
+import {
+  buildExtremeWithdrawPlan,
+  computeTargetCenterBin,
+  diffPlan,
+  type DiffPlanInput,
+} from "../decision/diffPlanner.ts";
 import { evaluateAllLots, getForceLiquidations } from "../decision/ageStopLoss.ts";
 import { loadOpenLots } from "../decision/lotStore.ts";
 import { binDirection, orientationOf } from "../domain/binMath.ts";
@@ -168,20 +173,20 @@ function rehydrateProbationState(
     }
   }
 
-  // Walked the full window without hitting a fallback row AND streak < 3.
-  // This means we have 1–2 successes but no recorded fallback in the window.
-  // The window may be smaller than a full episode. Conservative: if we have
-  // ANY successes but no fallback in window, treat as probation with the streak
-  // we have (the actual fallback may be just outside the window).
-  // However, if the window contained only successes and the window is the full
-  // table (rows.length < REHYDRATION_WINDOW) then we never had a fallback: not
-  // in probation.
-  if (rows.length < REHYDRATION_WINDOW) {
-    // We've seen the entire history; no fallback anywhere → not in probation.
-    return { inProbation: false, consecutiveSuccessCount: 0 };
-  }
-  // Partial window, all successes but < 3 — conservatively stay in probation.
-  return { inProbation: true, consecutiveSuccessCount: streak };
+  // Walked the full window without an early return: every scanned row was a
+  // clean success, and the streak never reached PROBATION_EXIT_SUCCESSES (3)
+  // inside the loop. Since REHYDRATION_WINDOW (10) > PROBATION_EXIT_SUCCESSES,
+  // the ONLY way to reach here is rows.length < PROBATION_EXIT_SUCCESSES
+  // (otherwise the streak>=3 branch above would already have returned) — i.e.
+  // we've seen the entire available history (fewer rows exist than a full
+  // window) and none of it was a fallback. Not in probation.
+  //
+  // (This function used to branch here on `rows.length < REHYDRATION_WINDOW`
+  // with a second "partial window, stay in probation" arm — but that
+  // condition always holds at this point given the window/streak sizes
+  // above, so the other arm was dead code. Removed rather than left
+  // unreachable; the probation-decision logic itself is unchanged.)
+  return { inProbation: false, consecutiveSuccessCount: 0 };
 }
 
 /**
@@ -559,8 +564,17 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
       });
       if (!plan) return { kind: "quiet", reason: "below min threshold" };
 
-      // fillBoundary: active bin shifted by the predicted center offset.
-      const fillBoundary = input.pool.activeBinId + Math.round(pred.centerOffset);
+      // fillBoundary: the SAME clamped center diffPlan actually built the
+      // position around (F10) — using the raw (unclamped) predicted offset
+      // here would disagree with where liquidity actually sits whenever
+      // |offset| > maxCenterOffset (NORMAL state; TREND always centers on
+      // the active bin per §3.2, which computeTargetCenterBin also honours).
+      const fillBoundary = computeTargetCenterBin(
+        adjustedCtx.state,
+        input.pool.activeBinId,
+        pred.centerOffset,
+        adjustedCtx.maxCenterOffset,
+      );
 
       return {
         kind: "plan_and_reconcile",

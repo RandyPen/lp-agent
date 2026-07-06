@@ -288,6 +288,70 @@ describe("createBinanceMultiFeed", () => {
   });
 
   // ---------------------------------------------------------------------------
+  // F3: still-forming final candle must be dropped (train/serve skew)
+  // ---------------------------------------------------------------------------
+
+  describe("in-progress kline exclusion", () => {
+    it("drops the final kline when its closeTime is in the future", async () => {
+      // 3 bars starting at base; bar i closes at base + i*60_000 + 59_999.
+      // Freeze "now" inside the last bar's minute → last bar is still forming.
+      const base = 1_700_000_000_000;
+      const klines = makeKlines(3, 2.5, 0.1); // closes 2.5, 2.6, 2.7
+      const fixedNow = base + 2 * 60_000 + 30_000; // mid-way through bar 2
+      const fetchFn = makeFakeFetch({
+        "SUIUSDC:1m": klines, "BTCUSDT:1m": klines, "ETHUSDT:1m": klines,
+        "SUIUSDC:5m": klines, "BTCUSDT:5m": klines, "ETHUSDT:5m": klines,
+      });
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 10, bars5m: 10, now: () => fixedNow });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      const bars = feed.latest1m().sui;
+      expect(bars.length).toBe(2); // in-progress bar 2 dropped
+      const last = bars[bars.length - 1];
+      if (!last) throw new Error("expected last bar");
+      expect(last.close).toBeCloseTo(2.6, 5); // last CLOSED bar, not 2.7
+      expect(last.ts).toBe(base + 60_000);
+    });
+
+    it("keeps a kline whose closeTime equals now exactly (just closed)", async () => {
+      const base = 1_700_000_000_000;
+      const klines = makeKlines(2, 2.5);
+      const fixedNow = base + 60_000 + 59_999; // == closeTime of bar 1
+      const fetchFn = makeFakeFetch({
+        "SUIUSDC:1m": klines, "BTCUSDT:1m": klines, "ETHUSDT:1m": klines,
+        "SUIUSDC:5m": klines, "BTCUSDT:5m": klines, "ETHUSDT:5m": klines,
+      });
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 10, bars5m: 10, now: () => fixedNow });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.latest1m().sui.length).toBe(2);
+    });
+
+    it("all-closed windows are unaffected (past data, real clock)", async () => {
+      // Base 1_700_000_000_000 is far in the past relative to Date.now() —
+      // no bar can be in progress, so all bars survive the filter.
+      const klines = makeKlines(4, 2.5);
+      const fetchFn = makeFakeFetch({
+        "SUIUSDC:1m": klines, "BTCUSDT:1m": klines, "ETHUSDT:1m": klines,
+        "SUIUSDC:5m": klines, "BTCUSDT:5m": klines, "ETHUSDT:5m": klines,
+      });
+
+      const feed = createBinanceMultiFeed({ fetchFn, bars1m: 10, bars5m: 10 });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.latest1m().sui.length).toBe(4);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // F2: per-symbol/per-interval staleness tracking
   // ---------------------------------------------------------------------------
 

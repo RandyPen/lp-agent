@@ -6,7 +6,15 @@
  *
  * Design notes:
  *   - Reuses the retry/backoff/timeout patterns from binance.ts.
- *   - Default window sizes: 120 bars of 1m (2h) and 288 bars of 5m (24h).
+ *   - Default window sizes: 480 bars of 1m (8h) and 288 bars of 5m (24h).
+ *     The 1m window MUST cover the ML sidecar's longest 1m rolling feature
+ *     window — vol_ratio's 360-bar long σ (ml/features/volatility.py
+ *     LONG_WINDOW). A 120-bar window left vol_ratio permanently
+ *     NaN→default(1.0) at inference (train/serve skew, constant PSI drift).
+ *   - The still-forming final candle is dropped at parse time: Binance's REST
+ *     klines include the in-progress last kline; training uses closed bars
+ *     only, so serving must too (otherwise the exact row the model scores is
+ *     systematically skewed).
  *   - Each symbol maintains two independent windows (1m and 5m).
  *   - `start()` kicks off a background refresh loop and returns a stop function.
  *   - No SQLite persistence here — the aggregator layer handles any needed
@@ -33,10 +41,16 @@ import type { OhlcvBar } from "../../prediction/types.ts";
 const DEFAULT_BASE_URL = "https://api.binance.com";
 
 // Default rolling window lengths (bar count).
-const DEFAULT_1M_BARS = 120;   // 2 hours of 1-minute bars
+// 480 one-minute bars = 8h: covers the ML sidecar's 360-bar vol_ratio long
+// window (ml/features/volatility.py LONG_WINDOW, min_periods=360) with 2h of
+// slack. Memory impact is trivial (480 bars × 3 symbols).
+const DEFAULT_1M_BARS = 480;   // 8 hours of 1-minute bars
 const DEFAULT_5M_BARS = 288;   // 24 hours of 5-minute bars
 
-// Klines hard limit per Binance REST API page.
+// Max klines requested per REST call. Binance /api/v3/klines allows up to
+// 1000 per request; 500 comfortably fetches the full 480-bar default window
+// in a single request (the initial fill is NOT paginated — refreshSymbol
+// requests min(maxBars, KLINES_PAGE_LIMIT)).
 const KLINES_PAGE_LIMIT = 500;
 
 // Retry policy.
@@ -64,7 +78,7 @@ export type FetchFn = (input: string | URL | Request, init?: RequestInit) => Pro
 export interface BinanceMultiFeedOptions {
   /** Binance REST base URL. Defaults to https://api.binance.com */
   baseUrl?: string;
-  /** Number of 1-minute bars to keep per symbol. Default 120 (2h). */
+  /** Number of 1-minute bars to keep per symbol. Default 480 (8h). */
   bars1m?: number;
   /** Number of 5-minute bars to keep per symbol. Default 288 (24h). */
   bars5m?: number;
@@ -136,15 +150,25 @@ function klinesUrl(
   return `${baseUrl}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
 }
 
-function parseKlines(klines: BinanceKline[]): OhlcvBar[] {
-  return klines.map((k) => ({
-    ts: k[0],
-    open: Number(k[1]),
-    high: Number(k[2]),
-    low: Number(k[3]),
-    close: Number(k[4]),
-    volume: Number(k[5]),
-  }));
+/**
+ * Parse Binance kline tuples into OhlcvBars, DROPPING the still-forming
+ * final candle: Binance's REST klines endpoint includes the in-progress
+ * last kline (its closeTime, tuple index 6, lies in the future). Training
+ * uses closed bars only, so keeping it would systematically skew the exact
+ * row the model scores and let mergeWindow keep overwriting a half-formed
+ * bar. A kline is closed iff closeTime <= nowMs.
+ */
+function parseKlines(klines: BinanceKline[], nowMs: number): OhlcvBar[] {
+  return klines
+    .filter((k) => k[6] <= nowMs)
+    .map((k) => ({
+      ts: k[0],
+      open: Number(k[1]),
+      high: Number(k[2]),
+      low: Number(k[3]),
+      close: Number(k[4]),
+      volume: Number(k[5]),
+    }));
 }
 
 /**
@@ -246,7 +270,7 @@ export function createBinanceMultiFeed(opts: BinanceMultiFeedOptions = {}): Bina
       () => jsonFetch<BinanceKline[]>(url),
       MAX_RETRIES,
     );
-    return parseKlines(raw);
+    return parseKlines(raw, nowFn());
   }
 
   /**

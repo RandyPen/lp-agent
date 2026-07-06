@@ -177,6 +177,94 @@ describe("createDerivativesFeed", () => {
     });
   });
 
+  describe("invalid (non-finite) payload values", () => {
+    // Fake fetch returning structurally valid JSON whose numeric fields do
+    // not parse to finite numbers (Number("garbage") → NaN). A NaN cache
+    // value would serialize to JSON null and 422 every sidecar /predict.
+    function makeGarbageFetch(): FetchFn {
+      return async (input: string | URL | Request): Promise<Response> => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+        if (url.includes("premiumIndex")) {
+          return new Response(
+            JSON.stringify({ symbol: "SUIUSDT", lastFundingRate: "garbage", nextFundingTime: 0, time: 0 }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ symbol: "SUIUSDT", openInterest: null, time: 0 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+    }
+
+    it("never caches NaN and does not advance lastUpdatedMs on garbage payloads", async () => {
+      const feed = createDerivativesFeed({ fetchFn: makeGarbageFetch() });
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      const snap = feed.latest();
+      // Cache untouched — initial zeros retained, never NaN.
+      expect(Number.isFinite(snap.funding)).toBe(true);
+      expect(Number.isFinite(snap.oi)).toBe(true);
+      expect(snap.funding).toBe(0);
+      expect(snap.oi).toBe(0);
+      // The staleness surface reflects the outage: no successful update.
+      expect(feed.lastUpdatedMs()).toBe(0);
+    });
+
+    it("keeps previously cached values when a later poll returns garbage", async () => {
+      // First two calls (initial refresh) return valid values; subsequent
+      // calls (second start()) return garbage.
+      let calls = 0;
+      const fetchFn: FetchFn = async (input) => {
+        calls++;
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url;
+        if (calls <= 2) {
+          if (url.includes("premiumIndex")) {
+            return new Response(
+              JSON.stringify({ symbol: "SUIUSDT", lastFundingRate: "0.0004", nextFundingTime: 0, time: 0 }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          return new Response(
+            JSON.stringify({ symbol: "SUIUSDT", openInterest: "4000000", time: 0 }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        if (url.includes("premiumIndex")) {
+          return new Response(
+            JSON.stringify({ symbol: "SUIUSDT", lastFundingRate: "NaN-ish", nextFundingTime: 0, time: 0 }),
+            { status: 200, headers: { "Content-Type": "application/json" } },
+          );
+        }
+        return new Response(
+          JSON.stringify({ symbol: "SUIUSDT", openInterest: undefined, time: 0 }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      };
+
+      const feed = createDerivativesFeed({ fetchFn });
+      const stop1 = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop1();
+
+      const tsAfterValid = feed.lastUpdatedMs();
+      expect(tsAfterValid).toBeGreaterThan(0);
+
+      // Second start() re-runs the initial refresh — now with garbage payloads.
+      const stop2 = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop2();
+
+      const snap = feed.latest();
+      expect(snap.funding).toBeCloseTo(0.0004, 8);
+      expect(snap.oi).toBe(4_000_000);
+      // Invalid refresh must NOT advance the staleness timestamp.
+      expect(feed.lastUpdatedMs()).toBe(tsAfterValid);
+    });
+  });
+
   describe("stop function", () => {
     it("stop() can be called multiple times without error", () => {
       const feed = createDerivativesFeed({ fetchFn: makeFakeFetch(0, 0) });

@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import { getDb } from "../db/client.ts";
 import { loadConfig } from "../config.ts";
 import { getAgentAddress } from "../sui/keypair.ts";
@@ -29,6 +30,90 @@ import type { StateContext } from "../prediction/types.ts";
 export interface RebalancerService {
   start(): () => void;
   tickOne(pmId: string): Promise<void>;
+  /**
+   * Resolve once every tick currently in flight (started by the interval
+   * scheduled from `start()`) has settled — success or failure, already
+   * caught internally, so `drain()` itself never rejects. Used by shutdown
+   * to avoid abandoning a tick mid-PTB-submission (Fix 4).
+   */
+  drain(): Promise<void>;
+}
+
+/**
+ * Startup reconciliation sweep for rebalances orphaned by a crash between the
+ * pre-charge treasury debit (`attemptCharge`, ~line 560 above) and PTB
+ * submission / the final status UPDATE. Without this, a crash there leaves
+ * credits debited forever and the `rebalances` row stuck in 'planned'.
+ *
+ * MUST be called once at process startup, BEFORE the rebalance interval
+ * starts (before `RebalancerService.start()` and before any tick fires).
+ * Because nothing has ticked yet in THIS process, any row still in a
+ * non-terminal status ('planned' or 'submitted' — see the `rebalances.status`
+ * CHECK constraint in schema.sql) is by construction left over from a
+ * PREVIOUS process that died mid-tick — there is no live-run row to
+ * accidentally sweep.
+ *
+ * Ambiguity: a non-terminal row can mean either (a) the PTB never went out,
+ * or (b) the PTB succeeded on-chain but the process crashed before the final
+ * status UPDATE landed. Distinguishing these would require re-deriving
+ * on-chain truth (out of scope here), so we always refund the pre-debited
+ * charge when one is recorded (`refundCharge` is idempotent — a no-op when
+ * the charge was never 'ok' or was already refunded). This can under-charge
+ * a user in case (b); it can never permanently strand a debit or double-charge
+ * — the correct failure direction for a custody agent.
+ *
+ * Schema note: `rebalances.status` has a CHECK(status IN (...)) constraint,
+ * not a free-form TEXT column, and SQLite cannot ALTER a CHECK constraint
+ * without a full table rebuild — which would violate this project's
+ * additive-only schema policy (`ensureColumns` in src/db/client.ts). So
+ * rather than introduce a new 'abandoned' enum value, reconciled rows are
+ * marked with the existing terminal 'failed' status and a descriptive
+ * `error` message.
+ */
+export function reconcileOrphanedRebalances(db: Database): {
+  scanned: number;
+  refunded: number;
+} {
+  const rows = db
+    .query<{ id: number; pm_id: string; charge_nonce: string | null }, []>(
+      `SELECT id, pm_id, charge_nonce FROM rebalances WHERE status IN ('planned', 'submitted')`,
+    )
+    .all();
+
+  let refunded = 0;
+  for (const row of rows) {
+    let wasRefunded = false;
+    if (row.charge_nonce) {
+      wasRefunded = refundCharge(
+        row.charge_nonce,
+        "reconciled at startup: rebalance orphaned by a crash between pre-charge and PTB",
+      );
+      if (wasRefunded) refunded++;
+    }
+    db.prepare(`UPDATE rebalances SET status = 'failed', error = ? WHERE id = ?`).run(
+      row.charge_nonce
+        ? `abandoned: reconciled at startup after a crash (charge ${wasRefunded ? "refunded" : "not refunded — already settled"})`
+        : "abandoned: reconciled at startup after a crash (no treasury charge to refund)",
+      row.id,
+    );
+    log.warn("rebalancer: reconciled orphaned rebalance from a previous run", {
+      rebalanceId: row.id,
+      pmId: row.pm_id,
+      chargeNonce: row.charge_nonce,
+      refunded: wasRefunded,
+    });
+  }
+
+  if (rows.length > 0) {
+    log.warn("rebalancer: startup reconciliation swept orphaned rebalances", {
+      scanned: rows.length,
+      refunded,
+    });
+  } else {
+    log.info("rebalancer: startup reconciliation found no orphaned rebalances");
+  }
+
+  return { scanned: rows.length, refunded };
 }
 
 /** JSON.stringify replacer that converts bigint to a string representation. */
@@ -473,12 +558,19 @@ export function createRebalancerService(
       // Flow: dryRun the collect+remove prefix → exact freed amounts → apply
       // the safety haircut → re-run the (deterministic) strategy with
       // pm.positionValue injected so the plan's amounts include the freed
-      // capital. Skipped for emergency plans (nothing is re-added anyway).
+      // capital.
+      //
+      // Emergency (EXTREME full-withdrawal) plans still run the dryRun below
+      // for `removeProceedsForIl` — realized IL of an emergency withdrawal is
+      // the LARGEST IL event and must not be dropped from PnL attribution —
+      // but skip the re-plan machinery entirely: emergency is a full
+      // withdrawal (nothing to re-add) and EXTREME's 1-min cadence means the
+      // extra strategy.plan() round-trip only costs latency for no benefit.
       let removeProceedsForIl: { a: bigint; b: bigint } | null = null;
-      if (plan.removeShares.size > 0 && plan.priority !== "emergency") {
+      if (plan.removeShares.size > 0) {
         const proceeds = await executor.estimateRemoveProceeds(plan, pm);
         removeProceedsForIl = proceeds;
-        if (proceeds.a > 0n || proceeds.b > 0n) {
+        if (plan.priority !== "emergency" && (proceeds.a > 0n || proceeds.b > 0n)) {
           const haircutBps = BigInt(cfg.readdProceedsHaircutBps);
           const positionValue = {
             a: proceeds.a - (proceeds.a * haircutBps) / 10_000n,
@@ -601,14 +693,17 @@ export function createRebalancerService(
         }
       }
 
-      // Persist the plan.
+      // Persist the plan. `charge_nonce` (nullable — treasury may be
+      // disabled, or cost may be 0) lets the startup reconciliation sweep
+      // (see `reconcileOrphanedRebalances` below) correlate this row back to
+      // its pre-debited charge if the process dies before this tick completes.
       const nowMs = Date.now();
       const insertResult = db
         .prepare(
-          `INSERT INTO rebalances (pm_id, planned_at_ms, plan_json, status)
-           VALUES (?, ?, ?, 'planned')`,
+          `INSERT INTO rebalances (pm_id, planned_at_ms, plan_json, status, charge_nonce)
+           VALUES (?, ?, ?, 'planned', ?)`,
         )
-        .run(pmId, nowMs, serializePlan(plan));
+        .run(pmId, nowMs, serializePlan(plan), chargeNonce);
 
       const rebalanceId = insertResult.lastInsertRowid;
 
@@ -843,7 +938,12 @@ export function createRebalancerService(
   // for PMs whose previous tick is still running (e.g., a slow Anthropic
   // brief call inside a strategy). `withLock` already serializes one PM, but
   // pre-filtering here avoids piling promises on the event loop.
-  const inFlight = new Set<string>();
+  //
+  // Maps pmId -> the SETTLED tracking promise (catch+finally already
+  // attached, so it always fulfills — never rejects) so `drain()` can
+  // `Promise.all` the in-flight set without needing per-tick error handling
+  // of its own (Fix 4: shutdown must not abandon a tick mid-PTB-submission).
+  const inFlight = new Map<string, Promise<void>>();
 
   return {
     start(): () => void {
@@ -856,9 +956,8 @@ export function createRebalancerService(
             skipped.push(sub.pmId);
             continue;
           }
-          inFlight.add(sub.pmId);
           fired += 1;
-          tickOne(sub.pmId)
+          const settled = tickOne(sub.pmId)
             .catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);
               log.error("rebalancer: unhandled error in tickOne", { pmId: sub.pmId, error: msg });
@@ -866,6 +965,7 @@ export function createRebalancerService(
             .finally(() => {
               inFlight.delete(sub.pmId);
             });
+          inFlight.set(sub.pmId, settled);
         }
         log.debug("rebalancer: interval tick", {
           activeSubs: subs.length,
@@ -878,5 +978,9 @@ export function createRebalancerService(
     },
 
     tickOne,
+
+    drain(): Promise<void> {
+      return Promise.all(Array.from(inFlight.values())).then(() => undefined);
+    },
   };
 }

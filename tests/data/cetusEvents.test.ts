@@ -67,15 +67,26 @@ function makeSwapEvent(
   } as unknown as SuiEvent;
 }
 
+// Default fake reserves (mirror real mainnet magnitudes for a SUI/USDC pool:
+// balance_a = raw USDC with 6 decimals, balance_b = raw SUI with 9 decimals).
+const DEFAULT_BALANCE_A = "135668098109";     // 135,668.098109 USDC
+const DEFAULT_BALANCE_B = "181100703836231";  // 181,100.703836231 SUI
+
 /**
  * Build a fake pool object response matching the REAL on-chain field layout:
  *   fields.active_id = { fields: { bits: <u32> } }
  *   fields.bin_manager.fields.bin_step = <number>
+ *   fields.balance_a / fields.balance_b = <u64 string> (pool reserves)
  *
  * Previous tests used `current_index` and top-level `bin_step` — those fields
  * do NOT exist on the real pool object.
  */
-function makePoolObjectResponse(activeBinId: number, binStep: number): object {
+function makePoolObjectResponse(
+  activeBinId: number,
+  binStep: number,
+  balanceA: string = DEFAULT_BALANCE_A,
+  balanceB: string = DEFAULT_BALANCE_B,
+): object {
   const bits = activeBinId < 0 ? activeBinId + 0x100000000 : activeBinId;
   return {
     data: {
@@ -91,6 +102,8 @@ function makePoolObjectResponse(activeBinId: number, binStep: number): object {
               bin_step: binStep,
             },
           },
+          balance_a: balanceA,
+          balance_b: balanceB,
         },
       },
     },
@@ -98,9 +111,14 @@ function makePoolObjectResponse(activeBinId: number, binStep: number): object {
 }
 
 /** Fake SuiClient for live feed (getObject). */
-function makeFakePoolClient(activeBinId: number, binStep: number): object {
+function makeFakePoolClient(
+  activeBinId: number,
+  binStep: number,
+  balanceA?: string,
+  balanceB?: string,
+): object {
   return {
-    getObject: async () => makePoolObjectResponse(activeBinId, binStep),
+    getObject: async () => makePoolObjectResponse(activeBinId, binStep, balanceA, balanceB),
   };
 }
 
@@ -348,6 +366,102 @@ describe("createCetusEventsFeed", () => {
       stop();
 
       expect(feed.latest().binStep).toBe(50);
+    });
+  });
+
+  describe("TVL from pool reserves", () => {
+    it("computes tvlUsd = reserveA + reserveB × spot price (quote-side valuation)", async () => {
+      // bin 1442, step 50, Pool<USDC=6, SUI=9> → price ≈ 0.7526 USDC/SUI.
+      const client = makeFakePoolClient(1442, 50);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: 6,
+        poolCoinBDecimals: 9,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      const state = feed.latest();
+      const price = Number(state.price);
+      const expected =
+        Number(DEFAULT_BALANCE_A) / 1e6 + (Number(DEFAULT_BALANCE_B) / 1e9) * price;
+      // ~135,668 USDC + ~181,101 SUI × ~0.7526 ≈ ~272k USD.
+      expect(state.tvlUsd).toBeCloseTo(expected, 3);
+      expect(state.tvlUsd).toBeGreaterThan(250_000);
+      expect(state.tvlUsd).toBeLessThan(300_000);
+    });
+
+    it("tvlUsd is strictly positive after a successful poll (L2 TVL-drop circuit viability)", async () => {
+      // Regression: tvlUsd used to be hard-coded 0, which made
+      // risk/circuits.ts checkTvlDrop5m structurally unable to fire
+      // (baseline <= 0 → fires:false forever).
+      const client = makeFakePoolClient(-5990, BIN_STEP);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.latest().tvlUsd).toBeGreaterThan(0);
+    });
+
+    it("poll fails loudly (no cache update) when balance_a is missing", async () => {
+      const badClient = {
+        getObject: async () => ({
+          data: {
+            content: {
+              fields: {
+                active_id: { type: "0x...::I32", fields: { bits: 1442 } },
+                bin_manager: { type: "0x...::BinManager", fields: { bin_step: 50 } },
+                // balance_a / balance_b intentionally absent
+              },
+            },
+          },
+        }),
+      };
+
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: badClient,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      // Poll errored → lastUpdatedMs stays 0, no silent tvlUsd=0 write.
+      expect(feed.lastUpdatedMs()).toBe(0);
+      expect(feed.latest().tvlUsd).toBe(0); // untouched initial sentinel
+    });
+
+    it("poll fails loudly when reserves are non-numeric", async () => {
+      const client = makeFakePoolClient(1442, 50, "not-a-number", DEFAULT_BALANCE_B);
+      const feed = createCetusEventsFeed({
+        poolId: POOL_ID,
+        poolCoinADecimals: POOL_COIN_A_DECIMALS,
+        poolCoinBDecimals: POOL_COIN_B_DECIMALS,
+        clientOverride: client,
+        pollIntervalMs: 1_000_000,
+      });
+
+      const stop = feed.start();
+      await new Promise((r) => setTimeout(r, 50));
+      stop();
+
+      expect(feed.lastUpdatedMs()).toBe(0);
     });
   });
 

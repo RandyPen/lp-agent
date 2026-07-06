@@ -6,7 +6,7 @@ import { createBinancePriceFeed } from "./data/feeds/binance.ts";
 import type { PriceFeed } from "./data/priceFeed.ts";
 import { createSubscriptionsService } from "./services/subscriptions.ts";
 import { createExecutorService } from "./services/executor.ts";
-import { createRebalancerService } from "./services/rebalancer.ts";
+import { createRebalancerService, reconcileOrphanedRebalances } from "./services/rebalancer.ts";
 import { startTreasuryService, type TreasuryService } from "./services/treasuryService.ts";
 import { createMarketAggregator } from "./data/marketAggregator.ts";
 import { createBinanceMultiFeed } from "./data/feeds/binanceMulti.ts";
@@ -82,6 +82,17 @@ async function main(): Promise<void> {
   // not only mlAgent. The aggregator feeds (Binance/derivatives/Cetus) are the
   // price of that protection and run on rule-only deployments too.
   const db = getDb();
+
+  // 7a-pre. Startup reconciliation sweep (Fix: crashes between the treasury
+  // pre-charge and PTB submission previously stranded a debited charge with
+  // the `rebalances` row stuck in 'planned' forever). MUST run before the
+  // rebalance interval starts and before any tick fires in this process —
+  // see reconcileOrphanedRebalances' doc comment for why that makes every
+  // non-terminal row found here safe to sweep.
+  const reconciliation = reconcileOrphanedRebalances(db);
+  if (reconciliation.scanned > 0) {
+    log.warn("liquidity-manager: startup reconciliation swept orphaned rebalances", reconciliation);
+  }
 
   const binanceFeed = createBinanceMultiFeed();
   const derivFeed = createDerivativesFeed();
@@ -358,25 +369,75 @@ async function main(): Promise<void> {
 
   log.info("liquidity-manager running");
 
-  // 10. Graceful shutdown on SIGINT / SIGTERM.
+  // 10. Graceful shutdown on SIGINT / SIGTERM / uncaughtException.
   //
-  // F3 fix: stopFeeds is called inside shutdown() before process.exit(0).
+  // F3 fix: stopFeeds is called inside teardown() before process.exit().
   // Previously it was registered on `process.once("beforeExit")` which is
   // skipped when process.exit() is called directly — feeds were never stopped.
-  function shutdown(signal: string): void {
-    log.info("received signal, shutting down", { signal });
+  //
+  // Fix 4: `gracefulTeardown` is idempotent (the `shuttingDown` latch) so a
+  // second SIGTERM (or an uncaughtException firing mid-shutdown) never
+  // re-enters teardown. After stopping every interval — including the
+  // rebalancer's own, via `stopRebalancer()` — it awaits
+  // `rebalancerService.drain()` (bounded by DRAIN_TIMEOUT_MS) so an
+  // in-flight tick that's awaiting on-chain confirmation is not abandoned
+  // mid-PTB-submission by a synchronous process.exit().
+  let shuttingDown = false;
+  const DRAIN_TIMEOUT_MS = 30_000;
+
+  async function gracefulTeardown(reason: string): Promise<void> {
+    if (shuttingDown) {
+      log.warn("liquidity-manager: teardown already in progress, ignoring repeat trigger", { reason });
+      return;
+    }
+    shuttingDown = true;
+    log.info("liquidity-manager: shutting down", { reason });
     clearInterval(subHandle);
     stopFeeds();
     stopRiskObserver();
     stopRebalancer();
     stopShadowRunner?.();
     treasuryService?.stop();
-    log.info("liquidity-manager stopped");
-    process.exit(0);
+
+    const drained = await Promise.race([
+      rebalancerService.drain().then(() => true as const),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), DRAIN_TIMEOUT_MS)),
+    ]);
+    if (drained) {
+      log.info("liquidity-manager: in-flight rebalancer ticks drained cleanly");
+    } else {
+      log.error(
+        "liquidity-manager: shutdown drain timed out — in-flight rebalancer ticks may still be running",
+        { timeoutMs: DRAIN_TIMEOUT_MS },
+      );
+    }
+    log.info("liquidity-manager: shutdown teardown complete");
   }
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => {
+    gracefulTeardown("SIGINT").finally(() => process.exit(0));
+  });
+  process.once("SIGTERM", () => {
+    gracefulTeardown("SIGTERM").finally(() => process.exit(0));
+  });
+
+  // A custody agent must never silently continue on undefined state. Both
+  // handlers log the full stack; uncaughtException additionally attempts the
+  // same graceful shutdown (bounded drain) before exiting non-zero — Node/Bun
+  // semantics already consider the process state undefined at this point, so
+  // teardown is best-effort, not a guarantee.
+  process.on("unhandledRejection", (reason: unknown) => {
+    log.error("liquidity-manager: unhandled promise rejection", {
+      error: reason instanceof Error ? (reason.stack ?? reason.message) : String(reason),
+    });
+  });
+
+  process.on("uncaughtException", (err: unknown) => {
+    log.error("liquidity-manager: uncaught exception — attempting graceful shutdown", {
+      error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+    });
+    gracefulTeardown("uncaughtException").finally(() => process.exit(1));
+  });
 }
 
 main().catch((err: unknown) => {

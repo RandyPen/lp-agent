@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS rebalances (
   digest           TEXT,
   plan_json        TEXT NOT NULL,
   status           TEXT NOT NULL CHECK(status IN ('planned','submitted','succeeded','failed')),
-  error            TEXT
+  error            TEXT,
+  -- Treasury charge nonce debited for this rebalance (nullable — treasury may
+  -- be disabled, or cost may be 0). Lets a startup reconciliation sweep
+  -- correlate an orphaned row back to its charge for a refund. Added via
+  -- ensureColumns on pre-existing DBs — see db/client.ts.
+  charge_nonce     TEXT
 );
 CREATE INDEX IF NOT EXISTS rebalances_pm     ON rebalances(pm_id, planned_at_ms DESC);
 CREATE INDEX IF NOT EXISTS rebalances_status ON rebalances(status);
@@ -142,12 +147,19 @@ CREATE TABLE IF NOT EXISTS treasury_credit_rates (
   updated_by     TEXT
 );
 
--- Latest on-chain balance snapshot seen by the watcher. Credits are booked only when delta > 0.
+-- Latest on-chain balance snapshot seen by the watcher. Credits are booked
+-- only when a delta (in EITHER direction) has been CONFIRMED — see
+-- BALANCE_CONFIRM_POLLS in src/treasury/watcher.ts. `pending_balance` /
+-- `pending_count` track a not-yet-confirmed observed change so a restart
+-- mid-confirmation resumes instead of re-arming from zero (added via
+-- ensureColumns on pre-existing DBs — see db/client.ts).
 CREATE TABLE IF NOT EXISTS treasury_address_balances (
   deposit_address    TEXT NOT NULL,
   coin_type          TEXT NOT NULL,
-  last_seen_balance  TEXT NOT NULL,     -- bigint as string
+  last_seen_balance  TEXT NOT NULL,     -- bigint as string; the last CONFIRMED balance
   last_seen_ms       INTEGER NOT NULL,
+  pending_balance    TEXT,              -- bigint as string; not-yet-confirmed observed balance
+  pending_count      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (deposit_address, coin_type)
 );
 

@@ -151,6 +151,24 @@ export function createDerivativesFeed(opts: DerivativesFeedOptions = {}): Deriva
     return (await resp.json()) as T;
   }
 
+  // NOTE on invalid payloads (documented cache-behavior exception, not a
+  // silent fallback): when Binance returns a payload whose numeric field does
+  // not parse to a finite number, we log a WARN, keep the previous cached
+  // value, and do NOT advance lastUpdated — so the feed's staleness surface
+  // reflects the outage naturally. Caching NaN would be worse than stale
+  // data: NaN serializes to JSON null, the sidecar's pydantic model rejects
+  // it with 422, and every prediction degrades to fallback="sidecar_down"
+  // until the value changes. We never fabricate replacement values.
+  //
+  // parseFinite rejects anything that is not a string/number parsing to a
+  // finite value — in particular null, which Number() would silently coerce
+  // to 0 (fabricating a plausible-looking rate from a broken payload).
+  function parseFinite(raw: unknown): number | null {
+    if (typeof raw !== "string" && typeof raw !== "number") return null;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+
   async function refreshFunding(): Promise<void> {
     const url = `${fapiBaseUrl}/fapi/v1/premiumIndex?symbol=${symbol}`;
     const data = await withRetry(
@@ -158,7 +176,15 @@ export function createDerivativesFeed(opts: DerivativesFeedOptions = {}): Deriva
       () => jsonFetch<BinancePremiumIndex>(url),
       MAX_RETRIES,
     );
-    cachedFunding = Number(data.lastFundingRate);
+    const funding = parseFinite(data.lastFundingRate);
+    if (funding === null) {
+      log.warn("derivatives: non-finite lastFundingRate in payload — keeping previous cache", {
+        symbol,
+        raw: String(data.lastFundingRate),
+      });
+      return;
+    }
+    cachedFunding = funding;
     lastUpdated = Date.now();
   }
 
@@ -169,7 +195,15 @@ export function createDerivativesFeed(opts: DerivativesFeedOptions = {}): Deriva
       () => jsonFetch<BinanceOpenInterest>(url),
       MAX_RETRIES,
     );
-    cachedOi = Number(data.openInterest);
+    const oi = parseFinite(data.openInterest);
+    if (oi === null) {
+      log.warn("derivatives: non-finite openInterest in payload — keeping previous cache", {
+        symbol,
+        raw: String(data.openInterest),
+      });
+      return;
+    }
+    cachedOi = oi;
     lastUpdated = Date.now();
   }
 

@@ -267,15 +267,23 @@ export function createPnlService(deps: PnlServiceDeps): PnlService {
 
     let baseNav = 0;
     let latestNav = 0;
+    let qualifyingPms = 0;
     for (const b of bases) {
       // Coverage guard per PM: the window must reach back at least 20h, or a
       // freshly-tracked PM would fake a near-zero PnL over a tiny window.
-      if (now - b.ts < MIN_COVERAGE_MS) return null;
+      // Skip (don't null out the whole pool) — a single under-covered PM
+      // (e.g. a PM onboarded a few hours ago) must not blind the L2/L3
+      // daily-loss circuits for every OTHER, well-covered PM in the pool.
+      // Each included PM contributes both its baseline and current NAV, so
+      // the partial sums stay an honest mark-to-market of the subset.
+      if (now - b.ts < MIN_COVERAGE_MS) continue;
       const l = latestByPm.get(b.pm_id);
-      if (!l) return null;
+      if (!l) continue; // no current sample for this PM — shouldn't happen, skip defensively
       baseNav += b.nav_usd;
       latestNav += l.nav_usd;
+      qualifyingPms++;
     }
+    if (qualifyingPms === 0) return null;
     if (!Number.isFinite(baseNav) || baseNav <= 0 || !Number.isFinite(latestNav)) return null;
 
     return (latestNav - baseNav) / baseNav;

@@ -585,6 +585,7 @@ export function loadConfig(): AppConfig {
     driftStrengthEntry: Number(optional("STATE_DRIFT_STRENGTH_ENTRY", String(d.driftStrengthEntry))),
     driftStrengthExit: Number(optional("STATE_DRIFT_STRENGTH_EXIT", String(d.driftStrengthExit))),
     pBreakEntry: Number(optional("STATE_P_BREAK_ENTRY", String(d.pBreakEntry))),
+    pBreakExit: Number(optional("STATE_P_BREAK_EXIT", String(d.pBreakExit))),
     pBreakSumExtreme: Number(optional("STATE_P_BREAK_SUM_EXTREME", String(d.pBreakSumExtreme))),
     pBreakSumExtremeExit: Number(optional("STATE_P_BREAK_SUM_EXTREME_EXIT", String(d.pBreakSumExtremeExit))),
     trendBiasStrong: Number(optional("STATE_TREND_BIAS_STRONG", String(d.trendBiasStrong))),
@@ -595,6 +596,7 @@ export function loadConfig(): AppConfig {
     ["STATE_DRIFT_STRENGTH_ENTRY", stateParams.driftStrengthEntry, 0, Infinity],
     ["STATE_DRIFT_STRENGTH_EXIT", stateParams.driftStrengthExit, 0, Infinity],
     ["STATE_P_BREAK_ENTRY", stateParams.pBreakEntry, 0, 1],
+    ["STATE_P_BREAK_EXIT", stateParams.pBreakExit, 0, 1],
     ["STATE_P_BREAK_SUM_EXTREME", stateParams.pBreakSumExtreme, 0, 2],
     ["STATE_P_BREAK_SUM_EXTREME_EXIT", stateParams.pBreakSumExtremeExit, 0, 2],
     ["STATE_TREND_BIAS_STRONG", stateParams.trendBiasStrong, 0, 1],
@@ -619,6 +621,15 @@ export function loadConfig(): AppConfig {
   ) {
     errs.push(
       `STATE_P_BREAK_SUM_EXTREME_EXIT (${stateParams.pBreakSumExtremeExit}) must be strictly below STATE_P_BREAK_SUM_EXTREME (${stateParams.pBreakSumExtreme}) — the EXTREME hysteresis band requires exit < entry`,
+    );
+  }
+  if (
+    Number.isFinite(stateParams.pBreakExit) &&
+    Number.isFinite(stateParams.pBreakEntry) &&
+    stateParams.pBreakExit >= stateParams.pBreakEntry
+  ) {
+    errs.push(
+      `STATE_P_BREAK_EXIT (${stateParams.pBreakExit}) must be strictly below STATE_P_BREAK_ENTRY (${stateParams.pBreakEntry}) — the TREND hysteresis band requires exit < entry`,
     );
   }
 

@@ -227,26 +227,31 @@ describe("diffPlan — NORMAL state", () => {
 
 describe("diffPlan — tolerance guard (returns null)", () => {
   it("returns null when current position center is within toleranceBins and shape is close", () => {
-    // Place a position exactly matching what the planner would produce.
-    // With centerOffset=0, active=0, halfWidth=3, position should be symmetric.
-    // Use a wide-sigma pred so weights are flat (easy to match).
+    // Build the position EXACTLY as the planner itself would (post ask-min
+    // filter, per-side renormalization, inventory scaling, dust filter) via a
+    // seed diffPlan call, rather than hand-crafting a symmetric fixture. A
+    // hand-crafted position that includes bins the ask-min filter would
+    // exclude is not a position the planner could ever actually build — see
+    // the F1 quiet-gate regression tests below, which cover exactly that
+    // "position matches only what survives the filter" scenario explicitly.
     const pred = makePred({ widthSigma: 5, centerOffset: 0 });
     const ctx = makeCtx("NORMAL", { halfWidth: 3, toleranceBins: 2 });
+    const pool = makePool();
 
-    // Position already centered at active with symmetric shares.
-    const pm = makePm({
-      positionBins: [
-        { binId: -3, liquidityShare: 100n, amountA: 100n, amountB: 0n },
-        { binId: -2, liquidityShare: 100n, amountA: 100n, amountB: 0n },
-        { binId: -1, liquidityShare: 100n, amountA: 100n, amountB: 0n },
-        { binId: 1, liquidityShare: 100n, amountA: 0n, amountB: 100n },
-        { binId: 2, liquidityShare: 100n, amountA: 0n, amountB: 100n },
-        { binId: 3, liquidityShare: 100n, amountA: 0n, amountB: 100n },
-      ],
+    const seedPlan = diffPlan(makeInput({ ctx, pred, pool }));
+    expect(seedPlan).not.toBeNull();
+    expect(seedPlan!.addBins.length).toBeGreaterThan(0);
+
+    const positionBins: PMState["positionBins"] = seedPlan!.addBins.map((binId, i) => {
+      const a = seedPlan!.addAmountsA[i] ?? 0n;
+      const b = seedPlan!.addAmountsB[i] ?? 0n;
+      return { binId, liquidityShare: a > 0n ? a : b, amountA: a, amountB: b };
     });
 
-    const plan = diffPlan(makeInput({ pm, ctx, pred }));
-    // Shape deviation is below MIN_SHAPE_DEVIATION → should be null.
+    const pm = makePm({ positionBins });
+    const plan = diffPlan(makeInput({ pm, ctx, pred, pool }));
+    // Next tick, unchanged inputs, position matches exactly what would be
+    // rebuilt → shape deviation is below MIN_SHAPE_DEVIATION → null.
     expect(plan).toBeNull();
   });
 
@@ -265,6 +270,58 @@ describe("diffPlan — tolerance guard (returns null)", () => {
 
     const plan = diffPlan(makeInput({ pm, ctx, pred }));
     expect(plan).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F1 regression — quiet-gate basis consistency
+//
+// Acceptance bar: a position built EXACTLY from diffPlan's own output, on a
+// pool where 2×fee + 0.003 exceeds one binStep's worth of price move (so the
+// ask-min filter excludes the nearest ask-side bin), must yield `diffPlan →
+// null` on the very next tick with unchanged inputs — for BOTH pool
+// orientations. Pre-fix, the quiet-gate compared an unfiltered target
+// against the (necessarily filtered) real position and churned every tick.
+// ---------------------------------------------------------------------------
+
+describe("diffPlan — F1 quiet-gate: filtered-bin basis consistency", () => {
+  // binStep=10 (0.1 %) with feeRateBps=40 (0.4 %): 2×fee + 0.003 = 1.1 % >>
+  // one bin's ~0.1 % move, so the nearest ask-side bin (and the next two)
+  // fail the ask-min filter regardless of which physical side is "ask" for
+  // this orientation.
+  const POOL = makePool(0, 40);
+  const CTX = makeCtx("NORMAL", { halfWidth: 3, toleranceBins: 2 });
+  const PRED = makePred({ widthSigma: 2, centerOffset: 0 });
+
+  function roundTrip(profile: PoolProfile) {
+    const pm0 = makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n });
+    const seedPlan = diffPlan({ pm: pm0, pool: POOL, ctx: CTX, pred: PRED, profile });
+    expect(seedPlan).not.toBeNull();
+    expect(seedPlan!.addBins.length).toBeGreaterThan(0);
+
+    // A freshly-built position: liquidityShare mirrors the raw amount placed
+    // (the only side with a non-zero amount per bin — see the verified
+    // above/below physical-side rule).
+    const positionBins: PMState["positionBins"] = seedPlan!.addBins.map((binId, i) => {
+      const a = seedPlan!.addAmountsA[i] ?? 0n;
+      const b = seedPlan!.addAmountsB[i] ?? 0n;
+      return { binId, liquidityShare: a > 0n ? a : b, amountA: a, amountB: b };
+    });
+
+    const pm1 = makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n, positionBins });
+    return diffPlan({ pm: pm1, pool: POOL, ctx: CTX, pred: PRED, profile });
+  }
+
+  it("non-inverted pool (poolCoinAIsQuote=false): stays quiet next tick", () => {
+    expect(SUI_USDC_PROFILE.poolCoinAIsQuote).not.toBe(true); // sanity: default orientation
+    const plan = roundTrip(SUI_USDC_PROFILE);
+    expect(plan).toBeNull();
+  });
+
+  it("inverted pool (poolCoinAIsQuote=true): stays quiet next tick", () => {
+    const invertedProfile: PoolProfile = { ...SUI_USDC_PROFILE, poolCoinAIsQuote: true };
+    const plan = roundTrip(invertedProfile);
+    expect(plan).toBeNull();
   });
 });
 

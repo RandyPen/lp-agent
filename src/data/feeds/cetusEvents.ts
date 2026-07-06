@@ -33,9 +33,10 @@
  *   - `queryEvents` with MoveEventType filter for `<DLMM_PACKAGE>::pool::SwapEvent`
  *   - `getObject` for pool state (activeBin, binStep)
  *
- * Pool object field layout (verified against mainnet 2026-06):
+ * Pool object field layout (verified against mainnet 2026-06, reserves 2026-07):
  *   fields.active_id = { type: "...I32", fields: { bits: <u32> } }
  *   fields.bin_manager.fields.bin_step  (u64 as string or number)
+ *   fields.balance_a / fields.balance_b (u64 strings — raw pool reserves)
  *   There is NO top-level `current_index` and NO top-level `bin_step`.
  *
  * Price convention:
@@ -69,9 +70,6 @@ const BACKFILL_PAGE_DELAY_MS = 150;
 
 // Live poll interval defaults.
 const DEFAULT_POLL_INTERVAL_MS = 30_000;
-
-// Default TVL fallback when pool object doesn't expose it directly.
-const TVL_FALLBACK_USD = 0;
 
 // ---------------------------------------------------------------------------
 // Default pool-physical coin decimals (SUI/USDC mainnet pool: Pool<USDC=6, SUI=9>)
@@ -357,10 +355,64 @@ async function queryPoolState(
   // Human price: USDC per SUI (Binance SUIUSDC convention).
   const price = priceFromBinIdAsQuote(activeBin, binStep, poolCoinADecimals, poolCoinBDecimals);
 
+  // ---------------------------------------------------------------------------
+  // TVL from pool reserves.
+  //
+  // `balance_a` / `balance_b` are top-level u64 strings on the DLMM pool
+  // object (verified against mainnet 2026-07). Missing/non-numeric values
+  // throw — never silently default to 0, because a 0 TVL permanently disarms
+  // the L2 "TVL drop" risk circuit (circuits.ts returns fires:false whenever
+  // the window baseline <= 0).
+  //
+  // Approximation (deliberate, documented): both reserves are valued through
+  // the pool's own spot price with PHYSICAL coinA treated as the USD-pegged
+  // quote side — true for the SUI/USDC pool (Pool<USDC=6, SUI=9>, price =
+  // USDC per SUI = coinA per coinB):
+  //
+  //   tvlUsd ≈ reserveA / 10^decA  +  (reserveB / 10^decB) × price
+  //
+  // This is good enough for the TVL-drop circuit, which only compares TVL
+  // against itself over a 5-minute window; absolute USD accuracy is not
+  // required. Number() precision loss on u64 reserves is likewise irrelevant
+  // at percentage granularity.
+  // ---------------------------------------------------------------------------
+  const balanceARaw = fields["balance_a"];
+  const balanceBRaw = fields["balance_b"];
+  if (balanceARaw === undefined || balanceARaw === null || typeof balanceARaw === "object") {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} missing fields.balance_a ` +
+        `(got: ${JSON.stringify(balanceARaw)})`,
+    );
+  }
+  if (balanceBRaw === undefined || balanceBRaw === null || typeof balanceBRaw === "object") {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} missing fields.balance_b ` +
+        `(got: ${JSON.stringify(balanceBRaw)})`,
+    );
+  }
+  const balanceA = Number(balanceARaw);
+  const balanceB = Number(balanceBRaw);
+  if (!Number.isFinite(balanceA) || balanceA < 0 || !Number.isFinite(balanceB) || balanceB < 0) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} has non-numeric reserves ` +
+        `(balance_a=${String(balanceARaw)}, balance_b=${String(balanceBRaw)})`,
+    );
+  }
+  const priceNum = Number(price);
+  if (!Number.isFinite(priceNum) || priceNum <= 0) {
+    throw new Error(
+      `cetusEvents: pool object ${poolId} produced invalid price '${price}' ` +
+        `(activeBin=${activeBin}, binStep=${binStep}) — cannot compute TVL`,
+    );
+  }
+  const tvlUsd =
+    balanceA / Math.pow(10, poolCoinADecimals) +
+    (balanceB / Math.pow(10, poolCoinBDecimals)) * priceNum;
+
   return {
     activeBin,
     price,
-    tvlUsd: TVL_FALLBACK_USD,
+    tvlUsd,
     binStep,
   };
 }
@@ -424,12 +476,13 @@ export function createCetusEventsFeed(opts: CetusEventsFeedOptions): CetusEvents
   let lastUpdated = 0;
 
   async function refresh(): Promise<void> {
+    // queryPoolState either returns a complete state (activeBin, price, real
+    // reserve-derived tvlUsd, binStep) or throws. On throw the previous cache
+    // is kept untouched and lastUpdated does NOT advance, so the aggregator's
+    // staleness surface reflects the outage — no partial/zero states are ever
+    // written.
     const state = await queryPoolState(poolId, poolCoinADecimals, poolCoinBDecimals, clientOverride);
-    // Preserve tvlUsd from previous cycle if the new query doesn't supply it.
-    cached = {
-      ...state,
-      tvlUsd: state.tvlUsd > 0 ? state.tvlUsd : cached.tvlUsd,
-    };
+    cached = state;
     lastUpdated = Date.now();
   }
 

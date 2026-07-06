@@ -2,21 +2,43 @@
  * Treasury balance watcher.
  *
  * Polls every registered user's deposit address every N seconds, compares
- * each (coin_type, balance) against the cached snapshot, and inserts a
- * `treasury_deposits` row + bumps `treasury_users.credits` whenever a
- * positive delta is observed. All writes go through the atomic
- * `recordDepositTx` so a crash mid-watcher never partially credits.
+ * each (coin_type, balance) against the last CONFIRMED snapshot, and inserts
+ * a `treasury_deposits` row + bumps `treasury_users.credits` whenever a
+ * CONFIRMED positive delta is observed. All crediting writes go through the
+ * atomic `recordDepositTx` so a crash mid-watcher never partially credits.
+ *
+ * Confirmation debounce (dip-then-recover double-credit fix):
+ *   Acting on a single balance observation is unsafe — an RPC lag / an
+ *   inconsistent replica can transiently report a balance that later
+ *   reverts (e.g. 100 -> 40 -> 100). Sui has fast deterministic finality, so
+ *   the threat here is RPC/replica inconsistency, not a deep chain reorg.
+ *   We therefore require the SAME new balance to be observed on
+ *   `BALANCE_CONFIRM_POLLS` consecutive polls — in EITHER direction —
+ *   before acting on it:
+ *     - Balance back at the confirmed baseline: any in-flight pending
+ *       observation is cleared (the change reverted before confirmation);
+ *       no credit change.
+ *     - Balance differs from baseline but hasn't been confirmed yet: the
+ *       observation is persisted (`pending_balance`/`pending_count` on
+ *       `treasury_address_balances`) and no action is taken. Persisting
+ *       additively means a restart mid-confirmation resumes the count
+ *       instead of re-arming from zero.
+ *     - Balance confirmed (same value seen `BALANCE_CONFIRM_POLLS` times):
+ *       act on the delta against the last CONFIRMED baseline — credit on
+ *       delta > 0, just move the baseline on delta < 0 — then clear pending.
  *
  * Idempotency contract:
  *   - The cache (`treasury_address_balances.last_seen_balance`) is the source
- *     of truth for "what we've already credited". A restart re-reads the
- *     cache; only NEW positive deltas trigger inserts.
+ *     of truth for "what we've already credited" — it only ever advances to
+ *     a CONFIRMED balance. A restart re-reads the cache (baseline + any
+ *     pending observation); only NEW confirmed positive deltas trigger
+ *     inserts.
  *   - On startup the watcher does NOT do a one-shot reconciliation pass —
  *     existing on-chain balances vs. cached gaps would be treated as new
  *     deposits. If you sweep externally, update the cache manually first
  *     (or use `getAllBalances` once to seed the cache before sweeping).
  *
- * Delta semantics:
+ * Delta semantics (post-confirmation):
  *   - `delta > 0`: new deposit — record + credit (credits=0 if no rate set;
  *     the row exists for audit + later backfill).
  *   - `delta < 0`: external sweep / operator move — only update cache,
@@ -28,10 +50,10 @@
  */
 
 import type { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
+import { getDb } from "../db/client.ts";
 import { log } from "../lib/logger.ts";
 import { canonicalType } from "../sui/lending/typeNorm.ts";
 import {
-  getAddressBalance,
   getCreditRate,
   listUsers,
   recordDepositTx,
@@ -39,6 +61,92 @@ import {
 } from "./store.ts";
 import { creditsForAmount } from "./credits.ts";
 import type { TreasuryUser } from "./types.ts";
+
+/**
+ * Number of consecutive polls that must observe the SAME new balance before
+ * the watcher acts on it (either direction). 2 is the minimum that turns a
+ * single-sample glitch into "seen twice in a row" without adding much
+ * latency to genuine deposits (one extra poll interval).
+ */
+const BALANCE_CONFIRM_POLLS = 2;
+
+interface BalanceCacheState {
+  /** Last CONFIRMED balance — the baseline credits have been booked against. */
+  confirmed: bigint;
+  /** Not-yet-confirmed observed balance, or null when nothing is pending. */
+  pendingBalance: bigint | null;
+  pendingCount: number;
+}
+
+interface BalanceCacheRow {
+  last_seen_balance: string;
+  pending_balance: string | null;
+  pending_count: number;
+}
+
+/**
+ * Raw read of the confirmation-tracking columns on `treasury_address_balances`.
+ * Deliberately bypasses `store.ts`'s `getAddressBalance` (which only exposes
+ * the confirmed baseline) — the debounce logic needs the pending columns too.
+ */
+function readBalanceCache(depositAddress: string, coinType: string): BalanceCacheState | null {
+  const db = getDb();
+  const row = db
+    .query<BalanceCacheRow, [string, string]>(
+      `SELECT last_seen_balance, pending_balance, pending_count
+       FROM treasury_address_balances
+       WHERE deposit_address = ? AND coin_type = ?`,
+    )
+    .get(depositAddress, coinType);
+  if (!row) return null;
+  return {
+    confirmed: BigInt(row.last_seen_balance),
+    pendingBalance: row.pending_balance !== null ? BigInt(row.pending_balance) : null,
+    pendingCount: row.pending_count,
+  };
+}
+
+/**
+ * Persist a not-yet-confirmed observation. `baselineBalance` is only used
+ * when no row exists yet (brand-new address) — it seeds `last_seen_balance`
+ * on insert; on conflict the existing confirmed baseline is left untouched.
+ */
+function writePendingObservation(args: {
+  depositAddress: string;
+  coinType: string;
+  baselineBalance: bigint;
+  pendingBalance: bigint;
+  pendingCount: number;
+  nowMs: number;
+}): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT INTO treasury_address_balances
+       (deposit_address, coin_type, last_seen_balance, last_seen_ms, pending_balance, pending_count)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(deposit_address, coin_type) DO UPDATE SET
+       pending_balance = excluded.pending_balance,
+       pending_count   = excluded.pending_count,
+       last_seen_ms    = excluded.last_seen_ms`,
+  ).run(
+    args.depositAddress,
+    args.coinType,
+    args.baselineBalance.toString(),
+    args.nowMs,
+    args.pendingBalance.toString(),
+    args.pendingCount,
+  );
+}
+
+/** Clear any in-flight pending observation without touching the confirmed baseline. */
+function clearPendingObservation(depositAddress: string, coinType: string): void {
+  const db = getDb();
+  db.prepare(
+    `UPDATE treasury_address_balances
+     SET pending_balance = NULL, pending_count = 0
+     WHERE deposit_address = ? AND coin_type = ?`,
+  ).run(depositAddress, coinType);
+}
 
 export interface WatcherTickStats {
   usersScanned: number;
@@ -118,11 +226,53 @@ async function tickOneUser(
   for (const b of balances) {
     const coinType = canonicalType(b.coinType);
     const currentBalance = BigInt(b.totalBalance);
-    const snap = getAddressBalance(user.depositAddress, coinType);
-    const prevBalance = snap?.lastSeenBalance ?? 0n;
-    const delta = currentBalance - prevBalance;
+    const cache = readBalanceCache(user.depositAddress, coinType);
+    const confirmedBalance = cache?.confirmed ?? 0n;
 
-    if (delta === 0n) continue;
+    if (currentBalance === confirmedBalance) {
+      // Back at (or still at) the confirmed baseline. Clear any in-flight
+      // pending observation — e.g. a transient dip that has since recovered,
+      // or a still-unconfirmed change that reverted before confirmation.
+      if (cache && (cache.pendingBalance !== null || cache.pendingCount !== 0)) {
+        clearPendingObservation(user.depositAddress, coinType);
+        log.debug("treasury/watcher: pending balance change reverted before confirmation", {
+          depositAddress: user.depositAddress,
+          coinType,
+          confirmedBalance: confirmedBalance.toString(),
+        });
+      }
+      continue;
+    }
+
+    // Balance differs from the confirmed baseline — debounce before acting.
+    const pendingMatches = cache?.pendingBalance === currentBalance;
+    const pendingCount = pendingMatches ? (cache?.pendingCount ?? 0) + 1 : 1;
+
+    if (pendingCount < BALANCE_CONFIRM_POLLS) {
+      writePendingObservation({
+        depositAddress: user.depositAddress,
+        coinType,
+        baselineBalance: confirmedBalance,
+        pendingBalance: currentBalance,
+        pendingCount,
+        nowMs,
+      });
+      log.debug("treasury/watcher: balance change observed, awaiting confirmation", {
+        depositAddress: user.depositAddress,
+        coinType,
+        confirmedBalance: confirmedBalance.toString(),
+        observedBalance: currentBalance.toString(),
+        pendingCount,
+        requiredPolls: BALANCE_CONFIRM_POLLS,
+      });
+      continue;
+    }
+
+    // Confirmed: the SAME new balance has now been observed
+    // BALANCE_CONFIRM_POLLS times in a row. Act against the last CONFIRMED
+    // baseline — there is only ever one pending value in flight per
+    // (address, coin), so this is the exact delta to apply.
+    const delta = currentBalance - confirmedBalance;
 
     if (delta < 0n) {
       // External sweep / operator move: only update cache, never reduce credits.
@@ -132,7 +282,8 @@ async function tickOneUser(
         lastSeenBalance: currentBalance,
         lastSeenMs: nowMs,
       });
-      log.info("treasury/watcher: outflow observed (cache updated, credits unchanged)", {
+      clearPendingObservation(user.depositAddress, coinType);
+      log.info("treasury/watcher: outflow confirmed (cache updated, credits unchanged)", {
         depositAddress: user.depositAddress,
         coinType,
         delta: delta.toString(),
@@ -141,7 +292,7 @@ async function tickOneUser(
       continue;
     }
 
-    // delta > 0 — record a deposit row + bump credits.
+    // delta > 0 — confirmed deposit: record a deposit row + bump credits.
     const rate = getCreditRate(coinType);
     const grantedCredits = creditsForAmount(delta, rate);
 
@@ -151,13 +302,14 @@ async function tickOneUser(
       depositAddress: user.depositAddress,
       coinType,
       amountDelta: delta,
-      prevBalance,
+      prevBalance: confirmedBalance,
       newBalance: currentBalance,
       creditsGranted: grantedCredits,
       rateNum: rate?.rateNum ?? null,
       rateDen: rate?.rateDen ?? null,
       observedAtMs: nowMs,
     });
+    clearPendingObservation(user.depositAddress, coinType);
     newDeposits++;
     creditsGranted += grantedCredits;
 

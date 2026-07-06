@@ -613,6 +613,35 @@ describe("mlAgent — output kinds", () => {
 });
 
 // ---------------------------------------------------------------------------
+// F10 — fillBoundary must match diffPlan's clamped center, not the raw
+// (unclamped) predicted offset.
+// ---------------------------------------------------------------------------
+
+describe("mlAgent — fillBoundary uses the clamped plan center (F10)", () => {
+  beforeEach(() => {
+    db = freshDb();
+  });
+
+  it("clamps fillBoundary to ±maxCenterOffset instead of the raw centerOffset", async () => {
+    const ctx: StateContext = { ...makeCtx("NORMAL"), maxCenterOffset: 1 };
+    // Raw predicted offset (10) far exceeds maxCenterOffset (1) — diffPlan
+    // clamps its center to activeBin+1; fillBoundary must agree.
+    const pred = makePred({ centerOffset: 10, fallback: false });
+    const strategy = createMlAgentStrategy(makeDeps({
+      provider: makeMockProvider(pred),
+      stateMachine: makeMockStateMachine(ctx),
+    }));
+
+    const output = await strategy.plan(makeStrategyInput());
+    if (output.kind !== "plan_and_reconcile" && output.kind !== "plan_only") {
+      throw new Error(`expected a plan, got ${output.kind}`);
+    }
+    // activeBin=100 (fixture) + clamp(round(10), -1, 1) = 101, NOT 110.
+    expect(output.fillBoundary).toBe(101);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests: restart rehydration
 // ---------------------------------------------------------------------------
 

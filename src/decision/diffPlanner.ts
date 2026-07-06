@@ -128,6 +128,62 @@ const MIN_SHAPE_DEVIATION = 0.15;
  */
 const MIN_BIN_AMOUNT = 100n;
 
+/**
+ * Strong-trend capital deployment fraction (§3.2): only this share of market
+ * capital is deployed on the counter-trend side; the rest rides to lending.
+ * `STRONG_TREND_CAPITAL_DIVISOR` is its EXACT bigint reciprocal (1 / 0.25 = 4)
+ * so `scalePrincipal` never has to round-trip through `Number` for this case.
+ */
+const STRONG_TREND_CAPITAL_SCALE = 0.25;
+const STRONG_TREND_CAPITAL_DIVISOR = 4n;
+
+/**
+ * Scale a bigint principal by `scale` without a lossy bigint→Number→bigint
+ * round-trip. `capitalScale` only ever takes two values today (1 = full
+ * deployment, STRONG_TREND_CAPITAL_SCALE = strong-trend 25%) — both have
+ * exact bigint representations, so we special-case them instead of routing
+ * through `Number(principal) * scale`, which silently loses precision above
+ * 2^53 raw units (a real risk for 6-decimal stablecoins at meaningful TVL).
+ *
+ * Per house policy (no silent fallbacks): an unrecognized scale throws rather
+ * than falling back to the lossy float path — a future new fraction must add
+ * its own exact bigint case here.
+ */
+function scalePrincipal(principal: bigint, scale: number): bigint {
+  if (scale === 1) return principal;
+  if (scale === STRONG_TREND_CAPITAL_SCALE) return principal / STRONG_TREND_CAPITAL_DIVISOR;
+  throw new RangeError(
+    `diffPlanner: scalePrincipal received unsupported capitalScale ${scale} — add an exact bigint case instead of falling back to Number()`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Target center-bin derivation (shared with mlAgent's fillBoundary — F10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive the target center bin exactly the way the plan build does:
+ *   - NORMAL: activeBin + clamp(round(centerOffset), -maxCenterOffset, +maxCenterOffset)
+ *   - TREND / EXTREME: activeBin (TREND never follows the moving predicted
+ *     center per §3.2; EXTREME has no center concept and callers shouldn't
+ *     reach this path for it, but activeBin is the safe/no-op answer).
+ *
+ * Exported so `mlAgent.ts` can compute `fillBoundary` from the SAME clamped
+ * value diffPlan actually built the position around, instead of the raw
+ * (unclamped) prediction offset — the two must never diverge (F10).
+ */
+export function computeTargetCenterBin(
+  state: StateContext["state"],
+  activeBin: number,
+  centerOffset: number,
+  maxCenterOffset: number,
+): number {
+  if (state !== "NORMAL") return activeBin;
+  const rawOffset = Math.round(centerOffset);
+  const clippedOffset = Math.max(-maxCenterOffset, Math.min(maxCenterOffset, rawOffset));
+  return activeBin + clippedOffset;
+}
+
 // ---------------------------------------------------------------------------
 // Weight computation helpers
 // ---------------------------------------------------------------------------
@@ -286,6 +342,45 @@ function currentPositionWeights(pm: PMState): Map<number, number> {
   for (const b of pm.positionBins) {
     if (b.liquidityShare > 0n) out.set(b.binId, Number(b.liquidityShare) / Number(total));
   }
+  return out;
+}
+
+/**
+ * Convert a hypothetical (or actual) set of per-bin PHYSICAL add amounts —
+ * the same shape as `RebalancePlan.addBins/addAmountsA/addAmountsB` — into a
+ * normalized weight map, for comparison against `currentPositionWeights`.
+ *
+ * Deliberately NOT price/decimal-adjusted. `currentPositionWeights` sums
+ * `liquidityShare` — an opaque on-chain LP-share unit — across BOTH physical
+ * sides with no price conversion, because `PositionBin` doesn't carry
+ * reliable per-bin token amounts (`PMState.positionValue`'s doc comment:
+ * "per-bin amounts are 0n in v0 chain reads" — the only real on-chain read
+ * available is the share count). Converting THIS side (the hypothetical
+ * build) into true price-adjusted capital weight while leaving the CURRENT
+ * side as a raw liquidity-share sum would make the two vectors comparable in
+ * appearance but WORSE in practice — a new, asymmetric approximation instead
+ * of the existing symmetric one. So both vectors use the exact same
+ * convention: sum raw bigint magnitude per bin (whichever physical side is
+ * non-zero), normalize to 1. Any residual cross-token-unit skew this leaves
+ * is bounded and pre-existing (see `currentPositionWeights`'s doc comment);
+ * what THIS fix removes is the much larger, unconditional-churn-inducing
+ * divergence from comparing an unfiltered target against a filtered reality
+ * (ask-min filter, stop-loss exemptions, per-side renormalization, inventory
+ * scaling, dust filter) — see diffPlan's quiet-gate section.
+ */
+function amountsToWeights(bins: number[], amountsA: bigint[], amountsB: bigint[]): Map<number, number> {
+  const raw = new Map<number, number>();
+  let total = 0;
+  for (let i = 0; i < bins.length; i++) {
+    const magnitude = Number(amountsA[i] ?? 0n) + Number(amountsB[i] ?? 0n);
+    if (magnitude > 0) {
+      raw.set(bins[i]!, magnitude);
+      total += magnitude;
+    }
+  }
+  if (total <= 0) return new Map();
+  const out = new Map<number, number>();
+  for (const [k, v] of raw) out.set(k, v / total);
   return out;
 }
 
@@ -622,17 +717,11 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
   // uncertainty input and used toleranceBins as a proxy).
   const maxCenterOffset = ctx.maxCenterOffset;
 
-  // --- NORMAL: center derived from predicted offset ---
+  // --- NORMAL: center derived from predicted offset (clamped) ---
   // --- TREND:  center = active bin (don't follow moving target) ---
-  let targetCenterBin: number;
-  if (ctx.state === "NORMAL") {
-    const rawOffset = Math.round(pred.centerOffset);
-    const clippedOffset = Math.max(-maxCenterOffset, Math.min(maxCenterOffset, rawOffset));
-    targetCenterBin = activeBin + clippedOffset;
-  } else {
-    // TREND: center is always active bin per §3.2
-    targetCenterBin = activeBin;
-  }
+  // Shared with mlAgent's fillBoundary (F10) so the fill-detection boundary
+  // never disagrees with where this function actually centers the position.
+  const targetCenterBin = computeTargetCenterBin(ctx.state, activeBin, pred.centerOffset, maxCenterOffset);
 
   // --- Inventory imbalance assessment (C1 wiring) ---
   // Computed on the FULL deployable capital (incl. any injected positionValue)
@@ -648,7 +737,8 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     decimalAdj: Math.pow(10, orientation.poolCoinADecimals - orientation.poolCoinBDecimals),
   });
 
-  // --- Tolerance check: is the current position already good enough? ---
+  // --- Current position center (used by the quiet-gate check below, once
+  // the real plan has been built) ---
   const currentPositionCenter: number | null = (() => {
     if (!hasPosition) return null;
     const min = pm.positionBins.reduce((m, b) => Math.min(m, b.binId), pm.positionBins[0]!.binId);
@@ -656,49 +746,15 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     return Math.round((min + max) / 2);
   })();
 
-  // A severe imbalance OR a pending force-liquidation mandates a correction
-  // pass even when the position shape looks fine — the severe regime's
-  // bypassGasFilter flag and §4.2's stale-inventory exception are exactly
-  // these two exceptions.
-  if (hasPosition && currentPositionCenter !== null && !invAdj.bypassGasFilter && !hasForceLiquidation) {
-    const centerDrift = Math.abs(currentPositionCenter - targetCenterBin);
-    if (centerDrift <= ctx.toleranceBins) {
-      // Center is close enough — check shape deviation.
-      let targetWeights: Map<number, number>;
-      const { lower: pmLo, upper: pmHi } = pmRange(pm, activeBin, ctx.halfWidth);
-
-      if (ctx.state === "TREND") {
-        const { weights } = computeTrendWeights(
-          activeBin,
-          ctx.trendBias,
-          ctx.halfWidth,
-          pred.widthSigma,
-          pmLo,
-          pmHi,
-          ctx.strongTrend,
-          dir,
-        );
-        targetWeights = weights;
-      } else {
-        targetWeights = computeNormalWeights(
-          targetCenterBin,
-          activeBin,
-          ctx.halfWidth,
-          pred.widthSigma,
-          pmLo,
-          pmHi,
-        );
-      }
-
-      const current = currentPositionWeights(pm);
-      const deviation = shapeDeviation(targetWeights, current);
-      if (deviation < MIN_SHAPE_DEVIATION) {
-        return null; // Below min-improvement threshold — quiet
-      }
-    }
-  }
-
-  // --- Build target weight map ---
+  // --- Build target weight map (SINGLE computation — shared by the
+  // quiet-gate check below and the real plan build; these must never diverge
+  // again, which is exactly the bug this section fixes: the gate used to
+  // recompute its own copy without the ask-min filter / per-side
+  // renormalization / inventory scaling the real build applies below, so a
+  // position that structurally CANNOT hold liquidity on a filtered bin was
+  // compared against a target that still counted that bin's mass — shape
+  // deviation then exceeded MIN_SHAPE_DEVIATION on nearly every tick even
+  // when centered, forcing a full remove+re-add every NORMAL/TREND eval.) ---
   const { lower: pmLower, upper: pmUpper } = pmRange(pm, activeBin, ctx.halfWidth);
 
   let targetWeights: Map<number, number>;
@@ -720,7 +776,7 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     isStrongTrend = strongTrend;
     if (isStrongTrend) {
       // Strong trend: only 25 % of market capital is deployed.
-      capitalScale = 0.25;
+      capitalScale = STRONG_TREND_CAPITAL_SCALE;
     }
   } else {
     // NORMAL
@@ -747,10 +803,11 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
   // Principal capital = idle balance + the dryRun-estimated value of the
   // position being removed (injected by the execution layer's re-plan pass);
   // capitalScale (strong-trend 25 %) applies to principal, fees ride on top.
+  // Full-bigint scaling (F11) — see scalePrincipal's doc comment.
   const principalA = pm.balance.a + (pm.positionValue?.a ?? 0n);
   const principalB = pm.balance.b + (pm.positionValue?.b ?? 0n);
-  const marketCapitalA = BigInt(Math.floor(Number(principalA) * capitalScale));
-  const marketCapitalB = BigInt(Math.floor(Number(principalB) * capitalScale));
+  const marketCapitalA = scalePrincipal(principalA, capitalScale);
+  const marketCapitalB = scalePrincipal(principalB, capitalScale);
 
   // Include fee bag in available capital.
   const availableA = marketCapitalA + pm.feeBag.a;
@@ -871,6 +928,45 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
 
   const totalAddA = sortedAmountsA.reduce((s, v) => s + v, 0n);
   const totalAddB = sortedAmountsB.reduce((s, v) => s + v, 0n);
+
+  // --- Quiet-gate: is the current position already close enough to what we
+  // just built? (F1 fix) ---
+  //
+  // The comparison target is `sortedBins`/`sortedAmountsA`/`sortedAmountsB` —
+  // the EXACT output of the ask-min filter, stop-loss exemptions, per-side
+  // renormalization, splitProportional, inventory-scale adjustment and dust
+  // filter above. Previously this check ran against a raw, unfiltered
+  // `targetWeights` snapshot computed independently of all of that shaping —
+  // so on any pool where the nearest ask bin fails the ask-min filter (which
+  // is common: 2×fee + 0.003 easily exceeds one binStep's worth of price
+  // move), the "target" permanently counted mass on a bin the built position
+  // could never actually hold, and shape deviation exceeded
+  // MIN_SHAPE_DEVIATION on essentially every tick — a full remove+re-add
+  // every NORMAL/TREND eval even when perfectly centered.
+  //
+  // Basis note: `currentPositionWeights` sums `liquidityShare` (an opaque
+  // on-chain LP-share unit) across both physical sides with NO price
+  // conversion — `PositionBin` doesn't carry reliable per-bin token amounts
+  // (see `PMState.positionValue`'s doc comment). `amountsToWeights` mirrors
+  // that exact convention for the hypothetical build (raw magnitude sum, no
+  // price/decimal adjustment) rather than converting to true price-adjusted
+  // capital weight, which would make the two vectors LESS comparable, not
+  // more (an asymmetric conversion on only one side). See that function's
+  // doc comment for the full rationale. The residual cross-token-unit skew
+  // this leaves was already present pre-fix and is bounded/documented; what
+  // this fix removes is the dominant, unconditional-churn-inducing
+  // divergence from comparing against the wrong (unfiltered) pipeline.
+  if (hasPosition && currentPositionCenter !== null && !invAdj.bypassGasFilter && !hasForceLiquidation) {
+    const centerDrift = Math.abs(currentPositionCenter - targetCenterBin);
+    if (centerDrift <= ctx.toleranceBins) {
+      const hypothetical = amountsToWeights(sortedBins, sortedAmountsA, sortedAmountsB);
+      const current = currentPositionWeights(pm);
+      const deviation = shapeDeviation(hypothetical, current);
+      if (deviation < MIN_SHAPE_DEVIATION) {
+        return null; // Below min-improvement threshold — quiet
+      }
+    }
+  }
 
   const stateLabel = ctx.state === "TREND" ? (isStrongTrend ? "TREND/strong" : "TREND/weak") : "NORMAL";
   const stopLossTag = stopLoss

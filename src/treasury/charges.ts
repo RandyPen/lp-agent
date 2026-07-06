@@ -165,32 +165,46 @@ export async function chargeForServiceWithSignature(
     throw new Error("bad_signature");
   }
 
-  // Signature valid — attempt the charge.
-  const row = attemptChargeTx({
-    nonce,
-    suiAddress,
-    pmId: null,
-    cost: credits,
-    memo: memo ?? null,
-  });
+  // Signature valid — attempt the charge. The debit (attemptChargeTx, which
+  // is itself a `db.transaction`) and the nonce status transition to
+  // 'accepted' are wrapped in ONE outer transaction here — bun:sqlite nests
+  // this as a SAVEPOINT, so the debit and the nonce-status flip commit or
+  // roll back together. Previously these were separate statements: a crash
+  // between them left the nonce permanently 'pending' (see the throw above
+  // for that state) while the user had already been charged.
+  const row = db.transaction(() => {
+    const chargeRow = attemptChargeTx({
+      nonce,
+      suiAddress,
+      pmId: null,
+      cost: credits,
+      memo: memo ?? null,
+    });
 
-  if (row.status === "ok") {
-    const verifiedAtMs = Date.now();
-    // Record signature metadata on the charge row.
-    db.prepare(
-      `UPDATE treasury_service_charges
-       SET signature = ?, message_b64 = ?, verified_at_ms = ?
-       WHERE nonce = ?`,
-    ).run(signature, messageB64, verifiedAtMs, nonce);
+    if (chargeRow.status === "ok") {
+      const verifiedAtMs = Date.now();
+      // Record signature metadata on the charge row.
+      db.prepare(
+        `UPDATE treasury_service_charges
+         SET signature = ?, message_b64 = ?, verified_at_ms = ?
+         WHERE nonce = ?`,
+      ).run(signature, messageB64, verifiedAtMs, nonce);
+    }
 
-    // Mark nonce accepted.
+    // Whether the charge succeeded or was rejected (not_registered /
+    // insufficient_credits), the nonce was consumed — mark it accepted in
+    // the SAME transaction as the debit attempt.
     db.prepare(
       `UPDATE treasury_charge_nonces
        SET status = 'accepted'
        WHERE sui_address = ? AND nonce = ?`,
     ).run(suiAddress, nonce);
 
-    const user = findUserBySuiAddress(suiAddress);
+    return chargeRow;
+  })();
+
+  const user = findUserBySuiAddress(suiAddress);
+  if (row.status === "ok") {
     return {
       ok: true,
       chargeNonce: nonce,
@@ -199,15 +213,6 @@ export async function chargeForServiceWithSignature(
     };
   }
 
-  // Charge was rejected (not_registered / insufficient_credits) — mark nonce accepted
-  // (nonce was consumed, just charge didn't go through).
-  db.prepare(
-    `UPDATE treasury_charge_nonces
-     SET status = 'accepted'
-     WHERE sui_address = ? AND nonce = ?`,
-  ).run(suiAddress, nonce);
-
-  const user = findUserBySuiAddress(suiAddress);
   return {
     ok: false,
     chargeNonce: nonce,

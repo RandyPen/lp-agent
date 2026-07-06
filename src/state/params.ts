@@ -39,6 +39,16 @@ export interface StateParams {
   /** TREND / NORMAL entry: p_break threshold (max(pAbove, pBelow) > this). */
   pBreakEntry: number;
   /**
+   * TREND exit hysteresis: max(pAbove, pBelow) must recede below this
+   * (strictly lower than `pBreakEntry`) before the p-break condition allows
+   * an exit back to NORMAL. Without a dedicated exit threshold, p-break
+   * oscillating around `pBreakEntry` (e.g. 0.58 ↔ 0.62) flaps the state
+   * machine every eval tick — the drift channel already has 2.0/1.5
+   * hysteresis and EXTREME has its own exit band; this closes the same gap
+   * for the p-break channel.
+   */
+  pBreakExit: number;
+  /**
    * EXTREME entry via local prediction: pAbove + pBelow > this triggers
    * EXTREME regardless of external risk signal.
    */
@@ -60,6 +70,7 @@ export const DEFAULT_STATE_PARAMS: StateParams = {
   driftStrengthEntry: 2.0,
   driftStrengthExit: 1.5,
   pBreakEntry: 0.6,
+  pBreakExit: 0.5,
   pBreakSumExtreme: 0.7,
   pBreakSumExtremeExit: 0.6,
   trendBiasStrong: 0.7,

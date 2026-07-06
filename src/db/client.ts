@@ -13,6 +13,11 @@ export function openDb(path: string): Database {
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
   db.exec("PRAGMA synchronous = NORMAL");
+  // Without this, a second process (operator script, ad-hoc SQL diagnostic)
+  // opening the same DB file while the agent is running gets an immediate
+  // SQLITE_BUSY instead of waiting for the writer to finish. 5s comfortably
+  // covers a single writer transaction under WAL.
+  db.exec("PRAGMA busy_timeout = 5000");
   applySchema(db);
   cached = db;
   return db;
@@ -78,6 +83,29 @@ const ADDITIVE_COLUMNS: AdditiveColumn[] = [
     table: "risk_events",
     column: "source",
     ddl: "ALTER TABLE risk_events ADD COLUMN source TEXT NOT NULL DEFAULT 'live' CHECK(source IN ('live','shadow'))",
+  },
+  {
+    // Treasury watcher confirmation debounce (dip-then-recover double-credit
+    // fix). `pending_balance`/`pending_count` track a not-yet-confirmed
+    // observed balance change so a restart mid-confirmation resumes rather
+    // than re-arming from zero. See src/treasury/watcher.ts.
+    table: "treasury_address_balances",
+    column: "pending_balance",
+    ddl: "ALTER TABLE treasury_address_balances ADD COLUMN pending_balance TEXT",
+  },
+  {
+    table: "treasury_address_balances",
+    column: "pending_count",
+    ddl: "ALTER TABLE treasury_address_balances ADD COLUMN pending_count INTEGER NOT NULL DEFAULT 0",
+  },
+  {
+    // Correlates a rebalances row to the treasury charge nonce debited for
+    // it, so a startup reconciliation sweep can refund the exact charge for
+    // a row orphaned by a crash between pre-charge and PTB submission. See
+    // reconcileOrphanedRebalances in src/services/rebalancer.ts.
+    table: "rebalances",
+    column: "charge_nonce",
+    ddl: "ALTER TABLE rebalances ADD COLUMN charge_nonce TEXT",
   },
 ];
 

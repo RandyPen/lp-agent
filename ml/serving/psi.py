@@ -9,8 +9,9 @@ Conventional reading: < 0.1 stable, 0.1–0.25 moderate shift, > 0.25 drifted
 
 from __future__ import annotations
 
+import threading
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 import numpy as np
 
@@ -48,6 +49,19 @@ class PsiTracker:
     Below ``min_obs`` observations the tracker reports PSI 0.0 — a documented
     warm-up, not a measurement; ``n_obs`` in the summary makes the state
     visible to /health consumers.
+
+    Per-feature exclusion: ``observe(vector, exclude={...})`` marks the named
+    features as warm-up defaults for THIS observation (recorded as NaN in the
+    window). ``summary`` computes a feature's PSI only over its non-excluded
+    observations and skips the feature entirely (listing it under
+    ``"excluded"``) while it has fewer than ``min_obs`` real values — so PSI
+    never fires on constants that are defaults-by-construction (e.g. the
+    sidecar's derivative history still accumulating) rather than drift.
+
+    Thread safety: /predict runs in Starlette's threadpool, so ``observe``
+    (deque append) and ``summary`` (``np.stack`` over the deque) can race.
+    Both are serialized on an internal lock — same self-guarding pattern as
+    ``ModelRegistry``'s bundle pointer.
     """
 
     def __init__(
@@ -62,34 +76,66 @@ class PsiTracker:
             raise ValueError(f"PsiTracker: baseline missing features {missing}")
         self._baseline = {n: baseline[n] for n in feature_names}
         self._feature_names = list(feature_names)
+        self._index = {n: i for i, n in enumerate(self._feature_names)}
         self._buffer: deque[np.ndarray] = deque(maxlen=window)
         self._min_obs = min_obs
+        self._lock = threading.Lock()
 
-    def observe(self, vector: np.ndarray) -> dict:
+    def observe(self, vector: np.ndarray, exclude: Collection[str] = ()) -> dict:
         """Append one feature vector and return the current PSI summary:
-        ``{"max": float, "by_feature": {...}, "breached": [...], "n_obs": int}``
-        (``breached`` uses the conventional 0.25 threshold)."""
-        vector = np.asarray(vector, dtype=float).reshape(-1)
+        ``{"max": float, "by_feature": {...}, "breached": [...],
+        "excluded": [...], "n_obs": int}``
+        (``breached`` uses the conventional 0.25 threshold).
+
+        Features named in ``exclude`` are recorded as NaN for this
+        observation (see class docstring); unknown names raise."""
+        vector = np.array(vector, dtype=float).reshape(-1)  # copy — we may mutate
         if len(vector) != len(self._feature_names):
             raise ValueError(
                 f"PsiTracker.observe: expected {len(self._feature_names)} values, got {len(vector)}"
             )
-        self._buffer.append(vector)
-        return self.summary()
+        if exclude:
+            unknown = [n for n in exclude if n not in self._index]
+            if unknown:
+                raise ValueError(f"PsiTracker.observe: unknown excluded features {unknown}")
+            for name in exclude:
+                vector[self._index[name]] = np.nan
+        with self._lock:
+            self._buffer.append(vector)
+            return self._summary_locked()
 
     def summary(self, breach_threshold: float = 0.25) -> dict:
+        with self._lock:
+            return self._summary_locked(breach_threshold)
+
+    def _summary_locked(self, breach_threshold: float = 0.25) -> dict:
+        """Compute the summary. Caller must hold ``self._lock``."""
         if len(self._buffer) < self._min_obs:
-            return {"max": 0.0, "by_feature": {}, "breached": [], "n_obs": len(self._buffer)}
+            return {
+                "max": 0.0,
+                "by_feature": {},
+                "breached": [],
+                "excluded": [],
+                "n_obs": len(self._buffer),
+            }
         matrix = np.stack(self._buffer)
         by_feature: dict[str, float] = {}
+        excluded: list[str] = []
         for i, name in enumerate(self._feature_names):
+            col = matrix[:, i]
+            finite = col[np.isfinite(col)]
+            if len(finite) < self._min_obs:
+                # Feature still in per-feature warm-up (observations were
+                # excluded as defaults-by-construction) — not a measurement.
+                excluded.append(name)
+                continue
             spec = self._baseline[name]
-            actual = bucket_fractions(matrix[:, i], spec["edges"])
-            by_feature[name] = psi(spec["expected"], actual)
+            by_feature[name] = psi(spec["expected"], bucket_fractions(finite, spec["edges"]))
         max_psi = max(by_feature.values()) if by_feature else 0.0
         return {
             "max": max_psi,
             "by_feature": by_feature,
             "breached": [n for n, v in by_feature.items() if v > breach_threshold],
+            "excluded": excluded,
             "n_obs": len(self._buffer),
         }

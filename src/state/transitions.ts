@@ -187,7 +187,11 @@ export function shouldEnterTrend(
  *
  * Return to NORMAL when BOTH:
  *   (a) drift_strength has fallen below the hysteresis exit threshold (1.5), AND
- *   (b) max(pAbove, pBelow) ≤ P_BREAK_ENTRY (no longer p-break dominant)
+ *   (b) max(pAbove, pBelow) has receded below P_BREAK_EXIT (0.5 by default) —
+ *       a DEDICATED exit threshold strictly below P_BREAK_ENTRY (0.6), so a
+ *       p-break value oscillating in the 0.5–0.6 band cannot flap the state
+ *       machine TREND↔NORMAL every eval tick (mirrors the drift-strength
+ *       2.0/1.5 hysteresis and the EXTREME pBreakSumExtreme/Exit band).
  */
 export function shouldExitTrend(
   snapshot: MarketSnapshot,
@@ -196,7 +200,7 @@ export function shouldExitTrend(
 ): boolean {
   const driftStrength = computeDriftStrength(snapshot);
   if (driftStrength > params.driftStrengthExit) return false;
-  if (Math.max(pred.pAbove, pred.pBelow) > params.pBreakEntry) return false;
+  if (Math.max(pred.pAbove, pred.pBelow) > params.pBreakExit) return false;
   return true;
 }
 
