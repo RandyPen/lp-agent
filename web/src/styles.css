@@ -1,0 +1,192 @@
+@import url("https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600;700&family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&display=swap");
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+ * LiquidityManager — quant terminal design system (dark-only, deliberate).
+ *
+ * Chart series colors are the dataviz reference palette's DARK categorical
+ * steps (validated as a set against the dark surface). UI chrome uses the
+ * brand phosphor-mint accent, which is NOT used as a series color.
+ * ------------------------------------------------------------------------- */
+
+@theme {
+  --font-display: "Chakra Petch", sans-serif;
+  --font-body: "IBM Plex Sans", sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+
+  --color-bg: #0a0d10;
+  --color-panel: #10151a;
+  --color-panel-2: #151c22;
+  --color-line: #1f2a33;
+  --color-line-2: #2b3945;
+
+  --color-ink: #e8eef2;
+  --color-ink-2: #9fb0bc;
+  --color-ink-3: #5c6c78;
+
+  --color-mint: #35e0a1;
+  --color-mint-dim: #1d7a58;
+
+  /* dataviz dark categorical slots */
+  --color-s-blue: #3987e5;
+  --color-s-aqua: #199e70;
+  --color-s-yellow: #c98500;
+  --color-s-violet: #9085e9;
+  --color-s-red: #e66767;
+  --color-s-orange: #d95926;
+
+  /* market states */
+  --color-state-normal: #199e70;
+  --color-state-trend: #3987e5;
+  --color-state-extreme: #e66767;
+
+  /* risk levels */
+  --color-l1: #c98500;
+  --color-l2: #d95926;
+  --color-l3: #e66767;
+}
+
+html {
+  background: var(--color-bg);
+  color-scheme: dark;
+}
+
+body {
+  font-family: var(--font-body);
+  color: var(--color-ink);
+  background:
+    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(53, 224, 161, 0.06), transparent),
+    var(--color-bg);
+  min-height: 100vh;
+}
+
+/* subtle scanline texture for the terminal feel */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    transparent 0px,
+    transparent 3px,
+    rgba(255, 255, 255, 0.006) 3px,
+    rgba(255, 255, 255, 0.006) 4px
+  );
+  z-index: 50;
+}
+
+::selection {
+  background: rgba(53, 224, 161, 0.25);
+}
+
+/* --------------------------------------------------------------------------
+ * Reusable primitives
+ * ------------------------------------------------------------------------ */
+
+.panel {
+  background: var(--color-panel);
+  border: 1px solid var(--color-line);
+  border-radius: 6px;
+}
+
+.panel-title {
+  font-family: var(--font-display);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-ink-2);
+}
+
+.mono-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.btn-primary {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+  color: #06231a;
+  background: var(--color-mint);
+  border-radius: 4px;
+  padding: 0.55rem 1.1rem;
+  transition: filter 120ms ease, transform 120ms ease;
+}
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.12);
+}
+.btn-primary:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn-primary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn-ghost {
+  font-family: var(--font-display);
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+  color: var(--color-ink-2);
+  border: 1px solid var(--color-line-2);
+  border-radius: 4px;
+  padding: 0.5rem 1rem;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--color-mint);
+  border-color: var(--color-mint-dim);
+}
+.btn-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* dapp-kit ConnectButton override — align with the terminal chrome */
+.wallet-connect-unconnected button {
+  font-family: var(--font-display) !important;
+  font-weight: 600 !important;
+  letter-spacing: 0.08em !important;
+  text-transform: uppercase !important;
+  font-size: 0.78rem !important;
+  color: #06231a !important;
+  background: var(--color-mint) !important;
+  border-radius: 4px !important;
+  padding: 0.55rem 1.1rem !important;
+  border: none !important;
+  cursor: pointer !important;
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.rise-in {
+  animation: rise-in 360ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 9999px;
+  background: var(--color-mint);
+  animation: pulse-dot 2.2s ease-in-out infinite;
+}

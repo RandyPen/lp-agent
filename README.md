@@ -182,7 +182,24 @@ Implement `PredictionProvider` and plug in your own sidecar / remote service / l
 |---|---|---|
 | LLM signal source | `Strategy.plan()` receives `history: PriceObservation[]` | Bring your own LLM client / RSS scraper / Twitter API and feed it into the decision inside your strategy |
 | Cross-chain | (nothing) | Bring a bridge SDK and run it as a separate service outside the main process; do not pollute the treasury module |
-| HTTP API | (nothing beyond the optional bind-local treasury API) | Bun ships `Bun.serve()`; add routes in `src/index.ts` — the treasury layer already exposes callable functions like `attemptCharge` / `findUserBySuiAddress` |
+| HTTP API | bind-local treasury API + read-only agent routes (`src/web/routes.ts`) | Extend `matchWebRoute` with new GET endpoints, or add mutating routes behind the existing signature-verification pattern |
+
+## Web portal (`web/`)
+
+A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dapp-kit-react` v2, dark quant-terminal UI. It is the user entry point for the agent:
+
+- **Enroll** — create a custody `PositionManager` + add liquidity (tx 1), then whitelist the agent operator (tx 2). The agent's `AgentAdded` watcher picks the PM up automatically; the wizard cross-checks that the portal and the running agent point at the same CDPM deployment before signing.
+- **Dashboard** — NAV per PM, cumulative fee income, three-state timeline, live L1/L2/L3 risk events.
+- **Intelligence** — observed price vs the model's q10–q90 quantile fan, model-vs-fallback share, shadow-mode ML-vs-rule comparison.
+- **Positions** — per-PM rebalance history with full plan drill-down and explorer links.
+- **Account** — signature-only registration, per-user deposit address, credit balance, deposit history.
+
+```bash
+# agent side: expose the API (bind-local) — TREASURY_HTTP_ENABLED=true bun start
+cd web && bun install && bun run dev     # Vite proxies /v1 → 127.0.0.1:8378
+```
+
+The portal reads the agent's data only through the HTTP API (no direct SQLite access) and signs only user-owned CDPM calls (`user_deposit_liquidity`, `user_insert_agent`) through the connected wallet.
 
 ## Project structure
 
@@ -205,7 +222,8 @@ src/
 ├── risk/                     # layered circuit breakers (L1/L2/L3) + monitor + PnL attribution
 ├── decision/                 # diff planner / inventory / age stop-loss
 ├── strategies/               # strategy implementations + registry (incl. mlAgent)
-├── treasury/                 # user top-ups + credit ledger + watcher + charges
+├── treasury/                 # user top-ups + credit ledger + watcher + charges (+ bind-local HTTP API)
+├── web/                      # read-only HTTP routes serving the web portal (mounted into the treasury API)
 ├── services/                 # orchestration (rebalancer / executor / subscriptions / treasuryService / shadowRunner)
 ├── db/                       # SQLite single-file schema (CREATE IF NOT EXISTS, no migrations)
 ├── lib/                      # utilities: logger / locks / errors
@@ -213,6 +231,8 @@ src/
 
 ml/                           # Python pipeline (uv-managed): data / features / training / serving / backtest / tests
                               # model artifacts in ml/artifacts/ stay out of git; uv.lock IS tracked for reproducibility
+
+web/                          # user-facing portal (Vite + React + dapp-kit v2) — standalone package, own lockfile
 ```
 
 ## Documentation

@@ -24,7 +24,7 @@ LiquidityManager is an **open-source quantitative liquidity-custody agent** for 
 **What the project intentionally does NOT ship**:
 - LLM-driven news ingestion / σ-jump / Strategic Brief — stripped in the template phase; future external signals enter via a `PredictionProvider` decorator or inside the sidecar, never as framework changes
 - Cross-chain support — single-chain Sui only
-- HTTP API surface — direct CLI + SQLite only; v2 adds HTTP
+- Public HTTP API — the only HTTP surface is the bind-local (127.0.0.1) Bun server gated by `TREASURY_HTTP_ENABLED`: treasury endpoints (`src/treasury/httpApi.ts`) + read-only agent-data routes (`src/web/routes.ts`) that back the `web/` portal. Never expose it raw to the internet.
 - Encrypted research-report layer via Seal — design is in `docs/seal-integration.md` (per-user model, AGENT keypair NOT involved), env placeholders in `.env.example`; SDK + Move contracts land in v2 forks
 
 Design directions captured from the operator's internal design notes (a Chinese-named markdown file at the repo root, kept local and untracked):
@@ -49,7 +49,8 @@ Open-source quant agent (~18 kLOC TypeScript, 860+ tests / 48 files; plus the `m
 
 **Note on doc references**: the detailed design documents under `docs/` (implementation plan, data sources, prediction/decision/backtest/risk designs, treasury, Seal, module-and-testing) are operator-local Chinese notes — gitignored, NOT in the public repo. References to them throughout this file are kept for the operator; in a fresh clone only `docs/README.md` and `docs/project-overview.md` exist.
 
-- Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo.
+- Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo. The `web/` portal is a third standalone Bun package (Vite + React 19 + `@mysten/dapp-kit-react` 2.x, own lockfile, never imported by the agent runtime); its data channel is the bind-local HTTP API (`src/web/routes.ts` mounted into `src/treasury/httpApi.ts`), and its dev proxy maps `/v1` → `127.0.0.1:8378`.
+- **CDPM deployment (2026-07-09)**: `src/sui/cdpm/package.ts` points at the current fresh publish `0x573584cc…` (feeHouse/accessList/adminCap/globalRecord all changed vs the old `0x3e9261…` deployment — it was a re-publish, not an upgrade, so event types from the old id never match). `web/src/lib/cdpm.ts` mirrors these ids and the EnrollWizard refuses to sign if `/v1/agent/summary`'s `cdpmPackage` disagrees. Verified on mainnet via `scripts/probe-cdpm-package.ts`.
 - **`.gitignore` layout** (the §2.1 open-source cleanup landed — `tests/` and the public docs are tracked; `scripts/` is fully local):
   - Root markdown (`README.md`, `CLAUDE.md`) is tracked; the operator's Chinese-named internal notes file at the repo root stays local (ignored via an ASCII-only pattern).
   - `docs/` — only the English docs are tracked (`docs/README.md`, `docs/project-overview.md`). The detailed Chinese design documents (`implementation-plan-v1.md`, `data-sources.md`, `forecasting-approach.md`, `prediction-service-design.md`, `decision-engine-design.md`, `backtest-framework-design.md`, `risk-monitoring-design.md`, `module-and-testing.md`, `treasury-role-design.md`, `seal-integration.md`, `project-background.md`, `x-article.md`) are ignored per-file and exist only on the operator's machine — they are NOT in the public repo. References to them elsewhere in this file remain valid for the operator but will not resolve in a fresh clone.

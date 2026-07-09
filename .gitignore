@@ -30,3 +30,6 @@ docs/system-status-and-gaps.md
 # The entire scripts/ directory is operator-local (verification probes,
 # bootstrap helpers, treasury ops) and stays untracked.
 /scripts/
+
+# Web portal build output (web/ sources are tracked; dist is generated)
+web/dist/
