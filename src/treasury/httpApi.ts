@@ -23,6 +23,7 @@ import {
   listDepositsForUser,
 } from "./store.ts";
 import type { DepositRecord } from "./types.ts";
+import { matchWebRoute } from "../web/routes.ts";
 
 const SUI_ADDR_RE = /^0x[0-9a-fA-F]{64}$/;
 const MAX_BODY_BYTES = 16_384;
@@ -337,9 +338,9 @@ export function startTreasuryHttpApi(cfg: AppConfig): TreasuryHttpApiHandle {
           response = await handleCharge(req);
         }
 
-        // 404 fallback
+        // Read-only web routes (src/web/routes.ts) — then 404 fallback
         else {
-          response = err(404, "not found");
+          response = matchWebRoute(cfg, method, pathname, url) ?? err(404, "not found");
         }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
