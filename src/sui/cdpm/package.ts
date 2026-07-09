@@ -1,15 +1,15 @@
 import { ConfigError } from "../../lib/errors.ts";
 
-// Upgraded CDPM package — see ~/Code/cdpm/skills/cdpm-agent-sdk/reference/constants.md
-export const CDPM_PACKAGE = "0x3e926116ec95d753b83b80d768e310ef492d84892dee5cc86b51c1d3a876d5b7";
+// Current CDPM deployment — see ~/Code/cdpm/skills/cdpm-agent-sdk/reference/constants.md
+export const CDPM_PACKAGE = "0x573584cc4698e82fd85f2b54e64ad4cd901c42b768f7628ec167bf2d24aa2aa7";
 export const CDPM_MODULE = "cdpm";
 
 /** Shared CDPM mainnet objects required by lending PTBs. */
 export const CDPM_MAINNET = {
-  feeHouseId: "0xa0cc9000a7b06325fd122ce9bf70763fb169e1bae17d0516dba08816b5ce9f18",
-  accessListId: "0xa2954f107287f8ca2b42e2da4753d39adee25f461e5a372628e79075fca85816",
-  adminCapId: "0xd5ba77b9c6df5d85cff535023aae1fff7f3e48b8b6bde4bfa0926e826715d9be",
-  globalRecordId: "0xd00df195a18f8d0ff33b784f8ff36d7726b6e36cd8c7dc922ecbd9099c9ca40d",
+  feeHouseId: "0x44cc921bdabdd4d868b32ba7081b71707b685eecc6b6034668281088bea0b5d8",
+  accessListId: "0xdca06884b21a23d04f2664835c0c965dc80a5c40294b90d9d000c7b05707f803",
+  adminCapId: "0x91940a5f725a9359d9778501fb6b9e2eff45e629127d612e8ce9d0cdc1102463",
+  globalRecordId: "0xee3b816d68c8d84fe90a2d0ad1861a6fb455d053f8edf6512a8953f7d3e77b95",
 } as const;
 
 export interface CdpmIds {
