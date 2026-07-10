@@ -14,6 +14,11 @@
  *   SHADOW_FLEET_INITIAL_A/B  raw physical units (default ≈65 USDC / 46.67 SUI)
  *   SHADOW_DB_FILE            default ./data/shadow.db
  *   SUI_RPC_URL               default https://fullnode.mainnet.sui.io:443
+ *   SUI_EVENTS_RPC_URL        endpoint for queryEvents (the fleet's ONLY RPC
+ *                             call). Falls back to SUI_RPC_URL. Needed when
+ *                             the local fullnode runs WITHOUT extended object
+ *                             indexing (queryEvents is an indexer feature) —
+ *                             e.g. the Germany box's node as of 2026-07.
  *
  * Run: bun run src/shadowStandalone.ts
  */
@@ -53,8 +58,13 @@ function main(): void {
     initialA: BigInt(process.env.SHADOW_FLEET_INITIAL_A ?? "65000000"),
     initialB: BigInt(process.env.SHADOW_FLEET_INITIAL_B ?? "46670000000"),
     // getSuiClient() would drag in loadConfig — standalone builds its own.
+    // queryEvents needs an INDEXING endpoint; SUI_EVENTS_RPC_URL overrides
+    // when the primary node runs without extended object indexing.
     clientOverride: new SuiJsonRpcClient({
-      url: process.env.SUI_RPC_URL ?? "https://fullnode.mainnet.sui.io:443",
+      url:
+        process.env.SUI_EVENTS_RPC_URL ??
+        process.env.SUI_RPC_URL ??
+        "https://fullnode.mainnet.sui.io:443",
       network: "mainnet",
     }),
   });
