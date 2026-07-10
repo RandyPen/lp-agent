@@ -427,3 +427,31 @@ CREATE TABLE IF NOT EXISTS position_entry_snapshots (
   spot_price      REAL NOT NULL,
   entry_value_usd REAL NOT NULL
 );
+
+------------------------------------------------------------------------------
+-- Shadow fleet (2026-07) — hypothetical rule-strategy books judged by real
+-- SwapEvents (see src/services/shadowFleet.ts / shadowBook.ts).
+-- shadow_nav: per-tick quote-denominated NAV vs the frozen HODL benchmark.
+-- shadow_books: serialized book state so a restart resumes the experiment.
+------------------------------------------------------------------------------
+
+CREATE TABLE IF NOT EXISTS shadow_nav (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  strategy               TEXT NOT NULL,
+  ts_ms                  INTEGER NOT NULL,
+  nav_quote              REAL NOT NULL,
+  hodl_quote             REAL NOT NULL,
+  price                  REAL NOT NULL,
+  fee_income_quote       REAL NOT NULL,
+  fills                  INTEGER NOT NULL,
+  skipped_terminal_fills INTEGER NOT NULL,
+  regime                 TEXT,
+  note                   TEXT
+);
+CREATE INDEX IF NOT EXISTS shadow_nav_strategy_ts ON shadow_nav(strategy, ts_ms DESC);
+
+CREATE TABLE IF NOT EXISTS shadow_books (
+  strategy      TEXT PRIMARY KEY,
+  book_json     TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);

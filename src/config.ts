@@ -79,6 +79,19 @@ export interface MlAppConfig {
 }
 
 /**
+ * Shadow fleet: rule strategies run side-by-side on HYPOTHETICAL books judged
+ * by real SwapEvents (src/services/shadowFleet.ts). Observability only —
+ * never submits transactions.
+ */
+export interface ShadowFleetConfig {
+  /** Rule strategy names to shadow. Empty = fleet disabled. */
+  strategies: StrategyName[];
+  /** Initial hypothetical inventory, RAW physical units (A/B). */
+  initialA: bigint;
+  initialB: bigint;
+}
+
+/**
  * L1/L2/L3 risk thresholds.
  * See `docs/risk-monitoring-design.md §5.3` and `implementation-plan-v1.md §5.3`.
  *
@@ -239,6 +252,7 @@ export interface AppConfig {
   prediction: PredictionAppConfig;
   /** ML runtime switches (shadow mode, etc.). */
   ml: MlAppConfig;
+  shadowFleet: ShadowFleetConfig;
   /**
    * Strategy to fall back to when `mlAgent` cannot use the prediction provider
    * (sidecar down, PSI drift, timeout). Defaults to `emaTrend`.
@@ -486,6 +500,29 @@ export function loadConfig(): AppConfig {
   // ML shadow mode.
   const ml: MlAppConfig = {
     shadowMode: optional("ML_SHADOW_MODE", "false").toLowerCase() === "true",
+  };
+
+  // Shadow fleet (rule strategies on hypothetical books; "" = disabled).
+  // Example: SHADOW_FLEET=presenceAnchor,presenceSweep
+  const shadowFleetRaw = optional("SHADOW_FLEET", "").trim();
+  const shadowFleetNames: StrategyName[] = [];
+  if (shadowFleetRaw.length > 0) {
+    for (const name of shadowFleetRaw.split(",").map((s) => s.trim()).filter(Boolean)) {
+      if (!isStrategyName(name) || name === "mlAgent") {
+        errs.push(
+          `SHADOW_FLEET entries must be rule strategies (got '${name}'); ` +
+            `valid: ${listStrategyNames().filter((n) => n !== "mlAgent").join(", ")}`,
+        );
+      } else {
+        shadowFleetNames.push(name);
+      }
+    }
+  }
+  const shadowFleet: ShadowFleetConfig = {
+    strategies: shadowFleetNames,
+    // Defaults ≈ 65 USDC + 46.67 SUI (~100 USDC at 0.75) — raw physical units.
+    initialA: BigInt(optional("SHADOW_FLEET_INITIAL_A", "65000000")),
+    initialB: BigInt(optional("SHADOW_FLEET_INITIAL_B", "46670000000")),
   };
 
   // Fallback strategy for mlAgent Tier 0 degradation.
@@ -741,6 +778,7 @@ export function loadConfig(): AppConfig {
     treasury,
     prediction,
     ml,
+    shadowFleet,
     fallbackStrategy,
     risk,
     riskObserverIntervalMs,

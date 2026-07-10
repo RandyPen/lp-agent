@@ -367,6 +367,33 @@ async function main(): Promise<void> {
     log.info("treasury: disabled (TREASURY_ENABLED=false)");
   }
 
+  // 9b. Shadow fleet (opt-in via SHADOW_FLEET=name,name): rule strategies on
+  // hypothetical books judged by real SwapEvents. Observability only — never
+  // touches the executor. See src/services/shadowFleet.ts.
+  let stopShadowFleet: (() => void) | null = null;
+  if (cfg.shadowFleet.strategies.length > 0) {
+    try {
+      const { createShadowFleet } = await import("./services/shadowFleet.ts");
+      const { getDb } = await import("./db/client.ts");
+      stopShadowFleet = createShadowFleet({
+        db: getDb(),
+        profile: cfg.poolProfile,
+        priceFeed,
+        strategies: cfg.shadowFleet.strategies,
+        initialA: cfg.shadowFleet.initialA,
+        initialB: cfg.shadowFleet.initialB,
+      }).start();
+      log.info("liquidity-manager: shadow fleet started", {
+        strategies: cfg.shadowFleet.strategies,
+      });
+    } catch (err: unknown) {
+      // Shadow observability must never block the live agent.
+      log.error("shadowFleet: failed to start (continuing without it)", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
   log.info("liquidity-manager running");
 
   // 10. Graceful shutdown on SIGINT / SIGTERM / uncaughtException.
@@ -397,6 +424,7 @@ async function main(): Promise<void> {
     stopRiskObserver();
     stopRebalancer();
     stopShadowRunner?.();
+    stopShadowFleet?.();
     treasuryService?.stop();
 
     const drained = await Promise.race([
