@@ -10,6 +10,7 @@ import { createSingleBinStrategy } from "./singleBin.ts";
 import { createMultiBinSpotStrategy } from "./multiBinSpot.ts";
 import { createEmaTrendStrategy } from "./emaTrend.ts";
 import { createPresenceAnchorStrategy } from "./presenceAnchor.ts";
+import { createPresenceSweepStrategy } from "./presenceSweep.ts";
 import { createMlAgentStrategy, type MlAgentDeps } from "./mlAgent.ts";
 import { ConfigError } from "../lib/errors.ts";
 
@@ -18,6 +19,7 @@ export type StrategyName =
   | "multiBinSpot"
   | "emaTrend"
   | "presenceAnchor"
+  | "presenceSweep"
   | "mlAgent";
 
 // Re-export so callers that need to pass mlDeps don't need a second import.
@@ -32,6 +34,7 @@ const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
   multiBinSpot: () => createMultiBinSpotStrategy(),
   emaTrend: () => createEmaTrendStrategy(),
   presenceAnchor: () => createPresenceAnchorStrategy(),
+  presenceSweep: () => createPresenceSweepStrategy(),
 };
 
 /**

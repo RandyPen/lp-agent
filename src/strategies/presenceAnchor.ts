@@ -116,7 +116,7 @@ export interface PresenceAnchorParams {
  * high vol is handled by σ-scaled WIDTH, DEFENSE is for vol TRANSITIONS
  * (the empirically dangerous part).
  */
-const DEFAULTS: Required<PresenceAnchorParams> = {
+export const PRESENCE_DEFAULTS: Required<PresenceAnchorParams> = {
   anchorWindowMs: 4 * 60 * 60 * 1000,
   horizonMs: 90 * 60 * 1000,
   volShortWindowMs: 60 * 60 * 1000,
@@ -140,14 +140,14 @@ const DEFAULTS: Required<PresenceAnchorParams> = {
 };
 
 /** Presence regime. DEFENSE maps onto the shared EXTREME semantics. */
-type PresenceRegime = "NORMAL" | "TREND" | "DEFENSE";
+export type PresenceRegime = "NORMAL" | "TREND" | "DEFENSE";
 
 // ---------------------------------------------------------------------------
 // Small helpers (pure)
 // ---------------------------------------------------------------------------
 
 /** Scale a bigint by a fraction in [0, 1+] via 6-digit fixed point. */
-function mulFrac(x: bigint, frac: number): bigint {
+export function mulFrac(x: bigint, frac: number): bigint {
   if (frac >= 1) return x;
   if (frac <= 0) return 0n;
   const SCALE = 1_000_000n;
@@ -155,7 +155,7 @@ function mulFrac(x: bigint, frac: number): bigint {
 }
 
 /** Realized σ per bar: sqrt(mean r²) over consecutive log-price returns. */
-function realizedSigma(closes: number[]): number {
+export function realizedSigma(closes: number[]): number {
   if (closes.length < 2) return MIN_SIGMA;
   let sum = 0;
   let n = 0;
@@ -172,7 +172,7 @@ function realizedSigma(closes: number[]): number {
 }
 
 /** splitProportional: same convention as multiBinSpot (dust → last non-zero). */
-function splitProportional(totalRaw: bigint, weights: number[]): bigint[] {
+export function splitProportional(totalRaw: bigint, weights: number[]): bigint[] {
   if (weights.length === 0) return [];
   if (totalRaw === 0n) return weights.map(() => 0n);
   const sum = weights.reduce((s, w) => s + w, 0);
@@ -203,7 +203,7 @@ function splitProportional(totalRaw: bigint, weights: number[]): bigint[] {
 // Regime nowcast
 // ---------------------------------------------------------------------------
 
-interface RegimeReadout {
+export interface RegimeReadout {
   regime: PresenceRegime;
   /** Current σ_short/σ_long ratio (NaN in cold start). */
   volRatio: number;
@@ -220,7 +220,7 @@ interface RegimeReadout {
  * lookback does not reach a full anchor window (cold start / early bars —
  * an unjudgeable point is simply not a trigger).
  */
-function driftZAt(
+export function driftZAt(
   bars: { bucketStartMs: number; close: number }[],
   tMs: number,
   p: Required<PresenceAnchorParams>,
@@ -244,7 +244,7 @@ function driftZAt(
  * readings across the trailing calm window), so a process restart cannot
  * skip the cooldown — everything is recomputed from data.
  */
-function nowcastRegime(
+export function nowcastRegime(
   bars: { bucketStartMs: number; close: number }[],
   nowMs: number,
   p: Required<PresenceAnchorParams>,
@@ -319,7 +319,7 @@ interface InventorySteering {
  *   base overweight  → bids buy even more base → reduce/zero the BID side.
  *   base underweight → asks sell scarce base   → reduce/zero the ASK side.
  */
-function steerInventory(
+export function steerInventory(
   baseRaw: bigint,
   quoteRaw: bigint,
   baseDecimals: number,
@@ -356,7 +356,7 @@ function steerInventory(
  * state machine would, from its own regime nowcast. `enteredAtMs` is the
  * snapshot time — this strategy is stateless across ticks by design.
  */
-function buildStateCtx(
+export function buildStateCtx(
   regime: PresenceRegime,
   nowMs: number,
   halfWidth: number,
@@ -386,7 +386,7 @@ function buildStateCtx(
 // ---------------------------------------------------------------------------
 
 export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}): Strategy {
-  const p: Required<PresenceAnchorParams> = { ...DEFAULTS, ...params };
+  const p: Required<PresenceAnchorParams> = { ...PRESENCE_DEFAULTS, ...params };
 
   return {
     name: "presenceAnchor",
