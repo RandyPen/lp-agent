@@ -132,8 +132,8 @@ const strategy = createPresenceAnchorStrategy();
 // ---------------------------------------------------------------------------
 
 describe("presenceAnchor NORMAL", () => {
-  it("declares a 4h history window requirement", () => {
-    expect(strategy.historyWindowMs).toBe(4 * 60 * 60 * 1000);
+  it("declares a 4.5h history window requirement (anchor + re-entry scan)", () => {
+    expect(strategy.historyWindowMs).toBe(4.5 * 60 * 60 * 1000);
   });
 
   it("empty PM → quiet", async () => {
@@ -157,11 +157,13 @@ describe("presenceAnchor NORMAL", () => {
   });
 
   it("price stretched above the anchor → center pulled toward the anchor (bin id UP on the inverted pool)", async () => {
-    // Steady exponential drift: +4% over 4h. σ_short ≈ σ_long → NORMAL;
-    // spot ends ≈ 2% above the window mean → dev ≈ +4 bins (binStep 50bp) →
+    // +4% drift over 4h WITH ±0.15% alternating noise: dev ≈ +4 bins →
     // human offset −2 → physical bin offset +2 on the inverted pool.
+    // The noise keeps drift_z = 0.04/(0.0015×√240) ≈ 1.7 BELOW the 2.0
+    // drift gate and σ_short ≈ σ_long → NORMAL (a noiseless drift would now
+    // correctly trip the DEFENSE drift gate instead — see the DEFENSE tests).
     const perBar = Math.pow(1.04, 1 / 240) - 1;
-    const rets = Array.from({ length: 240 }, () => perBar);
+    const rets = Array.from({ length: 240 }, (_, i) => perBar + (i % 2 === 0 ? 0.0015 : -0.0015));
     const out = await strategy.plan(makeInput(historyFromReturns(0.7212, rets)));
     const plan = expectPlan(out);
     assertPlanInvariants(plan);
@@ -297,6 +299,50 @@ describe("presenceAnchor DEFENSE", () => {
     // in the trailing 30min is burst-free → NORMAL again.
     const rets = [...calmReturns(80), ...violentReturns(60), ...calmReturns(100)];
     const out = await strategy.plan(makeInput(historyFromReturns(0.75, rets)));
+    const plan = expectPlan(out);
+    assertPlanInvariants(plan);
+    expect(plan.reason).toContain("NORMAL");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DEFENSE via the DRIFT gate (grinding trends the vol-ratio gate cannot see)
+// ---------------------------------------------------------------------------
+
+describe("presenceAnchor drift gate", () => {
+  /** Steady low-noise drift: totalPct over n bars with tiny alternating noise. */
+  function driftReturns(n: number, totalPct: number): number[] {
+    const perBar = Math.pow(1 + totalPct, 1 / n) - 1;
+    return Array.from({ length: n }, (_, i) => perBar + (i % 2 === 0 ? 0.0001 : -0.0001));
+  }
+
+  it("low-vol grinding trend → DEFENSE via driftZ (vol ratio stays calm)", async () => {
+    // −10% over 4.5h with tiny noise: σ_short ≈ σ_long (ratio ≈ 1) but
+    // drift_z >> 2 → the drift gate must fire where the vol gate is blind.
+    const positionBins = [{ binId: ACTIVE - 2, liquidityShare: 7n, amountA: 0n, amountB: 0n }];
+    const out = await strategy.plan(
+      makeInput(historyFromReturns(0.85, driftReturns(280, -0.10)), makePm({ positionBins })),
+    );
+    const plan = expectPlan(out);
+    expect(plan.addBins.length).toBe(0);
+    expect(plan.removeShares.get(ACTIVE - 2)).toBe(7n);
+    expect(plan.reason).toContain("driftZ=");
+  });
+
+  it("trend ended recently → still DEFENSE via re-entry scan", async () => {
+    // Drift bars 0..249, then only 20 flat bars: scan points in the trailing
+    // 30min still see drift_z ≥ 2 in their lookback → blocked.
+    const rets = [...driftReturns(250, -0.10), ...calmReturns(20)];
+    const out = await strategy.plan(makeInput(historyFromReturns(0.85, rets)));
+    expect(out.kind).toBe("reconcile_only");
+    if (out.kind === "reconcile_only") expect(out.reason).toContain("DEFENSE");
+  });
+
+  it("trend fully aged out of the anchor window → redeploys", async () => {
+    // Drift bars 0..199, then 300 flat bars: the trailing 4h lookback of the
+    // current bar AND every re-entry scan point is entirely flat → NORMAL.
+    const rets = [...driftReturns(200, -0.10), ...calmReturns(300)];
+    const out = await strategy.plan(makeInput(historyFromReturns(0.85, rets)));
     const plan = expectPlan(out);
     assertPlanInvariants(plan);
     expect(plan.reason).toContain("NORMAL");

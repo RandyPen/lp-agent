@@ -66,6 +66,16 @@ export interface PresenceAnchorParams {
   /** σ_short/σ_long ratio at which DEFENSE (full withdrawal) triggers. */
   defenseVolRatio?: number;
   /**
+   * Drift-strength z at which DEFENSE triggers: |net move over the anchor
+   * window| / (σ_bar × √bars). The vol-ratio gate alone is blind to
+   * low-volatility grinding trends (NAV-replay evidence: adding this gate
+   * was worth +7.5pp vs HODL in the bear year and +66pp absolute in the
+   * bull year). Same 2.0 entry as the mlAgent state machine's
+   * driftStrengthEntry; exit hysteresis is time-based via `reentryCalmMs`
+   * (this strategy is stateless — no latch to persist).
+   */
+  driftEnterZ?: number;
+  /**
    * Re-entry hysteresis: after a DEFENSE-level spike, the trailing window of
    * this length must be free of DEFENSE-level ratios before redeploying.
    */
@@ -112,6 +122,7 @@ const DEFAULTS: Required<PresenceAnchorParams> = {
   volShortWindowMs: 60 * 60 * 1000,
   trendVolRatio: 1.3,
   defenseVolRatio: 1.7,
+  driftEnterZ: 2.0,
   reentryCalmMs: 30 * 60 * 1000,
   targetBaseShare: 0.35,
   reversionGain: 0.5,
@@ -196,23 +207,54 @@ interface RegimeReadout {
   regime: PresenceRegime;
   /** Current σ_short/σ_long ratio (NaN in cold start). */
   volRatio: number;
-  /** True when the trailing calm window still contains a DEFENSE-level ratio. */
+  /** Current drift-strength z over the anchor window (NaN when history is short). */
+  driftZ: number;
+  /** True when the trailing calm window still contains a DEFENSE-level signal. */
   reentryBlocked: boolean;
 }
 
 /**
- * Nowcast the vol regime from 1m bars. Stateless across ticks: the re-entry
- * hysteresis is derived from the history series itself (rolling σ_short at
- * each bar of the trailing calm window), so a process restart cannot skip the
- * cooldown — everything is recomputed from data.
+ * Drift-strength z at time `tMs`: |net log move over the trailing anchor
+ * window| / (per-bar σ of that window × √bars). The state machine's
+ * driftStrength analog, computable purely from the bar series. NaN when the
+ * lookback does not reach a full anchor window (cold start / early bars —
+ * an unjudgeable point is simply not a trigger).
+ */
+function driftZAt(
+  bars: { bucketStartMs: number; close: number }[],
+  tMs: number,
+  p: Required<PresenceAnchorParams>,
+): number {
+  const win = bars.filter(
+    (b) => b.bucketStartMs > tMs - p.anchorWindowMs && b.bucketStartMs <= tMs,
+  );
+  const past = bars.filter((b) => b.bucketStartMs <= tMs - p.anchorWindowMs);
+  if (win.length < 30 || past.length === 0) return Number.NaN;
+  const cur = win[win.length - 1]!.close;
+  const ref = past[past.length - 1]!.close;
+  if (cur <= 0 || ref <= 0) return Number.NaN;
+  const sigma = realizedSigma(win.map((b) => b.close));
+  return Math.abs(Math.log(cur / ref)) / (sigma * Math.sqrt(win.length));
+}
+
+/**
+ * Nowcast the regime from 1m bars: vol-ratio transitions AND drift strength
+ * (grinding trends the vol gate cannot see). Stateless across ticks: the
+ * re-entry hysteresis is derived from the history series itself (rolling
+ * readings across the trailing calm window), so a process restart cannot
+ * skip the cooldown — everything is recomputed from data.
  */
 function nowcastRegime(
   bars: { bucketStartMs: number; close: number }[],
   nowMs: number,
   p: Required<PresenceAnchorParams>,
 ): RegimeReadout {
-  const closesAll = bars.map((b) => b.close);
-  const sigmaLong = realizedSigma(closesAll);
+  // σ_long over the ANCHOR window only (the fetch window is longer —
+  // anchorWindow + reentryCalm — so the re-entry scan has full lookback).
+  const anchorCloses = bars
+    .filter((b) => b.bucketStartMs > nowMs - p.anchorWindowMs)
+    .map((b) => b.close);
+  const sigmaLong = realizedSigma(anchorCloses);
 
   const shortCloses = bars
     .filter((b) => b.bucketStartMs > nowMs - p.volShortWindowMs)
@@ -220,8 +262,11 @@ function nowcastRegime(
   const sigmaShort = realizedSigma(shortCloses);
   const volRatio = sigmaLong > 0 ? sigmaShort / sigmaLong : Number.NaN;
 
-  // Rolling short-σ ratio at each bar of the trailing calm window: if any
-  // point hit DEFENSE level, redeployment stays blocked (hysteresis).
+  const driftZ = driftZAt(bars, nowMs, p);
+
+  // Rolling readings at each bar of the trailing calm window: if any point
+  // hit a DEFENSE-level signal (vol ratio OR drift), redeployment stays
+  // blocked (time-based hysteresis).
   let reentryBlocked = false;
   for (const bar of bars) {
     const t = bar.bucketStartMs;
@@ -229,19 +274,28 @@ function nowcastRegime(
     const win = bars
       .filter((b) => b.bucketStartMs > t - p.volShortWindowMs && b.bucketStartMs <= t)
       .map((b) => b.close);
-    if (win.length < 10) continue; // not enough bars to judge this point
-    if (realizedSigma(win) / sigmaLong >= p.defenseVolRatio) {
+    if (win.length >= 10 && realizedSigma(win) / sigmaLong >= p.defenseVolRatio) {
+      reentryBlocked = true;
+      break;
+    }
+    const dz = driftZAt(bars, t, p);
+    if (Number.isFinite(dz) && dz >= p.driftEnterZ) {
       reentryBlocked = true;
       break;
     }
   }
 
   let regime: PresenceRegime;
-  if (volRatio >= p.defenseVolRatio || reentryBlocked) regime = "DEFENSE";
-  else if (volRatio >= p.trendVolRatio) regime = "TREND";
+  if (
+    volRatio >= p.defenseVolRatio ||
+    (Number.isFinite(driftZ) && driftZ >= p.driftEnterZ) ||
+    reentryBlocked
+  ) {
+    regime = "DEFENSE";
+  } else if (volRatio >= p.trendVolRatio) regime = "TREND";
   else regime = "NORMAL";
 
-  return { regime, volRatio, reentryBlocked };
+  return { regime, volRatio, driftZ, reentryBlocked };
 }
 
 // ---------------------------------------------------------------------------
@@ -337,9 +391,10 @@ export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}):
   return {
     name: "presenceAnchor",
 
-    // The rebalancer fetches this much history for us (anchor + regime need
-    // the full anchor window; the default 5-minute window is far too short).
-    historyWindowMs: p.anchorWindowMs,
+    // The rebalancer fetches this much history for us: the anchor window
+    // plus the re-entry calm window, so the rolling re-entry scan's drift
+    // readings each have a full anchor-window lookback.
+    historyWindowMs: p.anchorWindowMs + p.reentryCalmMs,
 
     async plan(input: StrategyInput): Promise<StrategyOutput> {
       const { pm, pool, spot, history, profile } = input;
@@ -372,11 +427,16 @@ export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}):
 
       // ---- 2. Regime nowcast ---------------------------------------------
       const readout: RegimeReadout = coldStart
-        ? { regime: "NORMAL", volRatio: Number.NaN, reentryBlocked: false }
+        ? { regime: "NORMAL", volRatio: Number.NaN, driftZ: Number.NaN, reentryBlocked: false }
         : nowcastRegime(bars, nowMs, p);
 
       // ---- 3. σ / width / tolerance --------------------------------------
-      const closes = bars.map((b) => b.close);
+      // Anchor-window slice: the fetch window is anchorWindow + reentryCalm,
+      // but the anchor mean and the width σ are defined over the ANCHOR
+      // window only.
+      const closes = bars
+        .filter((b) => b.bucketStartMs > nowMs - p.anchorWindowMs)
+        .map((b) => b.close);
       const sigmaPerBar = coldStart
         ? closes.length >= 2
           ? ewmaSigma(closes)
@@ -400,16 +460,20 @@ export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}):
 
       // ---- 4. DEFENSE: presence-only exit --------------------------------
       if (readout.regime === "DEFENSE") {
+        const trig =
+          `volRatio=${readout.volRatio.toFixed(2)}` +
+          ` driftZ=${Number.isFinite(readout.driftZ) ? readout.driftZ.toFixed(2) : "n/a"}` +
+          `${readout.reentryBlocked ? ", re-entry blocked" : ""}`;
         const stateCtx = buildStateCtx("DEFENSE", nowMs, halfWidth, toleranceBins, 0, p);
         const withdraw = buildExtremeWithdrawPlan(
           pm,
-          `presenceAnchor: DEFENSE full withdrawal (volRatio=${readout.volRatio.toFixed(2)}${readout.reentryBlocked ? ", re-entry blocked" : ""})`,
+          `presenceAnchor: DEFENSE full withdrawal (${trig})`,
         );
         if (!withdraw) {
           // Nothing on the book — keep idle funds swept into lending at 100%.
           return {
             kind: "reconcile_only",
-            reason: `presenceAnchor: DEFENSE, nothing to withdraw (volRatio=${readout.volRatio.toFixed(2)}${readout.reentryBlocked ? ", re-entry blocked" : ""})`,
+            reason: `presenceAnchor: DEFENSE, nothing to withdraw (${trig})`,
             stateCtx,
           };
         }
