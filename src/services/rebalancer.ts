@@ -15,6 +15,7 @@ import { rescalePlanToAvailable } from "../decision/planMath.ts";
 import { syncLotsAfterRebalance } from "../decision/lotStore.ts";
 import type { PnlService } from "./pnlService.ts";
 import type { RiskMonitor } from "../risk/monitor.ts";
+import { recordRegimeTransition } from "../state/regimeJournal.ts";
 import { decide as routeLending } from "../sui/lending/router.ts";
 import { canLend } from "../sui/lending/lendingConfig.ts";
 import type { LendingDecision } from "../sui/lending/types.ts";
@@ -449,7 +450,9 @@ export function createRebalancerService(
       const pm = await getPositionManager(pmId);
       const pool = await getPoolState(cfg.poolProfile.poolId);
       const spot = await priceFeed.getSpot();
-      const history = await priceFeed.getHistory(5 * 60 * 1000); // 5-minute window
+      // Window sized by the live strategy's declared need (presenceAnchor: 4h
+      // for its anchor + vol-regime nowcast); default 5 minutes.
+      const history = await priceFeed.getHistory(strategy.historyWindowMs ?? 5 * 60 * 1000);
 
       const strategyInput: StrategyInput = {
         pm,
@@ -510,6 +513,27 @@ export function createRebalancerService(
         log.debug("rebalancer: quiet tick", { tickId, pmId, reason: output.reason });
         recordPnlTick({ pm, spotPrice: Number(spot.price) });
         return;
+      }
+
+      // Regime journal for rule-based strategies that emit a StateContext
+      // (presenceAnchor). mlAgent's state machine writes market_state_history
+      // itself — recording here too would double-write.
+      if (liveStrategyName !== "mlAgent" && output.stateCtx) {
+        try {
+          const reasonStr =
+            output.kind === "reconcile_only" ? output.reason : output.plan.reason;
+          recordRegimeTransition(
+            db,
+            pm.poolId,
+            output.stateCtx.state,
+            `presence: ${reasonStr.slice(0, 200)}`,
+          );
+        } catch (err) {
+          // Journal writes must never veto a tick.
+          log.warn("rebalancer: regime journal write failed (continuing)", {
+            tickId, pmId, err: String(err),
+          });
+        }
       }
 
       // Reconcile-only path: no rebalance PTB; just refresh lending state.

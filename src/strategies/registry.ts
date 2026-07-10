@@ -9,6 +9,7 @@ import type { Strategy } from "./types.ts";
 import { createSingleBinStrategy } from "./singleBin.ts";
 import { createMultiBinSpotStrategy } from "./multiBinSpot.ts";
 import { createEmaTrendStrategy } from "./emaTrend.ts";
+import { createPresenceAnchorStrategy } from "./presenceAnchor.ts";
 import { createMlAgentStrategy, type MlAgentDeps } from "./mlAgent.ts";
 import { ConfigError } from "../lib/errors.ts";
 
@@ -16,6 +17,7 @@ export type StrategyName =
   | "singleBin"
   | "multiBinSpot"
   | "emaTrend"
+  | "presenceAnchor"
   | "mlAgent";
 
 // Re-export so callers that need to pass mlDeps don't need a second import.
@@ -29,6 +31,7 @@ const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
   singleBin: () => createSingleBinStrategy(),
   multiBinSpot: () => createMultiBinSpotStrategy(),
   emaTrend: () => createEmaTrendStrategy(),
+  presenceAnchor: () => createPresenceAnchorStrategy(),
 };
 
 /**
