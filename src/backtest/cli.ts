@@ -30,7 +30,7 @@ Usage:
 
 Options:
   --strategy=<name>        Strategy to replay (required unless using default).
-                           Available: singleBin | multiBinSpot | emaTrend
+                           Available: singleBin | multiBinSpot | presenceAnchor | presenceSweep
                            Note: mlAgent cannot be backtested offline — it
                            requires the live Python prediction sidecar. See
                            docs/implementation-plan-v1.md §W5 for the planned
@@ -47,7 +47,7 @@ Options:
 
 Examples:
   bun run backtest --strategy=multiBinSpot
-  bun run backtest --strategy=emaTrend --from=2026-04-01 --to=2026-05-01
+  bun run backtest --strategy=multiBinSpot --from=2026-04-01 --to=2026-05-01
   bun run backtest --strategy=singleBin --db=./data/app.db --json
 `.trimStart();
 
@@ -207,7 +207,7 @@ async function main(): Promise<void> {
       "prediction sidecar to be running and serving /predict requests.\n" +
       "See docs/implementation-plan-v1.md §W5 for the planned shadow-vs-backtest " +
       "comparison workflow. Use a rule-based strategy (singleBin, multiBinSpot, " +
-      "emaTrend) for offline replay.",
+      "multiBinSpot) for offline replay.",
     );
     process.exit(1);
   }

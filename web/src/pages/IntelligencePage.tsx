@@ -49,7 +49,7 @@ export function IntelligencePage() {
         <StatTile
           label="Model"
           value={<span className="text-base">{latest?.model_version ?? "—"}</span>}
-          sub="LightGBM quantile · q10/q50/q90"
+          sub="LightGBM vol head · σ only (center head removed)"
         />
         <StatTile
           label="Model-path share"
@@ -77,10 +77,10 @@ export function IntelligencePage() {
       </div>
 
       <Panel
-        title="Price vs predicted distribution — 3 days"
+        title="Price vs ±1.28σ vol band — 3 days"
         right={
           <span className="text-ink-3 font-mono text-[11px]">
-            liquidity is placed across bins weighted by this distribution
+            liquidity is placed as a σ-scaled band centered on spot (no direction predicted)
           </span>
         }
       >
@@ -91,7 +91,7 @@ export function IntelligencePage() {
         ) : (
           <EmptyState>
             No predictions in the last 3 days. Start the ML sidecar (ml/) and the agent to see
-            the quantile fan.
+            the vol band.
           </EmptyState>
         )}
       </Panel>

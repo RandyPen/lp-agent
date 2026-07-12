@@ -1,8 +1,8 @@
 /**
  * tests/strategies/v0Strategies.test.ts
  *
- * Unit tests for the three rule-based strategies (singleBin straddle,
- * multiBinSpot, emaTrend). These had ZERO dedicated coverage before Phase 2 —
+ * Unit tests for the two rule-based strategies (singleBin straddle,
+ * multiBinSpot). These had ZERO dedicated coverage before Phase 2 —
  * the inverted side-split and active-bin placement shipped unnoticed because
  * nothing asserted the plan shapes.
  *
@@ -18,7 +18,6 @@
 import { describe, it, expect } from "bun:test";
 import { createSingleBinStrategy } from "../../src/strategies/singleBin.ts";
 import { createMultiBinSpotStrategy } from "../../src/strategies/multiBinSpot.ts";
-import { createEmaTrendStrategy } from "../../src/strategies/emaTrend.ts";
 import type { StrategyInput, StrategyOutput } from "../../src/strategies/types.ts";
 import type { PMState, PoolState, PriceObservation, RebalancePlan } from "../../src/domain/types.ts";
 import type { PoolProfile } from "../../src/pools/types.ts";
@@ -251,62 +250,5 @@ describe("multiBinSpot", () => {
     const enrichedPlan = expectPlan(enriched);
     expect(enrichedPlan.addAmountA).toBe(basePlan.addAmountA + 2_000_000n);
     expect(enrichedPlan.addAmountB).toBe(basePlan.addAmountB + 4_000_000_000n);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// emaTrend
-// ---------------------------------------------------------------------------
-
-describe("emaTrend", () => {
-  const strategy = createEmaTrendStrategy();
-
-  it("neutral trend: symmetric range, active excluded, physical sides", async () => {
-    const out = await strategy.plan(makeInput({ history: makeHistory(40, 0.75, 0) }));
-    const plan = expectPlan(out);
-    assertPlanInvariants(plan, ACTIVE);
-    const below = plan.addBins.filter((k) => k < ACTIVE).length;
-    const above = plan.addBins.filter((k) => k > ACTIVE).length;
-    expect(below).toBeGreaterThan(0);
-    expect(above).toBeGreaterThan(0);
-  });
-
-  it("bullish trend on an INVERTED pool shifts the range DOWN in bin space", async () => {
-    // Rising human price; poolCoinAIsQuote=true → binDirection = −1.
-    const bullish = makeHistory(40, 0.6, 0.01);
-    const out = await strategy.plan(makeInput({ history: bullish }));
-    const plan = expectPlan(out);
-    assertPlanInvariants(plan, ACTIVE);
-    const center = (Math.min(...plan.addBins) + Math.max(...plan.addBins)) / 2;
-    expect(center).toBeLessThan(ACTIVE);
-  });
-
-  it("bullish trend on a NON-inverted pool shifts the range UP in bin space", async () => {
-    const profile = makeProfile({
-      poolCoinADecimals: 9,
-      poolCoinBDecimals: 6,
-      poolCoinAIsQuote: false,
-    });
-    const bullish = makeHistory(40, 0.6, 0.01);
-    const out = await strategy.plan(makeInput({ history: bullish, profile }));
-    const plan = expectPlan(out);
-    const center = (Math.min(...plan.addBins) + Math.max(...plan.addBins)) / 2;
-    expect(center).toBeGreaterThan(ACTIVE);
-  });
-
-  it("includes injected positionValue in the deployable capital", async () => {
-    const positionBins = [
-      { binId: ACTIVE - 9, liquidityShare: 3n, amountA: 0n, amountB: 0n },
-    ];
-    const pm = makePm({
-      balanceA: 0n,
-      balanceB: 0n,
-      positionBins,
-      positionValue: { a: 7_000_000n, b: 0n },
-    });
-    const out = await strategy.plan(makeInput({ pm }));
-    const plan = expectPlan(out);
-    expect(plan.addAmountA).toBe(7_000_000n);
-    expect(plan.addAmountB).toBe(0n);
   });
 });

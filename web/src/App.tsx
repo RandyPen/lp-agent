@@ -39,13 +39,24 @@ export function App() {
 
   return (
     <div className="mx-auto min-h-screen max-w-6xl px-4 pb-16">
+      {summary.data?.demo && (
+        <div className="border-l1/40 bg-l1/10 -mx-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b px-4 py-2 text-center">
+          <span className="font-display text-l1 text-[0.72rem] font-bold tracking-[0.18em] uppercase">
+            ● Demo data
+          </span>
+          <span className="text-ink-2 text-xs">
+            Seeded sample dataset for UI demonstration — no real funds, no on-chain execution;
+            NAV, fees and rebalance figures are illustrative, not real performance.
+          </span>
+        </div>
+      )}
       <header className="border-line flex items-center justify-between border-b py-4">
         <div className="flex items-baseline gap-3">
           <span className="font-display text-mint text-lg font-bold tracking-widest">
             LIQUIDITY<span className="text-ink">MANAGER</span>
           </span>
           <span className="font-mono text-ink-3 hidden text-[11px] sm:inline">
-            quant LP agent · Sui mainnet
+            open-source LP-agent template · self-host for your own users
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -94,9 +105,11 @@ export function App() {
         {page === "account" && <AccountPage />}
       </main>
 
-      <footer className="text-ink-3 mt-16 flex items-center justify-between text-xs">
+      <footer className="text-ink-3 mt-16 flex items-center justify-between gap-4 text-xs">
         <span>
-          Apache-2.0 · non-custodial: the agent can never withdraw — only the owner can.
+          Reference portal from the open-source <b className="text-ink-2">lp-agent template</b>{" "}
+          (Apache-2.0) — each operator self-hosts it for their own users. Non-custodial: the agent
+          can never withdraw, only the owner can.
         </span>
         {summary.data && (
           <span className="mono-num">model {summary.data.modelVersion ?? "—"}</span>

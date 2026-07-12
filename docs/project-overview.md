@@ -40,7 +40,7 @@ The agent loop:
     7. record outcome in SQLite + emit JSON log lines
 ```
 
-The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `mlAgent`), **multiple market-data feeds** (`onchain`, `binance`, plus the v1 `binanceMulti` / `derivatives` / `cetusEvents` feeds behind `marketAggregator`), and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, prediction providers (`PredictionProvider`), post-v1 Treasury features, and the v2 per-user Seal encrypted-research-report layer — see §4.
+The repo ships **five strategies** (`presenceAnchor`, `presenceSweep`, `singleBin`, `multiBinSpot`, `mlAgent`), **multiple market-data feeds** (`onchain`, `binance`, plus the v1 `binanceMulti` / `derivatives` / `cetusEvents` feeds behind `marketAggregator`), and **one optional monetisation layer** (Treasury v1: per-user deposit addresses + credit ledger + per-tick charge). The architecture has explicit extension points for additional strategies, lending protocols, price-feed sources, prediction providers (`PredictionProvider`), post-v1 Treasury features, and the v2 per-user Seal encrypted-research-report layer — see §4.
 
 ---
 
@@ -92,11 +92,11 @@ The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `ml
 ## 3. What's actually built
 
 ### Strategy & rebalancing
-- Six registered strategies (`src/strategies/registry.ts`; `Strategy.plan` is async as of v1):
+- Five registered strategies (`src/strategies/registry.ts`; `Strategy.plan` is async as of v1):
   - `presenceAnchor` / `presenceSweep` — the presence architecture (mainline candidates, under forward shadow A/B on real SwapEvents): NORMAL/TREND/DEFENSE regime nowcast from realized vol-ratio + drift-z, σ-scaled width, clamped 4h-anchor reversion tilt (NORMAL-only), withdraw-only defense with idle → lending; `presenceSweep` adds the anchor-boundary flip-sweep / fillBoundary freeze discipline.
   - `singleBin` — P0 baseline: all liquidity in the active bin, re-centre on drift.
   - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights; the Tier 0 fallback.
-  - `emaTrend` — reference implementation only, not recommended live: dual-EMA (12/26) trend-biased placement; its premise (predictable short-horizon direction) measured at coin-flip accuracy in walk-forward and OOS (`decision-remove-center-prediction.md`).
+  - (`emaTrend` removed 2026-07 — directional premise falsified; see `decision-remove-center-prediction.md`. `FALLBACK_STRATEGY` now defaults to `multiBinSpot`.)
   - `mlAgent` — v1 main strategy: consumes `PredictionProvider` output (vol-head σ width + range-break probabilities; the range always centers on the active bin — the center prediction head was falsified and removed, see `decision-remove-center-prediction.md`) + the three-state machine's parameters; explicit Tier 0 fallback to rule strategies when the sidecar is unavailable (built via `buildStrategy("mlAgent", mlDeps)`).
 - `StrategyOutput` 4-state union (`plan_and_reconcile | plan_only | reconcile_only | quiet`).
 - `fillBoundary` persistence in `position_state` (consumed by `presenceSweep`'s freeze discipline; other strategies don't write it).
@@ -228,7 +228,7 @@ The agent mnemonic lives in `.env` as `AGENT_MNEMONICS` (or legacy `MNEMONICS`);
 ### Env (agent role)
 - **Required (one of)**: `AGENT_MNEMONICS` (or `MNEMONICS`) + optional `AGENT_DERIVATION_PATH` (default `m/44'/784'/1'/0'/0'`); or `AGENT_PRIVATE_KEY` (`suiprivkey1…` bech32, takes precedence).
 - **Required**: `EXPECTED_AGENT_ADDRESS` (64-hex Sui address). `loadConfig` collects every missing / malformed env field into one error.
-- **Optional**: `AGENT_IDENTITY_FILE` (override TOFU file path), `IDENTITY_FILES_DISABLED=true` (disable TOFU), `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot|emaTrend|mlAgent`, `PRICE_FEED=onchain|binance`, `BINANCE_SYMBOL=SUIUSDC`; ML/risk knobs (sidecar URL, timeout, shadow mode, risk thresholds) documented in `.env.example`.
+- **Optional**: `AGENT_IDENTITY_FILE` (override TOFU file path), `IDENTITY_FILES_DISABLED=true` (disable TOFU), `UNIFIED_TX=true`, `LENDING_ENABLED=true|false`, `STRATEGY=singleBin|multiBinSpot|presenceAnchor|presenceSweep|mlAgent`, `PRICE_FEED=onchain|binance`, `BINANCE_SYMBOL=SUIUSDC`; ML/risk knobs (sidecar URL, timeout, shadow mode, risk thresholds) documented in `.env.example`.
 
 ### Env (treasury role — when `TREASURY_ENABLED=true`)
 - `TREASURY_MNEMONICS` (or `TREASURY_PRIVATE_KEY`), `TREASURY_MASTER_DERIVATION_PATH`, `TREASURY_USER_BASE_PATH`, `EXPECTED_TREASURY_MASTER_ADDRESS` (optional but format-checked when set), `TREASURY_IDENTITY_FILE` (TOFU file path override).

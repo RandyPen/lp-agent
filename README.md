@@ -10,11 +10,11 @@ Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K L
 
 ## What it does
 
-- **Algorithmic rebalancing** — six registered strategies, each rebalance submitted as one atomic PTB:
+- **Algorithmic rebalancing** — five registered strategies, each rebalance submitted as one atomic PTB:
   - **`presenceAnchor` / `presenceSweep`** (mainline, under forward shadow A/B) — regime-gated market *presence*: NORMAL/TREND/DEFENSE nowcast from realized vol-ratio + drift, σ-scaled width, a clamped 4h-anchor reversion tilt, and withdraw-only defense (the agent has no taker permission — leaving the market IS the defense). `presenceSweep` adds the anchor-boundary flip-sweep / freeze discipline.
   - **`multiBinSpot`** (Tier 0) — rule-based log-normal distribution placement; the explicit fallback whenever the ML sidecar is degraded. **`singleBin`** — simplest reference baseline.
   - **`mlAgent`** — consumes the vol model through `PredictionProvider` (σ width + range-break probabilities; the range always centers on the active bin — no direction is predicted, by evidence, not by omission).
-  - **`emaTrend`** — retained as a reference implementation only: its premise (predictable short-horizon direction) measured at coin-flip accuracy both in walk-forward and out-of-sample (`docs/decision-remove-center-prediction.md`). Not recommended for live use.
+  - (`emaTrend` was **removed**: its premise — predictable short-horizon direction — measured at coin-flip accuracy in walk-forward and out-of-sample, and its trend-biased placement is a directional bet the evidence says nobody should take. `docs/decision-remove-center-prediction.md` records the falsification; recover the code from git history if you want a directional-strategy skeleton.)
 - **Idle-asset lending** — Scallop + Kai SAV integration, APY-aware router (25 bps Scallop tie-break), per-coin dust thresholds.
 - **Multi-source price feeds** — on-chain Cetus `SwapEvent` and Binance REST implementations behind one `PriceFeed` interface, sharing a `price_observations` history table.
 - **Automatic PM discovery** — the agent address is derived from `MNEMONICS`, the agent listens for on-chain `AgentAdded` events and adds the `PositionManager` to its monitor; `AgentRemoved` / `PositionManagerClosed` remove it automatically.
@@ -216,7 +216,7 @@ export function createMyStrategy(): Strategy {
 import { createMyStrategy } from "./myStrategy.ts";        // 1. import
 
 export type StrategyName =
-  | "singleBin" | "multiBinSpot" | "emaTrend"
+  | "singleBin" | "multiBinSpot"
   | "presenceAnchor" | "presenceSweep" | "mlAgent"
   | "myStrategy";                                          // 2. add to the union
 

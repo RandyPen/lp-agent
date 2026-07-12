@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 LiquidityManager is an **open-source quantitative liquidity-custody agent** for DLMM market-making on **Sui** (it began life as a bare template; the v1 plan in `docs/implementation-plan-v1.md` pivots it to a full quant agent with an in-tree ML pipeline). It operates through the **CDPM (LeafSheep) agent interface** — users own custodied `PositionManager` objects on-chain, and this agent is an authorized operator with a constrained permission set (see *Agent Permission Model* below).
 
 **What the current code ships** (the core skeleton — see `README.md` for the open-source-friendly intro):
-1. **Algorithm-driven rebalancing** — four registered strategies (`singleBin`, `multiBinSpot` log-normal-based, `emaTrend` dual-EMA trend-biased, `mlAgent` prediction-driven with Tier 0 fallback), strategy registry, atomic unified PTB; `Strategy.plan` is async
+1. **Algorithm-driven rebalancing** — five registered strategies (`presenceAnchor`/`presenceSweep` regime-gated presence mainline, `singleBin` baseline, `multiBinSpot` log-normal Tier 0 fallback, `mlAgent` vol-prediction-driven; `emaTrend` was removed 2026-07 — directional premise falsified, see `docs/decision-remove-center-prediction.md`), strategy registry, atomic unified PTB; `Strategy.plan` is async
 2. **Two price feeds** — on-chain Cetus `SwapEvent` (`onchain`) + public Binance REST (`binance`), shared `price_observations` table
 3. **Idle assets → lending** — Scallop + Kai SAV integration, APY-aware router with tie-break + dust filter
 4. **User top-up records** — per-user derivation addresses + watcher + credit ledger + APY rates (Treasury layer)

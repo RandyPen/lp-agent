@@ -23,6 +23,8 @@ export interface AgentSummary {
   succeededRebalances: number;
   lastRebalanceMs: number | null;
   modelVersion: string | null;
+  /** True when the API serves a seeded demo dataset — the UI shows a banner. */
+  demo?: boolean;
 }
 
 export interface PmSubscription {

@@ -8,7 +8,6 @@
 import type { Strategy } from "./types.ts";
 import { createSingleBinStrategy } from "./singleBin.ts";
 import { createMultiBinSpotStrategy } from "./multiBinSpot.ts";
-import { createEmaTrendStrategy } from "./emaTrend.ts";
 import { createPresenceAnchorStrategy } from "./presenceAnchor.ts";
 import { createPresenceSweepStrategy } from "./presenceSweep.ts";
 import { createMlAgentStrategy, type MlAgentDeps } from "./mlAgent.ts";
@@ -17,7 +16,6 @@ import { ConfigError } from "../lib/errors.ts";
 export type StrategyName =
   | "singleBin"
   | "multiBinSpot"
-  | "emaTrend"
   | "presenceAnchor"
   | "presenceSweep"
   | "mlAgent";
@@ -32,7 +30,6 @@ export type { MlAgentDeps } from "./mlAgent.ts";
 const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
   singleBin: () => createSingleBinStrategy(),
   multiBinSpot: () => createMultiBinSpotStrategy(),
-  emaTrend: () => createEmaTrendStrategy(),
   presenceAnchor: () => createPresenceAnchorStrategy(),
   presenceSweep: () => createPresenceSweepStrategy(),
 };
@@ -40,8 +37,8 @@ const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
 /**
  * Build a strategy by name.
  *
- * - Rule-based strategies (singleBin, multiBinSpot, emaTrend): `mlDeps` is
- *   ignored.
+ * - Rule-based strategies (singleBin, multiBinSpot, presenceAnchor,
+ *   presenceSweep): `mlDeps` is ignored.
  * - "mlAgent": `mlDeps` is required. Throws `ConfigError` when absent.
  */
 export function buildStrategy(name: StrategyName, mlDeps?: MlAgentDeps): Strategy {

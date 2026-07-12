@@ -255,7 +255,7 @@ export interface AppConfig {
   shadowFleet: ShadowFleetConfig;
   /**
    * Strategy to fall back to when `mlAgent` cannot use the prediction provider
-   * (sidecar down, PSI drift, timeout). Defaults to `emaTrend`.
+   * (sidecar down, PSI drift, timeout). Defaults to `multiBinSpot`.
    * Set via `FALLBACK_STRATEGY` env var.
    */
   fallbackStrategy: StrategyName;
@@ -526,7 +526,7 @@ export function loadConfig(): AppConfig {
   };
 
   // Fallback strategy for mlAgent Tier 0 degradation.
-  const fallbackStrategyRaw = optional("FALLBACK_STRATEGY", "emaTrend");
+  const fallbackStrategyRaw = optional("FALLBACK_STRATEGY", "multiBinSpot");
   if (!isStrategyName(fallbackStrategyRaw)) {
     errs.push(
       `FALLBACK_STRATEGY must be one of [${listStrategyNames().join(", ")}], got '${fallbackStrategyRaw}'`,
@@ -534,7 +534,7 @@ export function loadConfig(): AppConfig {
   }
   const fallbackStrategy = isStrategyName(fallbackStrategyRaw)
     ? fallbackStrategyRaw
-    : ("emaTrend" as StrategyName);
+    : ("multiBinSpot" as StrategyName);
 
   // Risk thresholds (L1/L2/L3 circuit breakers).
   const extremeVolatility5m = Number(optional("RISK_EXTREME_VOLATILITY_5M", "0.10"));

@@ -98,6 +98,13 @@ predictable — which is exactly what the vol head captures.
 - **web portal**: the prediction chart's band now renders
   `active_bin ± 1.28 × width_sigma` instead of the q10–q90 band, and no
   longer draws a predicted-center line.
+- The `emaTrend` strategy was removed outright (2026-07-12): dual-EMA
+  trend-biased placement is a directional bet, and the same evidence that
+  killed the center head (direction ≈ coin flip, in-sample and OOS) applies
+  to it one-for-one. `FALLBACK_STRATEGY` now defaults to `multiBinSpot`
+  (distribution placement, no directional bet) — the previous default WAS
+  `emaTrend`, i.e. the Tier 0 safety floor itself was a falsified-premise
+  strategy.
 - Model artifacts trained under the old layout (v0.1.0, v0.2.0) fail
   `load_bundle` validation by design (missing files / different meta);
   retrain with `uv run python -m training.train_vol …` to produce a v0.3.0

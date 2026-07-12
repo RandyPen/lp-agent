@@ -102,6 +102,10 @@ function handleAgentSummary(cfg: AppConfig): Response {
     succeededRebalances: rebalanceCount,
     lastRebalanceMs: lastRebalance,
     modelVersion: latestModel?.model_version ?? null,
+    // True when the API is serving a seeded demo dataset (set by
+    // scripts/serve-demo-api.ts). The portal shows a "DEMO DATA" banner so
+    // seeded NAV/fees/rebalances are never mistaken for real performance.
+    demo: process.env.WEB_DEMO_MODE === "true",
   });
 }
 

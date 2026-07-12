@@ -144,7 +144,7 @@ export function FeeChart({ ticks }: { ticks: Array<{ ts_ms: number; cum_fees: nu
 }
 
 // ---------------------------------------------------------------------------
-// Prediction fan — observed price line + q10–q90 band + predicted center
+// Vol band — observed price line + ±1.28σ (80%) vol band centered on spot
 // ---------------------------------------------------------------------------
 
 export interface FanData {
@@ -225,9 +225,9 @@ export function PredictionFan({ data }: { data: FanData }) {
             labelFormatter={(v) => formatTs(Number(v))}
             formatter={(value, name) => {
               if (Array.isArray(value)) {
-                return [`${Number(value[0]).toFixed(3)} – ${Number(value[1]).toFixed(3)}`, "q10–q90"];
+                return [`${Number(value[0]).toFixed(3)} – ${Number(value[1]).toFixed(3)}`, "±1.28σ band"];
               }
-              return [Number(value).toFixed(3), name === "price" ? "price" : "predicted center"];
+              return [Number(value).toFixed(3), name === "price" ? "price" : "band center (spot)"];
             }}
           />
           <Area
@@ -237,7 +237,7 @@ export function PredictionFan({ data }: { data: FanData }) {
             fill="#199e70"
             fillOpacity={0.16}
             isAnimationActive={false}
-            name="q10–q90"
+            name="±1.28σ band"
           />
           <Line
             data={data.bandPoints}
@@ -247,7 +247,7 @@ export function PredictionFan({ data }: { data: FanData }) {
             strokeDasharray="5 4"
             dot={false}
             isAnimationActive={false}
-            name="predicted center"
+            name="band center (spot)"
           />
           <Line
             data={data.pricePoints}
@@ -266,10 +266,10 @@ export function PredictionFan({ data }: { data: FanData }) {
         </span>
         <span className="flex items-center gap-1.5">
           <span className="inline-block h-0.5 w-4 border-t border-dashed" style={{ borderColor: "#199e70" }} />
-          predicted center
+          band center (spot)
         </span>
         <span className="flex items-center gap-1.5">
-          <span className="inline-block h-2.5 w-4" style={{ background: "rgba(25,158,112,0.25)" }} /> q10–q90 band
+          <span className="inline-block h-2.5 w-4" style={{ background: "rgba(25,158,112,0.25)" }} /> ±1.28σ vol band
         </span>
       </div>
     </div>
