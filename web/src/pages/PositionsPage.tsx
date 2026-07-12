@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 import { useCurrentAccount } from "@mysten/dapp-kit-react";
 import { api, type RebalanceEntry } from "@/lib/api";
 import { NavChart } from "@/components/charts";
 import { EmptyState, LoadingRow, Panel, StatusPill } from "@/components/primitives";
 import { EnrollWizard } from "./EnrollWizard";
 import {
+  explorerAddressUrl,
   explorerObjectUrl,
   explorerTxUrl,
   formatRaw,
@@ -14,6 +15,11 @@ import {
   truncateAddress,
 } from "@/lib/format";
 import { POOL } from "@/lib/cdpm";
+import {
+  fetchAgentEvents,
+  eventAmountLabel,
+  type AgentOnchainEvent,
+} from "@/lib/onchainEvents";
 
 export function PositionsPage() {
   const account = useCurrentAccount();
@@ -42,6 +48,8 @@ export function PositionsPage() {
       </div>
 
       {wizardOpen && <EnrollWizard onClose={() => setWizardOpen(false)} />}
+
+      <OnchainActivityPanel />
 
       {account && pms.isLoading && <LoadingRow />}
 
@@ -211,6 +219,105 @@ function RebalanceRow(props: {
           </details>
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// On-chain agent activity — queried directly from Sui GraphQL (no backend).
+// Public data: shown regardless of wallet connection. Surfaces REAL mainnet
+// agent events across all PMs, including third-party agents that aren't ours.
+// ---------------------------------------------------------------------------
+
+const KIND_META: Record<AgentOnchainEvent["kind"], { label: string; color: string }> = {
+  AgentLiquidityAdded: { label: "add", color: "var(--color-mint)" },
+  AgentLiquidityRemoved: { label: "remove", color: "var(--color-s-orange)" },
+  AgentFeeCollected: { label: "fee", color: "var(--color-s-blue)" },
+  AgentRewardCollected: { label: "reward", color: "var(--color-s-violet)" },
+};
+
+function OnchainActivityPanel() {
+  const q = useInfiniteQuery({
+    queryKey: ["onchainAgentEvents"],
+    queryFn: ({ pageParam }) => fetchAgentEvents({ before: pageParam, pageSize: 20 }),
+    initialPageParam: null as string | null,
+    getNextPageParam: (last) => (last.hasMore ? last.cursor : undefined),
+  });
+  const events = q.data?.pages.flatMap((p) => p.events) ?? [];
+
+  return (
+    <Panel
+      title="On-chain agent activity — all PMs (verifiable)"
+      right={
+        <span className="text-ink-3 font-mono text-[11px]">
+          live from Sui GraphQL · every row is a real mainnet tx
+        </span>
+      }
+    >
+      {q.isLoading ? (
+        <LoadingRow />
+      ) : q.isError ? (
+        <EmptyState>Could not reach Sui GraphQL — retry shortly.</EmptyState>
+      ) : events.length === 0 ? (
+        <EmptyState>No agent events found on-chain yet.</EmptyState>
+      ) : (
+        <div className="space-y-1.5">
+          {events.map((e, i) => (
+            <AgentEventRow key={`${e.digest}-${e.kind}-${e.pmId}-${i}`} e={e} />
+          ))}
+          <div className="pt-2 text-center">
+            {q.hasNextPage ? (
+              <button
+                onClick={() => q.fetchNextPage()}
+                disabled={q.isFetchingNextPage}
+                className="font-display text-ink-2 hover:text-mint border-line-2 hover:border-mint-dim rounded-md border px-4 py-1.5 text-xs tracking-wider uppercase transition-colors disabled:opacity-50"
+              >
+                {q.isFetchingNextPage ? "Loading…" : "Load more ↓"}
+              </button>
+            ) : (
+              <span className="text-ink-3 text-xs">— end of history —</span>
+            )}
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function AgentEventRow({ e }: { e: AgentOnchainEvent }) {
+  const meta = KIND_META[e.kind];
+  return (
+    <div className="border-line/60 hover:bg-panel-2 flex items-center gap-3 rounded-md border px-3 py-2 text-sm transition-colors">
+      <span className="text-ink-3 mono-num w-24 shrink-0 text-xs">{formatTs(e.timestampMs)}</span>
+      <span
+        className="font-display w-16 shrink-0 text-[10px] font-bold tracking-wider uppercase"
+        style={{ color: meta.color }}
+      >
+        {meta.label}
+      </span>
+      <a
+        className="text-s-blue mono-num shrink-0 text-xs underline decoration-dotted"
+        href={explorerAddressUrl(e.agent)}
+        target="_blank"
+        rel="noreferrer"
+        title={e.agent}
+      >
+        {truncateAddress(e.agent)}
+      </a>
+      <span className="text-ink-3 mono-num hidden shrink-0 text-xs lg:inline" title={e.pmId}>
+        PM {truncateAddress(e.pmId)}
+      </span>
+      <span className="text-ink-2 mono-num flex-1 truncate text-right text-xs">
+        {eventAmountLabel(e)}
+      </span>
+      <a
+        className="text-s-blue shrink-0 text-xs underline decoration-dotted"
+        href={explorerTxUrl(e.digest)}
+        target="_blank"
+        rel="noreferrer"
+      >
+        tx ↗
+      </a>
     </div>
   );
 }

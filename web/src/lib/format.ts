@@ -45,3 +45,7 @@ export function explorerTxUrl(digest: string): string {
 export function explorerObjectUrl(id: string): string {
   return `https://suivision.xyz/object/${id}`;
 }
+
+export function explorerAddressUrl(address: string): string {
+  return `https://suivision.xyz/account/${address}`;
+}
