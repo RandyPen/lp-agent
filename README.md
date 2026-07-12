@@ -63,8 +63,8 @@ The chain is the control plane: users delegate a `PositionManager` on-chain, the
 
 ```mermaid
 flowchart TB
-    subgraph chain["⛓️ Sui mainnet"]
-        PM["User's PositionManager<br/>(CDPM / LeafSheep)<br/>— owner keeps custody —"]
+    subgraph chain["⛓️ Sui mainnet — the custody boundary"]
+        PM["User's PositionManager (CDPM)<br/>— owner keeps custody —<br/>agent may: add · remove · collect<br/><b>agent may NOT: withdraw · close · swap</b>"]
         POOL["Cetus DLMM pool"]
         LEND["Scallop / Kai lending"]
     end
@@ -76,21 +76,24 @@ flowchart TB
         FEEDS["Market-data feeds<br/>onchain · Binance · derivatives"] --> AGG["Market aggregator"]
         AGG --> REB
         REB --> RISK{"Risk gate<br/>L1 / L2 / L3"}
-        RISK --> STATE["State machine<br/>NORMAL · TREND · EXTREME"]
-        STATE --> STRAT["Strategy<br/>presenceAnchor · presenceSweep<br/>multiBinSpot · singleBin · mlAgent"]
+        RISK -- "L3 emergency → halt, no new tx" --> HALT(["🛑 latched<br/>until human reset"])
+        RISK -- "L2 extreme → bypass strategy,<br/>force full withdrawal" --> EXEC
+        RISK -- "L1 soft / clear" --> STATE["State machine<br/>NORMAL · TREND · EXTREME"]
+        STATE --> STRAT["🔌 Strategy slot<br/><i>built-in or fork-registered</i>"]
         AGG --> FC["Forecast layer · rule-based<br/>σ + bin weights (Tier 0)"]
         FC -- "rule-based forecast" --> STRAT
-        STRAT --> EXEC["Executor<br/>builds one atomic PTB"]
-        REB -. "optional billing" .-> TRE["Treasury<br/>top-up + credit ledger<br/>pre-debit / refund"]
+        STRAT -- "RebalancePlan" --> EXEC["Executor<br/>builds ONE atomic PTB"]
+        REB -. "optional billing" .-> TRE["Treasury<br/>credit ledger · pre-debit / refund"]
     end
 
-    subgraph ml["🐍 ML sidecar · Python / uv (optional)"]
-        PRED["PredictionProvider seam"] --> LGBM["LightGBM vol model<br/>σ + range-break probabilities"]
+    subgraph ml["🐍 Prediction · behind the PredictionProvider seam"]
+        PRED["🔌 PredictionProvider"] --> LGBM["LightGBM vol model<br/>σ + range-break probs<br/><i>(Python sidecar, ml/)</i>"]
+        PRED --> NULLP["NullProvider<br/><i>rule-based, no Python</i>"]
     end
 
-    AGG -- "market snapshot" --> PRED
-    LGBM -- "ML forecast distribution" --> STRAT
-    PRED -. "sidecar down → falls back to rule forecast" .-> FC
+    AGG -- "MarketSnapshot" --> PRED
+    PRED -- "σ + p_break (mlAgent only)" --> STRAT
+    PRED -. "degraded → explicit Tier 0 fallback" .-> FC
 
     EXEC -- "collect → remove → transfer → redeem → add → supply" --> PM
     PM --- POOL
@@ -102,21 +105,84 @@ flowchart TB
 
 | Box | ID | Source |
 |---|---|---|
-| Subscription service | `SUB` | `src/services/subscriptions.ts` |
+| Subscription service | `SUB` | `src/services/subscriptions.ts` — **filters to one pool**; a PM on any other pool is skipped |
 | Rebalancer (tick loop) | `REB` | `src/services/rebalancer.ts` |
 | Market-data feeds | `FEEDS` | `src/data/feeds/` (onchain · binance · binanceMulti · derivatives · cetusEvents) |
 | Market aggregator | `AGG` | `src/data/marketAggregator.ts` |
-| Risk gate L1/L2/L3 | `RISK` | `src/risk/` |
+| Risk gate L1/L2/L3 | `RISK` · `HALT` | `src/risk/` — L1 soft-adjusts, **L2 forces a full withdrawal (bypassing the strategy)**, L3 latches and halts |
 | State machine | `STATE` | `src/state/` |
-| Strategy | `STRAT` | `src/strategies/` |
+| **Strategy slot** | `STRAT` | `src/strategies/` (built-ins) + anything a fork registers — see the seam diagram below |
 | Forecast layer (rule-based, Tier 0) | `FC` | `src/forecast/` (σ estimators + bin-weight mapping) |
 | Executor (atomic PTB) | `EXEC` | `src/services/executor.ts` |
 | Treasury (billing) | `TRE` | `src/treasury/` |
-| PredictionProvider seam | `PRED` | `src/prediction/` |
-| LightGBM vol model | `LGBM` | `ml/` (Python sidecar, uv-managed) — vol-only by design; the center head was falsified and removed, see `docs/decision-remove-center-prediction.md` |
+| **PredictionProvider seam** | `PRED` | `src/prediction/` — `PREDICTION_PROVIDER=sidecar\|null` |
+| LightGBM vol model / Null provider | `LGBM` · `NULLP` | `ml/` (Python, uv) — **vol-only by design**; the center head was falsified and removed (`docs/decision-remove-center-prediction.md`). `NULLP` runs the same graph with no Python. |
 | PositionManager / pool / lending | `PM` · `POOL` · `LEND` | on-chain: CDPM PositionManager, Cetus DLMM pool, Scallop/Kai (adapters in `src/sui/lending/`) |
 
-**One tick, per subscribed PM:** fetch PM state + pool active bin + spot + history → pre-tick **risk** check → **state** machine eval → **strategy** plan — consuming either the ML prediction or the rule-based **forecast** layer (σ + bin weights), plus the state params → lending router decides redeem/supply → (optional) **treasury** pre-debit → **executor** submits the unified PTB → on failure refund the charge → record to SQLite. The ML sidecar is consumed only through the `PredictionProvider` seam; if it is unavailable the agent degrades explicitly to the rule-based forecast (the Tier 0 floor) and logs the reason — never a silent fallback.
+**One tick, per subscribed PM:** fetch PM state + pool active bin + spot + history → pre-tick **risk** check → **state** machine eval → **strategy** plan (consuming the ML prediction or the rule-based **forecast** layer) → lending router decides redeem/supply → (optional) **treasury** pre-debit → **executor** submits the unified PTB → on failure refund the charge → record to SQLite. If the prediction provider is unavailable the agent degrades **explicitly** to Tier 0 and logs the reason — never a silent fallback.
+
+Two things the diagram is deliberately honest about: the risk gate can **bypass your strategy entirely** (an L2 EXTREME issues a forced full withdrawal without calling `plan()`), and an **L3 trip latches** — it stops submitting transactions and survives restarts until a human runs `bun run risk-reset`. It halts; it does not unwind.
+
+### The fork seam — what you plug in, and where
+
+Everything marked 🔌 above is a slot. You fill it from `agent.config.ts`, and the
+framework's own source is never edited — which is what makes upstream pulls
+conflict-free:
+
+```mermaid
+flowchart LR
+    subgraph fork["📦 YOUR fork — upstream never writes to these paths"]
+        USR["user/<br/>your strategy · pool · feed · model"]
+        CFG["agent.config.ts<br/><b>defineAgent({ … })</b>"]
+        USR --> CFG
+    end
+
+    subgraph reg["🔌 Registries — resolved at startup, before config"]
+        RS["Strategy registry<br/>selected by STRATEGY"]
+        RP["Pool registry<br/>selected by POOL_PROFILE"]
+        RF["Price-feed registry<br/>selected by PRICE_FEED"]
+        RM["Prediction provider<br/>selected by PREDICTION_PROVIDER"]
+    end
+
+    CFG -- "strategies" --> RS
+    CFG -- "pools" --> RP
+    CFG -- "feeds" --> RF
+    CFG -- "prediction" --> RM
+
+    RS --> RUN["Agent runtime · src/<br/><b>you never edit this</b>"]
+    RP --> RUN
+    RF --> RUN
+    RM --> RUN
+```
+
+| Slot | You write | Registry |
+|---|---|---|
+| Strategy | `strategies: [() => createMine()]` — a **factory**, not an instance | `src/strategies/registry.ts` |
+| Pool profile | `pools: [{ name, build }]` | `src/pools/index.ts` |
+| Price feed | `feeds: { pyth: (profile) => … }` | `src/data/feedRegistry.ts` |
+| Prediction model | `prediction: () => createMyProvider()` | wired in `src/index.ts` |
+
+Factories, not instances: the live rebalancer, the shadow fleet and the backtest
+each build their own strategy, so a shared object would leak state between PMs —
+and between the live book and the shadow book that exists to validate it.
+
+All four share one generic registry (`src/kit/registry.ts`) and are loaded by
+`src/kit/loadExtensions.ts` **before** `loadConfig()` — so your names are valid
+`STRATEGY` / `POOL_PROFILE` / `PRICE_FEED` values. No `agent.config.ts` = built-ins
+only; a broken one **aborts startup** rather than silently falling back.
+
+### Evaluating a strategy before it touches money
+
+```mermaid
+flowchart LR
+    F["bun run seed-fixture<br/><i>committed CSV, offline</i>"] --> B
+    C["bun run collect-historical<br/><i>public Binance klines</i>"] --> B
+    B["bun run backtest<br/><b>decision trace</b><br/>no fees · no IL · no gas"] --> S
+    S["bun run shadow<br/><b>real fills</b> from on-chain SwapEvents<br/>hypothetical book · zero capital"] --> L["bun start<br/>funded PositionManager"]
+```
+
+The backtest tells you *what your strategy would do*; only shadow tells you *how it
+would have done*. Neither needs a key.
 
 > The repo ships the framework and the pipeline drawn above — **not** the trained model that sits behind the `PredictionProvider` seam. Forks train their own. See [`docs/project-overview.md`](./docs/project-overview.md) for the module-level map.
 
