@@ -5,7 +5,7 @@ import type {
   PriceObservation,
   RebalancePlan,
 } from "../domain/types.ts";
-import type { StateContext } from "../prediction/types.ts";
+import type { MarketSnapshot, StateContext } from "../prediction/types.ts";
 
 export interface StrategyInput {
   pm: PMState;
@@ -13,6 +13,27 @@ export interface StrategyInput {
   spot: PriceObservation;
   history: PriceObservation[];
   profile: PoolProfile;
+  /**
+   * The full market snapshot the framework already assembles: derivatives
+   * (funding rate, open interest, 1m liquidation flow), cross-asset BTC/ETH
+   * OHLCV, pool TVL, and the Cetus-vs-Binance spread.
+   *
+   * Previously this was reachable only by `mlAgent` (through `MlAgentDeps`),
+   * so every other strategy — including every fork strategy — saw nothing but
+   * price ticks. That made fork strategies second-class by construction.
+   *
+   * OPTIONAL, and you must handle its absence:
+   *   - live rebalancer / shadow runner: PRESENT (the market aggregator is running).
+   *   - offline backtest and the shadow fleet: ABSENT (no aggregator; the
+   *     backtest replays persisted history, which does not carry derivatives).
+   *
+   * So a strategy that hard-depends on `snapshot` cannot be backtested offline.
+   * That is a real trade-off, not an oversight: degrade to `history` when it is
+   * undefined, or accept that your strategy is shadow-only. Never fabricate the
+   * missing values — `undefined` means "not observed", which is different from
+   * zero (see `DataOutageError` in src/data/marketAggregator.ts).
+   */
+  snapshot?: MarketSnapshot;
 }
 
 /**

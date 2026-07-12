@@ -374,12 +374,34 @@ different strategy than the one you configured.
 
 **Run it**: `STRATEGY=myStrategy bun start`.
 
+**Test it** — the kit is provided; you write ~5 lines:
+
+```ts
+import { makeInput, makeTestProfile, assertPlanInvariants } from "../tests/helpers/index.ts";
+
+const out = await createMyStrategy().plan(makeInput({ activeBin: 1445 }));
+assertPlanInvariants(out, makeTestProfile(), 1445);   // ← the important one
+```
+
+`assertPlanInvariants` runs the **same validator the rebalancer runs before it
+submits on-chain** (`src/decision/planInvariants.ts`): bins above the active bin
+carry physical coinA only, bins below carry coinB only, nothing lands on the
+active bin, and the per-bin amounts sum to the declared totals. So a plan that
+passes your test is a plan the live agent will accept — and if your strategy ever
+emits an invalid one in production, **the agent refuses to submit it** rather than
+placing a user's liquidity on the wrong side of the market. (This repo shipped
+exactly that bug once, unnoticed. Hence the guard.)
+
+The default `makeTestProfile()` is deliberately the **inverted** SUI/USDC shape,
+where a higher bin id means a *lower* price — a strategy that only works on a
+non-inverted pool has an orientation bug that a friendlier fixture would hide.
+
 **Validate before you go live** — in escalating order of realism, none of which
 costs you a cent:
 
 1. `bun run typecheck && bun test`.
 2. **Replay it offline** — no keys, no chain:
-   `bun run collect-historical && bun run backtest --pool-id=binance:SUIUSDC --strategy=myStrategy`.
+   `bun run seed-fixture && bun run backtest --pool-id=binance:SUIUSDC --strategy=myStrategy`.
    This is a *decision trace* (trigger frequency, bins touched); it has no
    fee/IL/gas accounting, so don't rank strategies by return with it.
 3. **Shadow it against the live market** — real prices, real on-chain

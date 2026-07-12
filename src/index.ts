@@ -356,6 +356,9 @@ async function main(): Promise<void> {
       liveStrategyName,
       mlDeps: liveStrategyName === "mlAgent" ? mlDeps : undefined,
       pnlService,
+      // Every strategy — not just mlAgent — now receives the assembled
+      // MarketSnapshot via StrategyInput.snapshot.
+      marketAggregator,
     },
   );
   const stopRebalancer = rebalancerService.start();

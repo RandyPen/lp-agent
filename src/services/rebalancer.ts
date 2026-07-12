@@ -12,6 +12,7 @@ import { saveFillBoundary } from "../strategies/positionState.ts";
 import type { Strategy, StrategyInput, StrategyOutput } from "../strategies/types.ts";
 import { buildExtremeWithdrawPlan } from "../decision/diffPlanner.ts";
 import { rescalePlanToAvailable } from "../decision/planMath.ts";
+import { validatePlan, formatViolations } from "../decision/planInvariants.ts";
 import { syncLotsAfterRebalance } from "../decision/lotStore.ts";
 import type { PnlService } from "./pnlService.ts";
 import type { RiskMonitor } from "../risk/monitor.ts";
@@ -26,7 +27,8 @@ import type { SubscriptionsService } from "./subscriptions.ts";
 import type { ExecutorService } from "./executor.ts";
 import type { PriceFeed } from "../data/priceFeed.ts";
 import type { RebalancePlan, PMState } from "../domain/types.ts";
-import type { StateContext } from "../prediction/types.ts";
+import type { MarketSnapshot, StateContext } from "../prediction/types.ts";
+import { DataOutageError, type MarketAggregator } from "../data/marketAggregator.ts";
 
 export interface RebalancerService {
   start(): () => void;
@@ -323,6 +325,16 @@ export interface RebalancerOpts {
    * record fee income, treasury cost, and realized IL.
    */
   pnlService?: PnlService;
+  /**
+   * Market aggregator. When present, every tick passes the assembled
+   * `MarketSnapshot` (derivatives, cross-asset, TVL, spread) to the strategy
+   * via `StrategyInput.snapshot`.
+   *
+   * Previously this reached the strategy layer only through `MlAgentDeps`, so
+   * only `mlAgent` could see anything richer than price. Threading it here
+   * makes every strategy — including fork strategies — first-class.
+   */
+  marketAggregator?: MarketAggregator;
 }
 
 export function createRebalancerService(
@@ -332,7 +344,7 @@ export function createRebalancerService(
   opts: RebalancerOpts,
 ): RebalancerService {
   const cfg = loadConfig();
-  const { riskMonitor, liveStrategyName, mlDeps, pnlService } = opts;
+  const { riskMonitor, liveStrategyName, mlDeps, pnlService, marketAggregator } = opts;
   const strategy: Strategy = buildStrategy(liveStrategyName, mlDeps);
   log.info("rebalancer: strategy selected", { name: strategy.name });
   const agentAddress = getAgentAddress();
@@ -454,12 +466,37 @@ export function createRebalancerService(
       // for its anchor + vol-regime nowcast); default 5 minutes.
       const history = await priceFeed.getHistory(strategy.historyWindowMs ?? 5 * 60 * 1000);
 
+      // Market snapshot for the strategy (derivatives, cross-asset, TVL, spread).
+      //
+      // `latest()` THROWS DataOutageError when an essential feed has never been
+      // populated — deliberately, so nothing fabricates a snapshot from zeros.
+      // That must not kill the tick: a rule-based strategy that only needs price
+      // should still run during a derivatives outage. So we catch that ONE typed
+      // error and pass `undefined`, which the contract defines as "not observed".
+      // Any other error propagates. The risk layer independently watches feed
+      // staleness (riskObserver → checkDataOutage) — degrading here does not hide
+      // an outage from the circuits.
+      let snapshot: MarketSnapshot | undefined;
+      if (marketAggregator) {
+        try {
+          snapshot = marketAggregator.latest();
+        } catch (err: unknown) {
+          if (!(err instanceof DataOutageError)) throw err;
+          log.warn("rebalancer: market snapshot unavailable, strategy runs on price only", {
+            tickId,
+            pmId,
+            emptySources: err.emptySources,
+          });
+        }
+      }
+
       const strategyInput: StrategyInput = {
         pm,
         pool,
         spot,
         history,
         profile: cfg.poolProfile,
+        ...(snapshot !== undefined ? { snapshot } : {}),
       };
 
       // Pre-tick risk veto for RULE-BASED strategies. mlAgent runs
@@ -759,6 +796,37 @@ export function createRebalancerService(
           if (drift > cfg.slippageMaxBinDrift) {
             throw new Error(
               `active bin drifted ${drift} bins (planned ${plan.plannedActiveBinId}, now ${poolNow.activeBinId}, max ${cfg.slippageMaxBinDrift}) between plan and execution`,
+            );
+          }
+        }
+
+        // Physical-validity guard: refuse to submit a plan that breaks the
+        // DLMM's own rules (wrong-side placement, active-bin placement, per-bin
+        // amounts that don't sum to the declared totals).
+        //
+        // This exists because the framework now runs strategies it did not
+        // write. A fork strategy with an inverted side-split would otherwise
+        // place a user's liquidity on the wrong side of the market and lose real
+        // money — this repo shipped exactly that bug once, unnoticed, because
+        // nothing asserted plan shape. We fail loudly rather than "fixing" the
+        // plan: a strategy that emits invalid plans is broken, and quietly
+        // rewriting its intent would hide that.
+        if (plan.addBins.length > 0) {
+          const violations = validatePlan(
+            plan,
+            cfg.poolProfile,
+            plan.plannedActiveBinId ?? pool.activeBinId,
+          );
+          if (violations.length > 0) {
+            log.error("rebalancer: strategy produced a physically invalid plan — refusing to submit", {
+              tickId,
+              pmId,
+              strategy: strategy.name,
+              violations: violations.map((v) => v.code),
+            });
+            throw new Error(
+              `strategy '${strategy.name}' produced an invalid RebalancePlan:\n` +
+                formatViolations(violations),
             );
           }
         }
