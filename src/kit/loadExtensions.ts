@@ -76,8 +76,11 @@ export async function loadExtensions(): Promise<void> {
     );
   }
 
-  for (const strategy of ext.strategies ?? []) {
-    registerStrategy(strategy.name, () => strategy);
+  // Construct one throwaway instance to learn the name, then register the
+  // FACTORY — so every consumer (live rebalancer, shadow fleet, backtest) gets
+  // its own instance, as the built-ins do.
+  for (const factory of ext.strategies ?? []) {
+    registerStrategy(factory().name, factory);
   }
 
   for (const pool of ext.pools ?? []) {
@@ -98,7 +101,7 @@ export async function loadExtensions(): Promise<void> {
 
   log.info("kit: loaded agent.config.ts", {
     path: configPath,
-    strategies: (ext.strategies ?? []).map((s) => s.name),
+    strategies: (ext.strategies ?? []).map((f) => f().name),
     pools: (ext.pools ?? []).map((p) => p.name),
     feeds: Object.keys(ext.feeds ?? {}),
     prediction: ext.prediction ? "custom" : "default",

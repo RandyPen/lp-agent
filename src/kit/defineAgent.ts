@@ -25,8 +25,18 @@ import type { PriceFeedBuilder } from "../data/feedRegistry.ts";
 import type { PredictionProvider } from "../prediction/provider.ts";
 
 export interface AgentExtensions {
-  /** Selected with STRATEGY / FALLBACK_STRATEGY / SHADOW_FLEET. */
-  strategies?: Strategy[];
+  /**
+   * Strategy FACTORIES, selected with STRATEGY / FALLBACK_STRATEGY /
+   * SHADOW_FLEET. Pass `() => createMyStrategy()`, not `createMyStrategy()`.
+   *
+   * Factories, not instances, because the framework builds a strategy per
+   * consumer: the live rebalancer, the shadow fleet, and the backtest each call
+   * buildStrategy() separately. Handing them one shared object would let a
+   * stateful strategy leak state between PMs, and between the live book and the
+   * shadow book that exists to validate it. The built-ins are registered as
+   * factories for exactly this reason.
+   */
+  strategies?: Array<() => Strategy>;
 
   /**
    * Selected with POOL_PROFILE=<name>. `build` is lazy so env-driven fields

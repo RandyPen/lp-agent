@@ -178,6 +178,15 @@ What this agent **CANNOT** do:
 
 Any code that appears to bypass these constraints is wrong by construction — verify against `cdpm-agent-sdk` before assuming the chain will accept the transaction.
 
+**Corollary — no swap, so inventory ratio is NOT a control variable.** The agent
+is a pure maker: it has no taker permission (the same property that makes it
+unable to steal). A strategy therefore cannot restore a target asset ratio after
+a directional move — it can only re-place the skewed inventory across bins or
+park the excess in lending. Range/width/regime/presence/lending are the entire
+control surface. Delta-neutral, inventory-targeting, and hedging strategies are
+**unbuildable on this custody design**, not merely unimplemented — do not accept
+a design that assumes a swap exists. Stated for fork authors in `README.md`.
+
 ## Extension points for downstream forks
 
 **The load-bearing rule: a fork must never have to edit a file under `src/`.**
@@ -197,7 +206,7 @@ union over an extension seam.**
 
 | Extension | Interface | Recipe |
 |---|---|---|
-| **New strategy** | `src/strategies/types.ts → Strategy` | Implement `plan() → StrategyOutput`, then `defineAgent({ strategies: [createMine()] })`. Select with `STRATEGY=mine`. Reference: `user/exampleStrategy.ts`, `multiBinSpot.ts`. |
+| **New strategy** | `src/strategies/types.ts → Strategy` | Implement `plan() → StrategyOutput`, then `defineAgent({ strategies: [() => createMine()] })` — a FACTORY, not an instance: live/shadow/backtest each build their own, and a shared object leaks state between PMs and between the live and shadow books. Select with `STRATEGY=mine`. Reference: `user/exampleStrategy.ts`. |
 | **New pool profile** | `src/pools/types.ts → PoolProfile` | Pure data. `defineAgent({ pools: [{ name, build }] })`; select with `POOL_PROFILE=`. **Run `bun run probe-bin-orientation` first on any non-SUI/USDC pool** and set `poolCoinAIsQuote` from what it reports. Reference: `sui-usdc.ts`. |
 | **New price feed** | `src/data/priceFeed.ts → PriceFeed` | `defineAgent({ feeds: { pyth: (profile) => ... } })`; select with `PRICE_FEED=pyth`. Built-ins live in `src/data/feedRegistry.ts`. |
 | **New prediction model** | `src/prediction/provider.ts → PredictionProvider` | `defineAgent({ prediction: () => createMine() })`, or pick a shipped impl with `PREDICTION_PROVIDER=sidecar\|null`. `null` = NullPredictionProvider: the full ML graph with no Python. The framework never knows what is behind the interface. |

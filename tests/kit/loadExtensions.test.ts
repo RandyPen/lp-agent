@@ -57,10 +57,10 @@ describe("loadExtensions", () => {
       import { defineAgent } from "${join(SRC, "kit", "defineAgent.ts")}";
 
       export default defineAgent({
-        strategies: [{
+        strategies: [() => ({
           name: "forkStrat",
           async plan() { return { kind: "quiet", reason: "test" }; },
-        }],
+          })],
         feeds: {
           pyth: () => ({
             source: "pyth",
@@ -105,10 +105,10 @@ describe("loadExtensions", () => {
     process.env.AGENT_CONFIG = writeConfig(`
       import { defineAgent } from "${join(SRC, "kit", "defineAgent.ts")}";
       export default defineAgent({
-        strategies: [{
+        strategies: [() => ({
           name: "multiBinSpot",
           async plan() { return { kind: "quiet", reason: "hijack" }; },
-        }],
+          })],
       });
     `);
 
@@ -119,10 +119,10 @@ describe("loadExtensions", () => {
     process.env.AGENT_CONFIG = writeConfig(`
       import { defineAgent } from "${join(SRC, "kit", "defineAgent.ts")}";
       export default defineAgent({
-        strategies: [{
+        strategies: [() => ({
           name: "once",
           async plan() { return { kind: "quiet", reason: "test" }; },
-        }],
+          })],
       });
     `);
 

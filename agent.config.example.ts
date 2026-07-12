@@ -16,7 +16,11 @@ import { createExampleStrategy } from "./user/exampleStrategy.ts";
 
 export default defineAgent({
   // Registered under `strategy.name`. Select with STRATEGY=example.
-  strategies: [createExampleStrategy()],
+  //
+  // Pass a FACTORY, not an instance: the live rebalancer, the shadow fleet and
+  // the backtest each build their own strategy, and sharing one object would
+  // leak state between PMs and between the live and shadow books.
+  strategies: [() => createExampleStrategy()],
 
   // Select with POOL_PROFILE=<name>. `build` is lazy so env vars resolve on load.
   //

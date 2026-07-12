@@ -21,6 +21,32 @@ Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K L
 - **User top-up accounting** — per-user derived deposit addresses, a SQLite credit ledger, a periodic watcher that credits inbound deposits, APY-aware conversion rates. Deposit addresses typically hold only stablecoins; operator sweep (`treasury-sweep.ts`) and refund (`treasury-refund.ts`) use Sui's protocol-level gasless stablecoin transfers (mainnet, 2026-05-20) for USDC and the other six allowlisted coins — the deposit address needs zero SUI for gas. The watcher merges coin-object balances and address-balance accumulator balances (from gasless deposits) into a single observed total, so both deposit paths are credited correctly. Non-allowlisted coins and the explicit `--force-gas` flag fall back to the legacy coin-object path.
 - **CDPM permission boundary** — all operations go through the LeafSheep `PositionManager`; user funds never leave the user's own vault.
 
+## The hard ceiling: no swap, so inventory is not a control variable
+
+Read this before you plan a strategy — it is a **permission-layer** limit, not a
+missing feature, and no amount of forking removes it.
+
+The CDPM custody boundary grants the agent exactly five powers: add liquidity,
+remove liquidity, collect fees, collect rewards, move the fee bag into the
+balance. **There is no swap.** The agent is a pure maker; it has no taker
+permission, by construction — that is the same property that makes it unable to
+steal, so it is not going away.
+
+The consequence is easy to miss: **your strategy cannot change the PM's asset
+ratio.** After a directional move leaves a position 90 % base / 10 % quote, you
+can re-place that skewed inventory across bins, or park the excess in lending —
+but you cannot sell base for quote to get back to 50/50. So:
+
+- ✅ Buildable: range/width selection, regime gating, recentering policy,
+  bin-weight distribution, fee-harvest timing, when to leave the market entirely
+  (withdraw-only defense), how much to lend.
+- ❌ Not buildable here: delta-neutral or inventory-targeting strategies, hedging,
+  anything whose control loop is "swap to restore a target ratio." Those need a
+  taker venue, which means a different custody design.
+
+Directional exposure is managed by *where you place and whether you're present* —
+never by trading. If your idea needs a swap, this framework is the wrong base.
+
 ## What it does **not** do (deliberately left to forks)
 
 - ❌ No trained models — the ML pipeline is in-tree (`ml/`), but the model artifacts (the alpha) are yours to train
@@ -28,6 +54,8 @@ Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K L
 - ❌ No cross-chain support (Sui mainnet only)
 - ❌ No public HTTP API — SQLite + CLI scripts only, plus an optional bind-local treasury HTTP API (`TREASURY_HTTP_ENABLED`, off by default; never expose it raw to the internet)
 - ❌ No user-initiated refunds (operator sweeps manually)
+- ❌ **One pool per process** — `POOL_PROFILE` is process-global, and a PM whitelisted on any other pool is skipped with a warning. Multi-pool = multiple processes.
+- ❌ **No per-user risk limits** — `RISK_*` thresholds are process-global, and the L3 emergency stop is a single latch for the whole fleet.
 
 ## Architecture
 
@@ -259,9 +287,14 @@ import { defineAgent } from "./src/kit/defineAgent.ts";
 import { createMyStrategy } from "./user/myStrategy.ts";
 
 export default defineAgent({
-  strategies: [createMyStrategy()],
+  strategies: [() => createMyStrategy()],   // a FACTORY, not an instance
 });
 ```
+
+Pass a factory, not an instance: the live rebalancer, the shadow fleet and the
+backtest each build their own strategy. Sharing one object would leak state
+between PMs — and between the live book and the shadow book that exists to
+validate it.
 
 That's it — **you never edit a file under `src/`.** Your strategy lives in
 `user/`, your wiring lives in `agent.config.ts`, and both are yours. Because

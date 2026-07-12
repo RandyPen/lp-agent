@@ -87,6 +87,26 @@ describe("strategy registry", () => {
     expect(buildStrategy("forkStrat").name).toBe("forkStrat");
   });
 
+  it("builds a FRESH instance per call — a fork strategy must not be a shared singleton", () => {
+    // Regression: extensions used to be registered as `() => strategy` over an
+    // already-constructed object, so buildStrategy() handed the SAME instance to
+    // the live rebalancer (across every PM), the shadow fleet, and the backtest.
+    // A stateful fork strategy would then leak state between users, and between
+    // the live book and the shadow book that exists to validate it. Built-ins
+    // are factories; fork strategies must be too.
+    let built = 0;
+    registerStrategy("fresh", () => {
+      built++;
+      return fakeStrategy("fresh");
+    });
+
+    const live = buildStrategy("fresh");
+    const shadow = buildStrategy("fresh");
+
+    expect(built).toBe(2);
+    expect(live).not.toBe(shadow); // distinct objects, not one shared instance
+  });
+
   it("still resolves the built-ins", () => {
     expect(buildStrategy("multiBinSpot").name).toBe("multiBinSpot");
     expect(isStrategyName("presenceAnchor")).toBe(true);
