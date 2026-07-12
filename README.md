@@ -1,6 +1,6 @@
 # LP Agent
 
-> An **open-source agent template** — a reference implementation you fork and operate yourself, not a hosted app — for an **autonomous, on-chain-delegated quant operator** that forecasts short-term **volatility** (not price direction) and shapes Cetus DLMM liquidity as a vol-scaled band around the market — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
+> An **open-source framework for non-custodial LP agents on Sui** — a reference implementation you fork and run yourself, not a hosted app. It **scaffolds the whole agent** — the Move custody boundary, L1/L2/L3 risk breakers, atomic multi-protocol execution, idle-asset lending, and a ready-to-ship user portal — so you bring one thing: **the strategy**. The reference agent forecasts short-term **volatility** (not price direction) and shapes Cetus DLMM liquidity as a vol-scaled band around the market — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
 
 It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. There is no central service: each deployer owns their own risk policy, capital limits, fee design, and trained model. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, and σ matters more than μ **literally**: walk-forward analysis falsified our own price-direction predictor (the q50 center placed no better than spot), so we removed it and kept only the volatility head, placing liquidity as a σ-scaled band centered on spot. Directional posture is handled by rule-based regime gates, not a trained center head — the burden of proof to reintroduce one is documented in `docs/decision-remove-center-prediction.md`.
 
@@ -122,13 +122,13 @@ cd ml && uv sync && uv run pytest        # (optional) ML pipeline, ~100 pass
 bun start
 ```
 
-## Extension points (the core value of the template)
+## Extension points (the core value of the framework)
 
 Five clearly carved extension seams — each has a ready-made interface; one registration line or one new file is all it takes:
 
 ### 1. Add a strategy
 
-A strategy is one file implementing the `Strategy` interface (`src/strategies/types.ts`). It is a **pure decision function**: given a market snapshot it returns *what to do*, and the framework owns everything else — risk gating, atomic PTB execution, lending of idle capital, custody boundary, journaling, shadow validation. **You write `plan()`; the template provides the rest.**
+A strategy is one file implementing the `Strategy` interface (`src/strategies/types.ts`). It is a **pure decision function**: given a market snapshot it returns *what to do*, and the framework owns everything else — risk gating, atomic PTB execution, lending of idle capital, custody boundary, journaling, shadow validation. **You write `plan()`; the framework provides the rest.**
 
 **The interface** — three members, only `plan` is required:
 
@@ -276,7 +276,7 @@ Implement `PredictionProvider` and plug in your own sidecar / remote service / l
 
 ## What you bring
 
-| You want to add | The template provides | You do |
+| You want to add | The framework provides | You do |
 |---|---|---|
 | LLM signal source | `Strategy.plan()` receives `history: PriceObservation[]` | Bring your own LLM client / RSS scraper / Twitter API and feed it into the decision inside your strategy |
 | Cross-chain | (nothing) | Bring a bridge SDK and run it as a separate service outside the main process; do not pollute the treasury module |
@@ -284,7 +284,7 @@ Implement `PredictionProvider` and plug in your own sidecar / remote service / l
 
 ## Web portal (`web/`)
 
-A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dapp-kit-react` v2, dark quant-terminal UI. **It is part of the template**: every operator who forks lp-agent self-hosts this portal for their own users — the front door where a user connects a wallet, enrolls a `PositionManager`, authorizes the operator's agent, tops up, and watches every rebalance on-chain. Fork it, rebrand it, or replace it — the agent only depends on the bind-local HTTP API, never on this UI. When the API serves the seeded demo dataset (`scripts/serve-demo-api.ts` sets `WEB_DEMO_MODE`), the portal shows a **"DEMO DATA"** banner so sample NAV / fees / rebalance figures are never mistaken for real performance. Its pages:
+A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dapp-kit-react` v2, dark quant-terminal UI. **It is part of the framework**: every operator who forks lp-agent self-hosts this portal for their own users — the front door where a user connects a wallet, enrolls a `PositionManager`, authorizes the operator's agent, tops up, and watches every rebalance on-chain. Fork it, rebrand it, or replace it — the agent only depends on the bind-local HTTP API, never on this UI. When the API serves the seeded demo dataset (`scripts/serve-demo-api.ts` sets `WEB_DEMO_MODE`), the portal shows a **"DEMO DATA"** banner so sample NAV / fees / rebalance figures are never mistaken for real performance. Its pages:
 
 - **Enroll** — create a custody `PositionManager` + add liquidity (tx 1), then whitelist the agent operator (tx 2). The agent's `AgentAdded` watcher picks the PM up automatically; the wizard cross-checks that the portal and the running agent point at the same CDPM deployment before signing.
 - **Dashboard** — NAV per PM, cumulative fee income, three-state timeline, live L1/L2/L3 risk events.
@@ -363,7 +363,7 @@ Apache-2.0, see `LICENSE`.
 
 ## Acknowledgements
 
-Template inspired by:
+Inspired by:
 - [Cetus DLMM](https://cetus-1.gitbook.io/cetus-developer-docs/developer/via-dlmm-contract) — the DLMM protocol on Sui
 - [CDPM (LeafSheep)](https://github.com/randyPen/cdpm) — the PositionManager permission abstraction; user funds never leave the user's own vault
 - Scallop + Kai SAV — lending yield sources

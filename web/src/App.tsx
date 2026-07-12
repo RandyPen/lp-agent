@@ -56,7 +56,7 @@ export function App() {
             LIQUIDITY<span className="text-ink">MANAGER</span>
           </span>
           <span className="font-mono text-ink-3 hidden text-[11px] sm:inline">
-            open-source LP-agent template · self-host for your own users
+            open-source LP-agent framework · self-host for your own users
           </span>
         </div>
         <div className="flex items-center gap-3">
@@ -107,7 +107,7 @@ export function App() {
 
       <footer className="text-ink-3 mt-16 flex items-center justify-between gap-4 text-xs">
         <span>
-          Reference portal from the open-source <b className="text-ink-2">lp-agent template</b>{" "}
+          Reference portal from the open-source <b className="text-ink-2">lp-agent framework</b>{" "}
           (Apache-2.0) — each operator self-hosts it for their own users. Non-custodial: the agent
           can never withdraw, only the owner can.
         </span>
