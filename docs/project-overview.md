@@ -1,7 +1,7 @@
 # LiquidityManager — Project Overview
 
 > Companion to `module-and-testing.md`, `treasury-role-design.md`, and `forecasting-approach.md`.
-> Last updated: 2026-06-11 (v1 rewrite landed). ~16 kLOC TypeScript/Bun + SQLite, plus the `ml/` Python pipeline (uv-managed). 572 bun tests across 31 files + 100 pytest tests, typecheck clean.
+> Last updated: 2026-06-11 (v1 rewrite landed). ~16 kLOC TypeScript/Bun + SQLite, plus the `ml/` Python pipeline (uv-managed). 900+ bun tests + ~100 pytest tests, typecheck clean.
 
 This document answers four questions: what this project is, what's actually built, what's intentionally left out (so forks know where to extend), and what's still on the punch list before this template is mainnet-validated.
 

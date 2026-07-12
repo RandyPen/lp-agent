@@ -1,6 +1,7 @@
 import { ConfigError } from "./lib/errors.ts";
 import { loadPoolProfile, type PoolProfile } from "./pools/index.ts";
 import { isStrategyName, listStrategyNames, type StrategyName } from "./strategies/registry.ts";
+import { isPriceFeedName, listPriceFeedNames } from "./data/feedRegistry.ts";
 import { DEFAULT_STATE_PARAMS, type StateParams } from "./state/params.ts";
 
 export type Network = "mainnet" | "testnet" | "devnet";
@@ -56,10 +57,23 @@ export interface TreasuryAppConfig {
 }
 
 /**
- * Configuration for the Python prediction sidecar (v1 ML layer).
- * See `docs/prediction-service-design.md §4` and `implementation-plan-v1.md §9`.
+ * Which `PredictionProvider` implementation backs the `mlAgent` strategy.
+ *
+ *   "sidecar" — HTTP to the Python inference sidecar (ml/). The production path.
+ *   "null"    — the deterministic, rule-based NullPredictionProvider. No Python,
+ *               no network, no model artifacts. Use it to run the full ML
+ *               decision graph (state machine, probation, predictions table) on
+ *               a machine that has no sidecar.
+ *
+ * A fork can also bypass this entirely by exporting `prediction` from
+ * agent.config.ts.
  */
+export type PredictionProviderKind = "sidecar" | "null";
+
+/** Configuration for the prediction layer (v1 ML). */
 export interface PredictionAppConfig {
+  /** Which provider implementation to construct. Default: "sidecar". */
+  provider: PredictionProviderKind;
   /** Base URL of the local Python inference sidecar. Default: http://127.0.0.1:8377 */
   sidecarUrl: string;
   /** HTTP request timeout in ms. After this, SidecarPredictionProvider returns fallback="timeout". */
@@ -204,7 +218,12 @@ export interface AppConfig {
   eventPollIntervalMs: number;
   rebalanceIntervalMs: number;
   perPmCooldownMs: number;
-  priceFeed: "onchain" | "pyth" | "binance";
+  /**
+   * Name of a feed in the price-feed registry (src/data/feedRegistry.ts).
+   * Built-ins: "onchain" | "binance". A fork can register more via
+   * agent.config.ts, so this is a validated string, not a closed union.
+   */
+  priceFeed: string;
   strategy: StrategyName;
   /**
    * When true (the default), the rebalancer submits a single unified PTB per
@@ -319,15 +338,25 @@ function parseNetwork(raw: string): Network {
   throw new ConfigError(`SUI_NETWORK must be mainnet|testnet|devnet, got '${raw}'`);
 }
 
+/**
+ * Validated against the feed registry rather than a literal union, so a feed a
+ * fork registered in agent.config.ts is accepted here. `pyth` used to be listed
+ * as a valid value and then process.exit(1)'d at startup — it is now simply not
+ * registered, and the error below tells you how to add it.
+ */
 function parsePriceFeed(raw: string): AppConfig["priceFeed"] {
-  if (raw === "onchain" || raw === "pyth" || raw === "binance") return raw;
-  throw new ConfigError(`PRICE_FEED must be onchain|pyth|binance, got '${raw}'`);
+  if (isPriceFeedName(raw)) return raw;
+  throw new ConfigError(
+    `PRICE_FEED must be one of [${listPriceFeedNames().join(", ")}], got '${raw}'. ` +
+      `To add your own, export it from agent.config.ts (see agent.config.example.ts).`,
+  );
 }
 
 function parseStrategy(raw: string): StrategyName {
   if (isStrategyName(raw)) return raw;
   throw new ConfigError(
-    `STRATEGY must be one of [${listStrategyNames().join(", ")}], got '${raw}'`,
+    `STRATEGY must be one of [${listStrategyNames().join(", ")}], got '${raw}'. ` +
+      `To add your own, export it from agent.config.ts (see agent.config.example.ts).`,
   );
 }
 
@@ -487,12 +516,17 @@ export function loadConfig(): AppConfig {
     }
   }
 
-  // Prediction sidecar config (v1 ML layer).
+  // Prediction layer (v1 ML).
   const predictionTimeoutMs = Number(optional("PREDICTION_TIMEOUT_MS", "2000"));
   if (!Number.isFinite(predictionTimeoutMs) || predictionTimeoutMs <= 0) {
     errs.push(`PREDICTION_TIMEOUT_MS must be a positive number, got '${process.env.PREDICTION_TIMEOUT_MS ?? ""}'`);
   }
+  const predictionProviderRaw = optional("PREDICTION_PROVIDER", "sidecar").trim();
+  if (predictionProviderRaw !== "sidecar" && predictionProviderRaw !== "null") {
+    errs.push(`PREDICTION_PROVIDER must be sidecar|null, got '${predictionProviderRaw}'`);
+  }
   const prediction: PredictionAppConfig = {
+    provider: (predictionProviderRaw === "null" ? "null" : "sidecar") as PredictionProviderKind,
     sidecarUrl: optional("PREDICTION_SIDECAR_URL", "http://127.0.0.1:8377"),
     timeoutMs: predictionTimeoutMs,
   };

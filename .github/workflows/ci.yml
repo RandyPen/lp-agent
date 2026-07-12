@@ -5,6 +5,73 @@ on:
   pull_request:
 
 jobs:
+  # Everything below this job runs against the working tree. This one runs
+  # against ONLY THE TRACKED FILES — which is what a fork actually clones.
+  #
+  # It exists because the repo once shipped docs, a README quickstart, and a
+  # runtime error message that all pointed at scripts/ files while the entire
+  # scripts/ directory was gitignored: 0 of 32 shipped. Everything passed CI,
+  # because CI never looked at the tree a stranger gets. A latched L3 emergency
+  # stop told the operator to run a script that did not exist.
+  #
+  # So: extract the tracked tree, and prove a fork can get to a signal with no
+  # credentials at all.
+  fresh-clone:
+    name: Fresh clone (tracked files only, zero credentials)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Extract the tracked tree (exactly what a fork clones)
+        run: |
+          mkdir -p /tmp/fresh
+          git archive HEAD | tar -x -C /tmp/fresh
+          echo "--- tracked scripts/ ---"
+          ls /tmp/fresh/scripts/ || echo "(none)"
+
+      - name: Every script referenced by tracked docs/runtime must exist
+        working-directory: /tmp/fresh
+        run: |
+          # Collect scripts/<name> mentions from the files a fork actually reads,
+          # then assert each one is present. This is the regression guard.
+          refs=$(grep -rhoE 'scripts/[a-zA-Z0-9._-]+\.ts' \
+                   README.md CLAUDE.md docs/ .env.example src/ 2>/dev/null | sort -u)
+          missing=0
+          for ref in $refs; do
+            if [ ! -f "$ref" ]; then
+              echo "::error::$ref is referenced by a tracked file but does not ship"
+              missing=1
+            else
+              echo "ok: $ref"
+            fi
+          done
+          exit $missing
+
+      - name: Install
+        working-directory: /tmp/fresh
+        run: bun install
+
+      # Seeds from the committed fixture, NOT from Binance: api.binance.com is
+      # geo-blocked on most CI runners, and a build that depends on a live
+      # third-party API goes red for reasons unrelated to the code.
+      - name: Offline loop — seed history, replay a strategy (no keys, no network)
+        working-directory: /tmp/fresh
+        run: |
+          bun run seed-fixture
+          bun run backtest --pool-id=binance:SUIUSDC --strategy=presenceAnchor
+
+      - name: Fork seam — a custom strategy must run WITHOUT editing framework files
+        working-directory: /tmp/fresh
+        run: |
+          cp agent.config.example.ts agent.config.ts
+          bun run backtest --pool-id=binance:SUIUSDC --strategy=example
+          # The whole point: registering a strategy left the framework untouched.
+          if ! git -C "$GITHUB_WORKSPACE" diff --quiet -- src/strategies/registry.ts src/pools/index.ts src/config.ts; then
+            echo "::error::framework files were modified to register a strategy — the seam is not working"
+            exit 1
+          fi
+
   ts:
     name: TypeScript (typecheck + tests)
     runs-on: ubuntu-latest

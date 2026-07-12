@@ -7,7 +7,16 @@
     "start": "bun run src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "backtest": "bun run src/backtest/cli.ts"
+
+    "shadow": "bun run src/shadowStandalone.ts",
+    "backtest": "bun run src/backtest/cli.ts",
+    "seed-fixture": "bun run scripts/seed-fixture.ts",
+    "collect-historical": "bun run scripts/collect-historical.ts",
+    "shadow-report": "bun run scripts/shadow-report.ts",
+
+    "verify-agent": "bun run scripts/verify-agent-address.ts",
+    "probe-bin-orientation": "bun run scripts/probe-bin-orientation.ts",
+    "risk-reset": "bun run scripts/risk-reset-emergency.ts"
   },
   "dependencies": {
     "@cetusprotocol/dlmm-sdk": "latest",

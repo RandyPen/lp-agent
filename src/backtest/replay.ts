@@ -171,8 +171,31 @@ export async function runBacktest(input: BacktestInput): Promise<BacktestResult>
     const pool = buildPool(input.profile, obs);
     const history = historyFor(input.observations, i, input.historyWindowMs);
 
+    // Inject positionValue, exactly as the live rebalancer does.
+    //
+    // Strategies are contracted to size adds from `balance + feeBag +
+    // positionValue` — the value they are about to free by removing the current
+    // position. In production the rebalancer dryRuns the remove prefix
+    // (estimateRemoveProceeds) and injects the haircutted proceeds before
+    // re-running plan(). Without this, a strategy that honours that contract
+    // sees zero deployable capital on every tick after its first deployment
+    // (the add drained `balance`) and can never recenter — the backtest would
+    // silently under-report rebalance frequency for correctly-written
+    // strategies. The sim tracks per-bin amounts exactly, so no dryRun and no
+    // haircut are needed here.
+    const pmForPlan: PMState =
+      pm.positionBins.length > 0
+        ? {
+            ...pm,
+            positionValue: pm.positionBins.reduce(
+              (acc, b) => ({ a: acc.a + b.amountA, b: acc.b + b.amountB }),
+              { a: 0n, b: 0n },
+            ),
+          }
+        : pm;
+
     const output = await strategy.plan({
-      pm,
+      pm: pmForPlan,
       pool,
       spot: obs,
       history,

@@ -106,6 +106,45 @@ describe("runBacktest", () => {
     expect(result.summary.uniqueBinsTouched).toBeGreaterThan(1);
   });
 
+  it("injects positionValue so a recenter actually redeploys the freed principal", async () => {
+    // Regression: the replay used to call plan() without injecting
+    // `positionValue` (the value a strategy is about to free by removing its
+    // position). The live rebalancer injects it from a dryRun of the remove
+    // prefix, and strategies are contracted to size adds from
+    // `balance + feeBag + positionValue`.
+    //
+    // Without it, every tick after the first deployment saw grossA/grossB == 0
+    // (the add had drained `balance`), so recenters emitted plans with EMPTY
+    // adds: the position was removed and never redeployed. The old "emits
+    // multiple rebalances" test missed this because it only counts plan KINDS
+    // — an empty plan still counts as a rebalance. So assert the plans place
+    // real liquidity, not merely that they exist.
+    const obs = syntheticObservations(50, 2.5, 100, 1_000_000, 60_000, 7);
+    const result = await runBacktest({
+      profile: testProfile(),
+      strategyName: "singleBin",
+      observations: obs,
+      initialBalanceA: 100_000_000_000n,
+      initialBalanceB: 250_000_000n,
+      historyWindowMs: 30 * 60 * 1000,
+    });
+
+    const plans = result.ticks
+      .map((t) => t.output)
+      .filter((o) => o.kind === "plan_and_reconcile" || o.kind === "plan_only")
+      .map((o) => (o as { plan: { addBins: number[]; addAmountA: bigint; addAmountB: bigint } }).plan);
+
+    expect(plans.length).toBeGreaterThan(1);
+
+    // The FIRST plan can always size from the opening balance. It is the ones
+    // AFTER it — where the only capital available is the position being
+    // removed — that regress to empty when positionValue is missing.
+    for (const plan of plans.slice(1)) {
+      expect(plan.addBins.length).toBeGreaterThan(0);
+      expect(plan.addAmountA + plan.addAmountB).toBeGreaterThan(0n);
+    }
+  });
+
   it("multiBinSpot deploys across multiple bins on first tick", async () => {
     const obs = syntheticObservations(10, 2.5, 20, 1_000_000, 60_000);
     const result = await runBacktest({

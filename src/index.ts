@@ -1,8 +1,8 @@
 import { loadConfig } from "./config.ts";
 import { openDb, getDb } from "./db/client.ts";
 import { getAgentAddress } from "./sui/keypair.ts";
-import { createOnchainPriceFeed } from "./data/feeds/onchain.ts";
-import { createBinancePriceFeed } from "./data/feeds/binance.ts";
+import { loadExtensions, getCustomPredictionProvider } from "./kit/loadExtensions.ts";
+import { buildPriceFeed } from "./data/feedRegistry.ts";
 import type { PriceFeed } from "./data/priceFeed.ts";
 import { createSubscriptionsService } from "./services/subscriptions.ts";
 import { createExecutorService } from "./services/executor.ts";
@@ -18,8 +18,16 @@ import { log } from "./lib/logger.ts";
 
 // ML / shadow mode imports — only used when STRATEGY=mlAgent or ML_SHADOW_MODE=true.
 import type { MlAgentDeps, StrategyName } from "./strategies/registry.ts";
+import type { PredictionProvider } from "./prediction/provider.ts";
 
 async function main(): Promise<void> {
+  // 0. Register the fork's strategies / pools / feeds from agent.config.ts.
+  //
+  // MUST precede loadConfig(): config validates STRATEGY, POOL_PROFILE and
+  // PRICE_FEED against the registries, so a fork's entries have to be in them
+  // first. No agent.config.ts (the reference agent's own case) = built-ins only.
+  await loadExtensions();
+
   // 1. Load config — fails fast on missing env vars.
   const cfg = loadConfig();
 
@@ -47,21 +55,11 @@ async function main(): Promise<void> {
     shadowMode: cfg.ml.shadowMode,
   });
 
-  // 4. Create the price feed. Currently `onchain` (Cetus SwapEvent) and
-  // `binance` (public Binance REST) are implemented; `pyth` is a stub for
-  // downstream forks.
-  let priceFeed: PriceFeed;
-  switch (cfg.priceFeed) {
-    case "onchain":
-      priceFeed = createOnchainPriceFeed(cfg.poolProfile);
-      break;
-    case "binance":
-      priceFeed = createBinancePriceFeed(cfg.poolProfile);
-      break;
-    case "pyth":
-      log.error("price feed not yet implemented", { priceFeed: cfg.priceFeed });
-      process.exit(1);
-  }
+  // 4. Create the price feed. Built-ins are `onchain` (Cetus SwapEvent) and
+  // `binance` (public Binance REST); a fork can register its own (e.g. Pyth)
+  // in agent.config.ts. An unknown name already failed validation in
+  // loadConfig, so this cannot miss.
+  const priceFeed: PriceFeed = buildPriceFeed(cfg.priceFeed, cfg.poolProfile);
 
   // 5. Create and initially poll subscriptions so we backfill on first start.
   const subscriptionsService = createSubscriptionsService();
@@ -164,9 +162,19 @@ async function main(): Promise<void> {
       params: cfg.stateParams,
     });
 
-    // Prediction provider: sidecar in production; null provider if sidecar not configured.
-    let predictionProvider;
-    {
+    // Prediction provider, in precedence order:
+    //   1. agent.config.ts `prediction` — a fork's own model/service.
+    //   2. PREDICTION_PROVIDER=null — the deterministic rule-based provider.
+    //      Runs the whole ML decision graph with no Python and no network.
+    //   3. PREDICTION_PROVIDER=sidecar (default) — HTTP to the ml/ sidecar.
+    let predictionProvider: PredictionProvider;
+    const customProvider = getCustomPredictionProvider();
+    if (customProvider) {
+      predictionProvider = customProvider();
+    } else if (cfg.prediction.provider === "null") {
+      const { createNullPredictionProvider } = await import("./prediction/nullProvider.ts");
+      predictionProvider = createNullPredictionProvider();
+    } else {
       const { createSidecarPredictionProvider } = await import("./prediction/sidecarProvider.ts");
       predictionProvider = createSidecarPredictionProvider({
         baseUrl: cfg.prediction.sidecarUrl,
@@ -188,7 +196,8 @@ async function main(): Promise<void> {
     };
 
     log.info("liquidity-manager: ML graph wired up", {
-      sidecarUrl: cfg.prediction.sidecarUrl,
+      predictionProvider: predictionProvider.name,
+      sidecarUrl: cfg.prediction.provider === "sidecar" ? cfg.prediction.sidecarUrl : undefined,
       fallbackStrategy: cfg.fallbackStrategy,
       liveStrategy: cfg.strategy,
       shadowMode: cfg.ml.shadowMode,

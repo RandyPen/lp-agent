@@ -27,21 +27,28 @@ import { SuiJsonRpcClient } from "@mysten/sui/jsonRpc";
 import { openDb } from "./db/client.ts";
 import { createBinancePriceFeed } from "./data/feeds/binance.ts";
 import { createShadowFleet } from "./services/shadowFleet.ts";
-import { buildSuiUsdcProfile } from "./pools/sui-usdc.ts";
-import { isStrategyName, type StrategyName } from "./strategies/registry.ts";
+import { loadPoolProfile } from "./pools/index.ts";
+import { loadExtensions } from "./kit/loadExtensions.ts";
+import { isStrategyName, listStrategyNames, type StrategyName } from "./strategies/registry.ts";
 import { log } from "./lib/logger.ts";
 
-function main(): void {
-  const profile = buildSuiUsdcProfile();
-  if (!profile.poolId) {
-    throw new Error("shadowStandalone: SUI_USDC_POOL_ID must be set");
-  }
+async function main(): Promise<void> {
+  // Register the fork's strategies/pools before any name is resolved below.
+  await loadExtensions();
+
+  // Goes through the pool registry (not buildSuiUsdcProfile directly) so a
+  // fork can shadow its own pool with POOL_PROFILE=<name>.
+  const profile = loadPoolProfile(process.env.POOL_PROFILE ?? "sui-usdc");
 
   const namesRaw = process.env.SHADOW_FLEET?.trim() || "presenceAnchor,presenceSweep";
   const strategies: StrategyName[] = [];
   for (const name of namesRaw.split(",").map((s) => s.trim()).filter(Boolean)) {
     if (!isStrategyName(name) || name === "mlAgent") {
-      throw new Error(`shadowStandalone: unsupported shadow strategy '${name}'`);
+      throw new Error(
+        `shadowStandalone: unsupported shadow strategy '${name}'. ` +
+          `Available: ${listStrategyNames().filter((n) => n !== "mlAgent").join(", ")} ` +
+          `(mlAgent needs the live prediction graph and cannot run in the fleet).`,
+      );
     }
     strategies.push(name);
   }
@@ -81,4 +88,9 @@ function main(): void {
   process.once("SIGTERM", () => teardown("SIGTERM"));
 }
 
-main();
+main().catch((err: unknown) => {
+  log.error("shadowStandalone: fatal error", {
+    error: err instanceof Error ? (err.stack ?? err.message) : String(err),
+  });
+  process.exit(1);
+});

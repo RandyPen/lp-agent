@@ -27,9 +27,45 @@ docs/treasury-role-design.md
 docs/x-article.md
 docs/system-status-and-gaps.md
 
-# The entire scripts/ directory is operator-local (verification probes,
-# bootstrap helpers, treasury ops) and stays untracked.
-/scripts/
+# scripts/ is untracked BY DEFAULT — one-off probes and operator-local
+# diagnostics belong here and must never ship (CLAUDE.md §"Verification
+# scripts"). But a fork cannot operate the agent without a small reusable
+# subset: the tracked docs, the README quickstart, and the runtime itself
+# (src/risk/emergency.ts) all point at these. They are whitelisted below.
+#
+# Rule of thumb: if a TRACKED doc or src/ file names the script, it must be
+# whitelisted here. Everything else — including anything under scripts/local/
+# — stays operator-local.
+/scripts/*
+!/scripts/README.md
+
+# Recovery + verification
+!/scripts/risk-reset-emergency.ts
+!/scripts/fund-address-balance.ts
+!/scripts/verify-agent-address.ts
+!/scripts/verify-treasury-address.ts
+!/scripts/verify-data-coverage.ts
+!/scripts/probe-bin-orientation.ts
+!/scripts/probe-cdpm-package.ts
+
+# Historical data + offline evaluation
+!/scripts/seed-fixture.ts
+!/scripts/collect-historical.ts
+!/scripts/backfill-cetus-events.ts
+!/scripts/shadow-report.ts
+
+# Web portal demo mode (WEB_DEMO_MODE)
+!/scripts/seed-demo-data.ts
+!/scripts/serve-demo-api.ts
+
+# Treasury operator CLI (opt-in feature, but a fork that enables it needs a
+# way to get funds back out)
+!/scripts/treasury-register-user.ts
+!/scripts/treasury-list-users.ts
+!/scripts/treasury-list-balances.ts
+!/scripts/treasury-update-rate.ts
+!/scripts/treasury-sweep.ts
+!/scripts/treasury-refund.ts
 
 # Web portal build output (web/ sources are tracked; dist is generated)
 web/dist/

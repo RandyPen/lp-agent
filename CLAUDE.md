@@ -35,7 +35,7 @@ Design directions captured from the operator's internal design notes (a Chinese-
 
 ## Repository Status
 
-Open-source quant agent (~18 kLOC TypeScript, 860+ tests / 48 files; plus the `ml/` Python pipeline, ~100 pytest tests). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`, ML pipeline under `ml/`. The v1 rewrite landed: `src/prediction` (PredictionProvider + sidecar client), `src/state` (three-state machine), `src/risk` (L1/L2/L3), `src/decision`, `src/data/feeds/{binanceMulti,derivatives,cetusEvents}` + `src/data/marketAggregator`, `src/strategies/mlAgent`, `src/services/shadowRunner`, and the uv-managed `ml/` sidecar (LightGBM quantile training + FastAPI serving). `Strategy.plan` is now async. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the module layout. `README.md` is the entry point for fork users.
+Open-source quant agent (~18 kLOC TypeScript, 900+ tests; plus the `ml/` Python pipeline, ~100 pytest tests). Source under `src/`, tests under `tests/`, scripts under `scripts/`, docs under `docs/`, ML pipeline under `ml/`. The v1 rewrite landed: `src/prediction` (PredictionProvider + sidecar client), `src/state` (three-state machine), `src/risk` (L1/L2/L3), `src/decision`, `src/data/feeds/{binanceMulti,derivatives,cetusEvents}` + `src/data/marketAggregator`, `src/strategies/mlAgent`, `src/services/shadowRunner`, and the uv-managed `ml/` sidecar (LightGBM quantile training + FastAPI serving). `Strategy.plan` is now async. See `docs/project-overview.md` for a current state map and `docs/module-and-testing.md` for the module layout. `README.md` is the entry point for fork users.
 
 ### Load-bearing execution facts (2026-07 wiring/correctness pass)
 
@@ -51,15 +51,17 @@ Open-source quant agent (~18 kLOC TypeScript, 860+ tests / 48 files; plus the `m
 
 - Runtime preference: **Bun** for TS. The ML pipeline (`ml/`) is a separate **uv**-managed Python project — two toolchains total, no cargo. The `web/` portal is a third standalone Bun package (Vite + React 19 + `@mysten/dapp-kit-react` 2.x, own lockfile, never imported by the agent runtime); its data channel is the bind-local HTTP API (`src/web/routes.ts` mounted into `src/treasury/httpApi.ts`), and its dev proxy maps `/v1` → `127.0.0.1:8378`.
 - **CDPM deployment (2026-07-09)**: `src/sui/cdpm/package.ts` points at the current fresh publish `0x573584cc…` (feeHouse/accessList/adminCap/globalRecord all changed vs the old `0x3e9261…` deployment — it was a re-publish, not an upgrade, so event types from the old id never match). `web/src/lib/cdpm.ts` mirrors these ids and the EnrollWizard refuses to sign if `/v1/agent/summary`'s `cdpmPackage` disagrees. Verified on mainnet via `scripts/probe-cdpm-package.ts`.
-- **`.gitignore` layout** (the §2.1 open-source cleanup landed — `tests/` and the public docs are tracked; `scripts/` is fully local):
+- **`.gitignore` layout** (`tests/`, the public docs, and a whitelisted subset of `scripts/` are tracked):
   - Root markdown (`README.md`, `CLAUDE.md`) is tracked; the operator's Chinese-named internal notes file at the repo root stays local (ignored via an ASCII-only pattern).
   - `docs/` — only the English docs are tracked (`docs/README.md`, `docs/project-overview.md`). The detailed Chinese design documents (`implementation-plan-v1.md`, `data-sources.md`, `forecasting-approach.md`, `prediction-service-design.md`, `decision-engine-design.md`, `backtest-framework-design.md`, `risk-monitoring-design.md`, `module-and-testing.md`, `treasury-role-design.md`, `seal-integration.md`, `project-background.md`, `x-article.md`) are ignored per-file and exist only on the operator's machine — they are NOT in the public repo. References to them elsewhere in this file remain valid for the operator but will not resolve in a fresh clone.
   - `/tests` — tracked (first trust signal for an open-source repo).
-  - `/scripts/` — the ENTIRE directory is ignored. All scripts (verification probes, bootstrap helpers, treasury ops, historical-data collectors) are operator-local; nothing under `scripts/` ships in the public repo, and the runtime never imports from it.
+  - `agent.config.example.ts` + `user/` — tracked. A fork copies the example to `agent.config.ts` and commits it in ITS repo; upstream never creates one.
+  - `/scripts/*` — **ignored by default, with an explicit whitelist** (see `.gitignore` + `scripts/README.md`). One-off probes and machine-specific diagnostics go in `scripts/local/` and never ship. But the reusable operator subset IS tracked, because the tracked docs and the runtime reference it.
+    - **Invariant: if a tracked file (README, CLAUDE.md, `docs/`, `.env.example`, or anything under `src/`) names a `scripts/<x>.ts`, that script MUST be whitelisted.** This was violated once — the whole directory was blanket-ignored while `src/risk/emergency.ts` told operators to run `scripts/risk-reset-emergency.ts` to clear a latched L3 stop, and `src/sui/submit.ts` pointed at `scripts/fund-address-balance.ts` for gas. Both shipped as dangling references; a fork that tripped L3 was bricked. The `fresh-clone` CI job now enforces this.
   - `/data` — SQLite database directory, ignored.
   - `.env`, `.env.local` — never commit secrets.
   - `ml/.gitignore` keeps `ml/artifacts/`, `ml/data/parquet/`, `ml/reports/`, `.venv` out of git; `ml/uv.lock` IS tracked for reproducibility.
-  - CI (`.github/workflows/ci.yml`) runs `bunx tsc --noEmit` + `bun test` and `uv run pytest` (in `ml/`) on every push / PR. License: Apache-2.0 (`LICENSE`).
+  - CI (`.github/workflows/ci.yml`): `bunx tsc --noEmit` + `bun test`, the `web/` build, `uv run pytest` (in `ml/`), and a **`fresh-clone` job** that extracts only the tracked tree (`git archive HEAD`) and proves a fork with zero credentials can collect history, replay a strategy, and register its own strategy without touching `src/`. License: Apache-2.0 (`LICENSE`).
 
 ## Verification scripts (convention)
 
@@ -178,16 +180,36 @@ Any code that appears to bypass these constraints is wrong by construction — v
 
 ## Extension points for downstream forks
 
-Downstream forks add their own features without forking the framework.
-Five explicit seams, each with a one-line / one-file extension recipe:
+**The load-bearing rule: a fork must never have to edit a file under `src/`.**
+
+Strategies, pools, feeds and the prediction model all register at RUNTIME from
+`agent.config.ts` (repo root) via `defineAgent()` — see `src/kit/defineAgent.ts`
+and `src/kit/loadExtensions.ts`. The fork's own code lives in `user/`.
+
+Neither path is ever written to by upstream, so a fork pulls upstream forever
+without a merge conflict. (They are deliberately NOT gitignored — the fork
+commits them; conflict-freedom comes from upstream not touching them.)
+
+This replaced the old design, where `StrategyName` was a closed union and pools
+were a closed map, so registering anything meant patching a framework file and
+re-resolving the same conflict on every pull. **Do not reintroduce a closed
+union over an extension seam.**
 
 | Extension | Interface | Recipe |
 |---|---|---|
-| **New strategy** | `src/strategies/types.ts → Strategy` | Implement `Strategy.plan() → StrategyOutput`; register in `src/strategies/registry.ts`; add to `StrategyName` union. Reference: `multiBinSpot.ts`. |
-| **New pool profile** | `src/pools/types.ts → PoolProfile` | New file `src/pools/<pair>.ts` exporting `build<Pair>Profile() → PoolProfile`; register in `src/pools/index.ts → BUILDERS`. Reference: `sui-usdc.ts`. |
-| **New lending protocol** | `src/sui/lending/types.ts → LendingProtocol` union + adapter pattern | Mirror `src/sui/lending/scallop.ts`; extend `LendingProtocol`; extend `pickHighestApy` in router; add entries to `LENDING_OPPORTUNITIES`. |
+| **New strategy** | `src/strategies/types.ts → Strategy` | Implement `plan() → StrategyOutput`, then `defineAgent({ strategies: [createMine()] })`. Select with `STRATEGY=mine`. Reference: `user/exampleStrategy.ts`, `multiBinSpot.ts`. |
+| **New pool profile** | `src/pools/types.ts → PoolProfile` | Pure data. `defineAgent({ pools: [{ name, build }] })`; select with `POOL_PROFILE=`. **Run `bun run probe-bin-orientation` first on any non-SUI/USDC pool** and set `poolCoinAIsQuote` from what it reports. Reference: `sui-usdc.ts`. |
+| **New price feed** | `src/data/priceFeed.ts → PriceFeed` | `defineAgent({ feeds: { pyth: (profile) => ... } })`; select with `PRICE_FEED=pyth`. Built-ins live in `src/data/feedRegistry.ts`. |
+| **New prediction model** | `src/prediction/provider.ts → PredictionProvider` | `defineAgent({ prediction: () => createMine() })`, or pick a shipped impl with `PREDICTION_PROVIDER=sidecar\|null`. `null` = NullPredictionProvider: the full ML graph with no Python. The framework never knows what is behind the interface. |
+| **New lending protocol** | `src/sui/lending/types.ts → LendingProtocol` union + adapter pattern | **Still a framework edit** (the one remaining closed seam): mirror `scallop.ts`; extend `LendingProtocol`; extend `pickHighestApy` in router; add to `LENDING_OPPORTUNITIES`. |
 | **New lendable coin** | `src/sui/lending/lendingConfig.ts → LENDING_OPPORTUNITIES` + `MIN_LENDING_DELTA_RAW` + `SCALLOP_RESERVES`; `kaiVaults.ts → KAI_VAULTS` if Kai-supported | Edit three (or four) lists — no code change. Operator runbook in `feedback_lending_whitelist.md` (memory). |
-| **New prediction model** (v1+) | `src/prediction/provider.ts → PredictionProvider` | Implement `predict(snapshot, ctx) → PredictionResponse`; swap your own sidecar / remote service / Rust impl behind it. Reference: `sidecarProvider.ts`. The framework never knows what model is behind the interface. |
+
+Ordering constraint: `loadExtensions()` runs BEFORE `loadConfig()` in every
+entrypoint (`src/index.ts`, `src/shadowStandalone.ts`, `src/backtest/cli.ts`),
+because config validates `STRATEGY` / `POOL_PROFILE` / `PRICE_FEED` against the
+registries. Consequence: **a module under `user/` must not call `loadConfig()`
+at module scope.** A missing `agent.config.ts` = built-ins only (documented,
+intentional); a broken one aborts startup — never a silent fallback.
 
 When extending the agent with LLM intelligence / news / external signals,
 do NOT wire them into the framework. Prefer one of:

@@ -4,7 +4,7 @@
 
 It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. There is no central service: each deployer owns their own risk policy, capital limits, fee design, and trained model. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, and σ matters more than μ **literally**: walk-forward analysis falsified our own price-direction predictor (the q50 center placed no better than spot), so we removed it and kept only the volatility head, placing liquidity as a σ-scaled band centered on spot. Directional posture is handled by rule-based regime gates, not a trained center head — the burden of proof to reintroduce one is documented in `docs/decision-remove-center-prediction.md`.
 
-Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K LOC, 930+ bun tests + ~120 pytest tests, Apache-2.0.
+Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K LOC, 900+ bun tests + ~100 pytest tests, Apache-2.0.
 
 **v1 has landed**: the ML prediction pipeline lives in-tree — a Python training + inference sidecar (`ml/`, managed with uv; **vol-only by design** — the mean-price head was falsified by walk-forward and removed, see `docs/decision-remove-center-prediction.md`), the `mlAgent` strategy, a three-state machine (`src/state`), layered circuit-breaker risk controls (`src/risk`), and shadow mode (`src/services/shadowRunner`). **The repo ships the pipeline and the framework, not trained models** — model artifacts stay out of git; forks retrain on the same pipeline. Bring your own strategies, your own pools, your own models.
 
@@ -92,7 +92,40 @@ flowchart TB
 
 > The repo ships the framework and the pipeline drawn above — **not** the trained model that sits behind the `PredictionProvider` seam. Forks train their own. See [`docs/project-overview.md`](./docs/project-overview.md) for the module-level map.
 
-## Quick start
+## Try it in 5 minutes (no keys, no wallet, no chain writes)
+
+You do **not** need a mnemonic, a funded address, or a `PositionManager` to see
+a strategy run. Two credential-free loops ship in the box:
+
+```bash
+bun install
+
+# A. Replay a strategy over real history — offline, no network at all.
+#    Seeds from a committed fixture (1 day of 1m SUI/USDC closes).
+bun run seed-fixture
+bun run backtest --pool-id=binance:SUIUSDC --strategy=presenceAnchor
+
+# B. Run strategies against the LIVE market on a hypothetical book.
+#    Fills a simulated position from real on-chain SwapEvents and never signs
+#    anything. Needs a pool id, no secrets.
+SUI_USDC_POOL_ID=0x<dlmm-pool> bun run shadow
+```
+
+For real, current, longer history use `bun run collect-historical` (public
+Binance klines) instead of the fixture.
+
+> **Region note:** `api.binance.com` is geo-blocked in some jurisdictions (incl.
+> the US), which affects `collect-historical` and the `binance` price feed. The
+> fixture path above needs no network; for live use, point `BINANCE_BASE_URL` at
+> a reachable mirror, or run with `PRICE_FEED=onchain` (Cetus `SwapEvent`), which
+> has no such dependency.
+
+`backtest` is a **decision trace** (trigger frequency, bins touched) — it has no
+fee/IL/gas accounting, so don't rank strategies by return with it. `shadow` is
+the honest evaluator: real fills, real market, zero capital at risk. Score a run
+with `bun run shadow-report`.
+
+## Quick start (live, on mainnet)
 
 ```bash
 # 1. Install
@@ -108,19 +141,27 @@ cp .env.example .env                     # edit in your secrets
                                          # ML / risk env vars (sidecar URL, shadow mode,
                                          # risk thresholds) are documented in .env.example.
 
-# 3. Verify key derivation
-#    Derive the address from your mnemonic at AGENT_DERIVATION_PATH and
-#    compare it with EXPECTED_AGENT_ADDRESS — the runtime enforces the
-#    match at startup and aborts on mismatch. (scripts/ is operator-local
-#    and not shipped; write your own probe there, see CLAUDE.md.)
+# 3. Verify key derivation — the mnemonic must derive EXPECTED_AGENT_ADDRESS.
+#    Probes the common Sui BIP44 paths and reports which matched. Never prints
+#    key material. The runtime enforces the same match at startup.
+bun run verify-agent
+
+#    On a pool other than SUI/USDC, ALSO run this — it confirms on-chain which
+#    side of the active bin holds which physical coin. Getting it backwards is
+#    the most expensive bug in a DLMM agent; this repo shipped it once already.
+bun run probe-bin-orientation
 
 # 4. Static integrity
-bun run typecheck && bun test            # should be 930+ pass
-cd ml && uv sync && uv run pytest        # (optional) ML pipeline, ~100 pass
+bun run typecheck && bun test
+cd ml && uv sync && uv run pytest        # (optional) ML pipeline
 
 # 5. Run
 bun start
 ```
+
+If the L3 emergency stop ever latches, it **survives restarts** — clear it with
+`bun run risk-reset "<reason>"`, then restart. See `scripts/README.md` for the
+full operator toolkit.
 
 ## Extension points (the core value of the framework)
 
@@ -210,42 +251,79 @@ export function createMyStrategy(): Strategy {
 }
 ```
 
-**Register** — three edits, all in `src/strategies/registry.ts`:
+**Register** — in `agent.config.ts`, a file the framework never writes to:
 
 ```ts
-import { createMyStrategy } from "./myStrategy.ts";        // 1. import
+// agent.config.ts   (cp agent.config.example.ts agent.config.ts)
+import { defineAgent } from "./src/kit/defineAgent.ts";
+import { createMyStrategy } from "./user/myStrategy.ts";
 
-export type StrategyName =
-  | "singleBin" | "multiBinSpot"
-  | "presenceAnchor" | "presenceSweep" | "mlAgent"
-  | "myStrategy";                                          // 2. add to the union
-
-const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
-  // ...existing...
-  myStrategy: () => createMyStrategy(),                    // 3. add to BUILDERS
-};
+export default defineAgent({
+  strategies: [createMyStrategy()],
+});
 ```
 
-The `StrategyName` union is **exhaustive and type-checked** — if you forget to register, `bun run typecheck` fails. That's the seam working: registration is compiler-enforced, not convention.
+That's it — **you never edit a file under `src/`.** Your strategy lives in
+`user/`, your wiring lives in `agent.config.ts`, and both are yours. Because
+upstream never touches those paths, you can `git pull` this framework forever
+without a merge conflict. (They are *not* gitignored — commit them to your fork
+like any other source.)
+
+If `agent.config.ts` is absent you simply get the built-ins. If it's present but
+broken, **startup fails loudly** — a custody agent must never quietly run a
+different strategy than the one you configured.
 
 **Run it**: `STRATEGY=myStrategy bun start`.
 
-**Validate before you go live** (all provided by the framework, no extra wiring for the first two):
+**Validate before you go live** — in escalating order of realism, none of which
+costs you a cent:
 
-- `bun run typecheck && bun test` — the exhaustive union + the strategy test suite catch wiring errors.
-- Add a unit test under `tests/strategies/` (copy `tests/strategies/presenceAnchor.test.ts` — feed a fixture `StrategyInput`, assert the `StrategyOutput`). No chain needed.
-- **Shadow mode** — validate the decisions against a rule baseline on live market data with **zero capital at risk** before submitting a single PTB (`src/services/shadowRunner`, `ML_SHADOW_MODE=true`; score with `shadow-report`). The shadow harness currently compares against the rule baseline — slot your strategy in as the candidate to A/B it.
+1. `bun run typecheck && bun test`.
+2. **Replay it offline** — no keys, no chain:
+   `bun run collect-historical && bun run backtest --pool-id=binance:SUIUSDC --strategy=myStrategy`.
+   This is a *decision trace* (trigger frequency, bins touched); it has no
+   fee/IL/gas accounting, so don't rank strategies by return with it.
+3. **Shadow it against the live market** — real prices, real on-chain
+   `SwapEvent` fills into a hypothetical book, **zero capital at risk**:
+   `STRATEGY=myStrategy bun run shadow`, then score with `bun run shadow-report`.
+4. Only then point a funded `PositionManager` at it.
 
-References: `singleBin.ts` (109 lines, simplest) · `multiBinSpot.ts` (probability-distribution placement) · `presenceAnchor.ts` (regime-gated, declares a 4h `historyWindowMs`).
+References: `user/exampleStrategy.ts` (a complete worked example, written to be
+edited) · `singleBin.ts` (109 lines, simplest built-in) · `multiBinSpot.ts`
+(probability-distribution placement) · `presenceAnchor.ts` (regime-gated,
+declares a 4h `historyWindowMs`).
 
 ### 2. Add a pool profile
 
+A `PoolProfile` is **pure data** — ids, decimals, bin step, orientation, per-coin
+lending knobs. Declare it in `agent.config.ts`; no framework file changes:
+
 ```ts
-// src/pools/eth-usdc.ts
-export function buildEthUsdcProfile(): PoolProfile { /* ... */ }
+export default defineAgent({
+  pools: [{ name: "eth-usdc", build: () => buildEthUsdcProfile() }],
+});
 ```
 
-Add one line to the `BUILDERS` map in `src/pools/index.ts`. Then `POOL_PROFILE=eth-usdc bun start`.
+Then `POOL_PROFILE=eth-usdc bun start`.
+
+> ⚠️ **On any pool that is not SUI/USDC, run `bun run probe-bin-orientation` first**
+> and set `poolCoinAIsQuote` from what it reports. "Bin id up" does **not** mean
+> "price up" — the SUI/USDC pool is inverted. Guessing puts every bin on the
+> wrong side of the market; this repo shipped that bug once already.
+
+### 2b. Add a price feed
+
+`PriceFeed` (`src/data/priceFeed.ts`) is a three-method interface. Register an
+implementation under the name `PRICE_FEED` selects:
+
+```ts
+export default defineAgent({
+  feeds: { pyth: (profile) => createPythPriceFeed(profile) },
+});
+```
+
+Then `PRICE_FEED=pyth bun start`. Built-ins: `onchain` (Cetus `SwapEvent`) and
+`binance` (public REST).
 
 ### 3. Add a lending protocol
 
@@ -272,7 +350,24 @@ export interface PredictionProvider {
 }
 ```
 
-Implement `PredictionProvider` and plug in your own sidecar / remote service / local implementation — the framework does not change. References: `src/prediction/sidecarProvider.ts` (HTTP → Python sidecar) and `nullProvider.ts` (rule-based fallback). The training pipeline lives in `ml/` (uv-managed, LightGBM vol model — quantile loss on the volatility head only; the center head was falsified and removed, see `docs/decision-remove-center-prediction.md`); forks rebuild the training set with the shipped collectors (`cd ml && uv run python -m data.collectors.binance_klines --start … --end …`) and train their own.
+Implement `PredictionProvider` and register it — the framework does not change:
+
+```ts
+export default defineAgent({
+  prediction: () => createMyPredictionProvider(),
+});
+```
+
+Two implementations ship: `sidecarProvider.ts` (HTTP → the Python sidecar) and
+`nullProvider.ts` (deterministic, rule-based, **no Python and no network**).
+Select between them with `PREDICTION_PROVIDER=sidecar|null` — so you can run the
+whole ML decision graph, including `mlAgent`, on a machine with no sidecar:
+
+```bash
+STRATEGY=mlAgent PREDICTION_PROVIDER=null bun run shadow
+```
+
+The training pipeline lives in `ml/` (uv-managed, LightGBM vol model — quantile loss on the volatility head only; the center head was falsified and removed, see `docs/decision-remove-center-prediction.md`); forks rebuild the training set with the shipped collectors (`cd ml && uv run python -m data.collectors.binance_klines --start … --end …`) and train their own.
 
 ## What you bring
 
