@@ -92,13 +92,14 @@ The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `ml
 ## 3. What's actually built
 
 ### Strategy & rebalancing
-- Four registered strategies (`src/strategies/registry.ts`; `Strategy.plan` is async as of v1):
+- Six registered strategies (`src/strategies/registry.ts`; `Strategy.plan` is async as of v1):
+  - `presenceAnchor` / `presenceSweep` — the presence architecture (mainline candidates, under forward shadow A/B on real SwapEvents): NORMAL/TREND/DEFENSE regime nowcast from realized vol-ratio + drift-z, σ-scaled width, clamped 4h-anchor reversion tilt (NORMAL-only), withdraw-only defense with idle → lending; `presenceSweep` adds the anchor-boundary flip-sweep / fillBoundary freeze discipline.
   - `singleBin` — P0 baseline: all liquidity in the active bin, re-centre on drift.
-  - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights.
-  - `emaTrend` — dual-EMA (12/26) trend classifier; tent-shaped weights, range center offset by ±halfWidth/2 toward trend side, ×1.5 skew on the trend side.
+  - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights; the Tier 0 fallback.
+  - `emaTrend` — reference implementation only, not recommended live: dual-EMA (12/26) trend-biased placement; its premise (predictable short-horizon direction) measured at coin-flip accuracy in walk-forward and OOS (`decision-remove-center-prediction.md`).
   - `mlAgent` — v1 main strategy: consumes `PredictionProvider` output (vol-head σ width + range-break probabilities; the range always centers on the active bin — the center prediction head was falsified and removed, see `decision-remove-center-prediction.md`) + the three-state machine's parameters; explicit Tier 0 fallback to rule strategies when the sidecar is unavailable (built via `buildStrategy("mlAgent", mlDeps)`).
 - `StrategyOutput` 4-state union (`plan_and_reconcile | plan_only | reconcile_only | quiet`).
-- `fillBoundary` persistence in `position_state` (table exists; only consumed by future bid-ask-style strategies — v0 strategies don't write it).
+- `fillBoundary` persistence in `position_state` (consumed by `presenceSweep`'s freeze discipline; other strategies don't write it).
 - **Unified rebalance PTB** behind `UNIFIED_TX=true` flag — atomic DLMM ops, single gas envelope. I32 → u32 two's-complement bit serialisation handled correctly in both legacy and unified paths.
 
 ### Price feeds

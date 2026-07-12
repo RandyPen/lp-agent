@@ -1,16 +1,20 @@
 # LP Agent
 
-> An **open-source agent template** — a reference implementation you fork and operate yourself, not a hosted app — for an **autonomous, on-chain-delegated quant operator** that forecasts the short-term price *distribution* and shapes Cetus DLMM liquidity around it — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
+> An **open-source agent template** — a reference implementation you fork and operate yourself, not a hosted app — for an **autonomous, on-chain-delegated quant operator** that forecasts short-term **volatility** (not price direction) and shapes Cetus DLMM liquidity as a vol-scaled band around the market — earning swap fees, capturing buy-low/sell-high spread, and parking idle capital in lending — all while running **inside a Move permission boundary that makes withdrawal impossible**. The user keeps custody; the agent can touch the position, never the exit.
 
-It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. There is no central service: each deployer owns their own risk policy, capital limits, fee design, and trained model. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, σ matters more than μ, so place liquidity across bins weighted by a forecast distribution (q10/q50/q90) instead of chasing spot.
+It plugs into [LeafSheep](https://app.leafsheep.xyz)'s `PositionManager` delegation slot, auto-discovers work from on-chain `AgentAdded` events, and submits each rebalance as one atomic PTB. There is no central service: each deployer owns their own risk policy, capital limits, fee design, and trained model. The design thesis is laid out in the essay *"Market Making Is a Forecasting Problem: The Design of an Open-Source LP Agent for Sui"* — LP is a forecasting problem, and σ matters more than μ **literally**: walk-forward analysis falsified our own price-direction predictor (the q50 center placed no better than spot), so we removed it and kept only the volatility head, placing liquidity as a σ-scaled band centered on spot. Directional posture is handled by rule-based regime gates, not a trained center head — the burden of proof to reintroduce one is documented in `docs/decision-remove-center-prediction.md`.
 
-Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~16K LOC, 572 bun tests + ~100 pytest tests, Apache-2.0.
+Bun + TypeScript + SQLite (agent) · uv + Python, LightGBM (ML pipeline). ~18K LOC, 930+ bun tests + ~120 pytest tests, Apache-2.0.
 
-**v1 has landed**: the ML prediction pipeline lives in-tree — a Python training + inference sidecar (`ml/`, managed with uv), the `mlAgent` strategy, a three-state machine (`src/state`), layered circuit-breaker risk controls (`src/risk`), and shadow mode (`src/services/shadowRunner`). **The repo ships the pipeline and the framework, not trained models** — model artifacts stay out of git; forks retrain on the same pipeline. Bring your own strategies, your own pools, your own models.
+**v1 has landed**: the ML prediction pipeline lives in-tree — a Python training + inference sidecar (`ml/`, managed with uv; **vol-only by design** — the mean-price head was falsified by walk-forward and removed, see `docs/decision-remove-center-prediction.md`), the `mlAgent` strategy, a three-state machine (`src/state`), layered circuit-breaker risk controls (`src/risk`), and shadow mode (`src/services/shadowRunner`). **The repo ships the pipeline and the framework, not trained models** — model artifacts stay out of git; forks retrain on the same pipeline. Bring your own strategies, your own pools, your own models.
 
 ## What it does
 
-- **Algorithmic rebalancing** — four built-in strategies (`singleBin` / `multiBinSpot` / `emaTrend` / `mlAgent`) covering three paradigms: probability-distribution placement, trend-biased placement, and ML-prediction-driven placement; each rebalance is submitted as one atomic PTB. `mlAgent` degrades explicitly to a Tier 0 rule-based strategy when the sidecar is unavailable.
+- **Algorithmic rebalancing** — six registered strategies, each rebalance submitted as one atomic PTB:
+  - **`presenceAnchor` / `presenceSweep`** (mainline, under forward shadow A/B) — regime-gated market *presence*: NORMAL/TREND/DEFENSE nowcast from realized vol-ratio + drift, σ-scaled width, a clamped 4h-anchor reversion tilt, and withdraw-only defense (the agent has no taker permission — leaving the market IS the defense). `presenceSweep` adds the anchor-boundary flip-sweep / freeze discipline.
+  - **`multiBinSpot`** (Tier 0) — rule-based log-normal distribution placement; the explicit fallback whenever the ML sidecar is degraded. **`singleBin`** — simplest reference baseline.
+  - **`mlAgent`** — consumes the vol model through `PredictionProvider` (σ width + range-break probabilities; the range always centers on the active bin — no direction is predicted, by evidence, not by omission).
+  - **`emaTrend`** — retained as a reference implementation only: its premise (predictable short-horizon direction) measured at coin-flip accuracy both in walk-forward and out-of-sample (`docs/decision-remove-center-prediction.md`). Not recommended for live use.
 - **Idle-asset lending** — Scallop + Kai SAV integration, APY-aware router (25 bps Scallop tie-break), per-coin dust thresholds.
 - **Multi-source price feeds** — on-chain Cetus `SwapEvent` and Binance REST implementations behind one `PriceFeed` interface, sharing a `price_observations` history table.
 - **Automatic PM discovery** — the agent address is derived from `MNEMONICS`, the agent listens for on-chain `AgentAdded` events and adds the `PositionManager` to its monitor; `AgentRemoved` / `PositionManagerClosed` remove it automatically.
@@ -45,7 +49,7 @@ flowchart TB
         AGG --> REB
         REB --> RISK{"Risk gate<br/>L1 / L2 / L3"}
         RISK --> STATE["State machine<br/>NORMAL · TREND · EXTREME"]
-        STATE --> STRAT["Strategy<br/>singleBin · multiBinSpot<br/>emaTrend · mlAgent"]
+        STATE --> STRAT["Strategy<br/>presenceAnchor · presenceSweep<br/>multiBinSpot · singleBin · mlAgent"]
         AGG --> FC["Forecast layer · rule-based<br/>σ + bin weights (Tier 0)"]
         FC -- "rule-based forecast" --> STRAT
         STRAT --> EXEC["Executor<br/>builds one atomic PTB"]
@@ -111,7 +115,7 @@ cp .env.example .env                     # edit in your secrets
 #    and not shipped; write your own probe there, see CLAUDE.md.)
 
 # 4. Static integrity
-bun run typecheck && bun test            # should be 572 pass
+bun run typecheck && bun test            # should be 930+ pass
 cd ml && uv sync && uv run pytest        # (optional) ML pipeline, ~100 pass
 
 # 5. Run
@@ -124,21 +128,115 @@ Five clearly carved extension seams — each has a ready-made interface; one reg
 
 ### 1. Add a strategy
 
+A strategy is one file implementing the `Strategy` interface (`src/strategies/types.ts`). It is a **pure decision function**: given a market snapshot it returns *what to do*, and the framework owns everything else — risk gating, atomic PTB execution, lending of idle capital, custody boundary, journaling, shadow validation. **You write `plan()`; the template provides the rest.**
+
+**The interface** — three members, only `plan` is required:
+
+```ts
+export interface Strategy {
+  readonly name: string;
+  readonly historyWindowMs?: number;              // price history you need (default 5 min)
+  plan(input: StrategyInput): Promise<StrategyOutput>;
+}
+```
+
+**What `plan()` receives** (`StrategyInput`):
+
+| Field | Type | What it is |
+|---|---|---|
+| `pm` | `PMState` | Your PM: `balance.{a,b}`, `feeBag.{a,b}`, `positionBins[]`, `lending`, `positionValue` — all **PHYSICAL** coin amounts (coinA/coinB as the pool holds them) |
+| `pool` | `PoolState` | `activeBinId`, `binStep`, `feeRateBps` |
+| `spot` | `PriceObservation` | Current quote price (coinB-per-coinA, decimal-adjusted) + timestamp |
+| `history` | `PriceObservation[]` | Price history over `historyWindowMs`. **This is your feature source** — feed it to your own σ estimator, LLM client, external signal, anything |
+| `profile` | `PoolProfile` | Pool metadata + orientation. Route every bin↔price decision through `src/domain/binMath.ts` (`humanPriceForBin` / `binDirection` / `orientationOf`) |
+
+**What `plan()` returns** — one of four `StrategyOutput` kinds:
+
+| Kind | Meaning |
+|---|---|
+| `{ kind: "plan_and_reconcile", plan }` | Execute the rebalance PTB **and** run lending reconciliation (cover shortfall + deploy idle). The normal path. |
+| `{ kind: "plan_only", plan }` | Execute the rebalance, skip lending (tactical move, e.g. fee harvest) |
+| `{ kind: "reconcile_only", reason }` | No rebalance — just capture idle yield / cover a shortfall |
+| `{ kind: "quiet", reason }` | Do nothing this tick |
+
+The `plan` you build is a `RebalancePlan` (`src/domain/types.ts`): `removeShares` (drained first), then `addBins[]` / `addAmountsA[]` / `addAmountsB[]` (placed second, same length), `collectFees`, and a free-form `reason` captured into the journal.
+
+**Two contracts your `plan` must honor** (both verified on mainnet — see `CLAUDE.md` → *Load-bearing execution facts*):
+
+- **Bin orientation** — bins **above** the active bin hold physical **coinA** only; bins **below** hold **coinB** only; **never place on the active bin** (composition-fee policy). Split your capital by side accordingly. Do not assume "bin up = price up" — the SUI/USDC pool is inverted; go through `binMath.ts`.
+- **Sizing** — size `addAmounts*` from the **pre-remove** snapshot (`pm.balance` + fee bag when `collectFees` + `pm.positionValue`). The rebalancer re-scales your per-bin amounts to the actual post-remove balances, so you work in ratios, not realized amounts.
+
+**Skeleton** (copy `multiBinSpot.ts` — 286 lines, zero ML deps — and replace only the distribution step with your alpha):
+
 ```ts
 // src/strategies/myStrategy.ts
-import type { Strategy } from "./types.ts";
+import type { Strategy, StrategyInput, StrategyOutput } from "./types.ts";
+import { orientationOf } from "../domain/binMath.ts";
 
 export function createMyStrategy(): Strategy {
   return {
     name: "myStrategy",
-    async plan(input) {
-      // return { kind: "plan_and_reconcile", plan } | { kind: "quiet" } | ...
+    historyWindowMs: 60 * 60 * 1000,             // e.g. 1h — omit for the 5-min default
+    async plan(input: StrategyInput): Promise<StrategyOutput> {
+      const { pm, pool, spot, history, profile } = input;
+
+      // 0. Guard: empty PM / bad price → quiet
+      if (pm.balance.a === 0n && pm.balance.b === 0n && pm.positionBins.length === 0)
+        return { kind: "quiet", reason: "myStrategy: empty PM" };
+
+      // 1. YOUR ALPHA: turn `history` (+ optional PredictionProvider, external
+      //    signal, LLM call) into a target bin range + per-bin weights.
+      const orientation = orientationOf(profile);
+      // ... compute targetBins, weights ...
+
+      // 2. Split capital by the physical-side rule (bins above active → coinA,
+      //    below → coinB, active excluded); build addBins / addAmountsA / addAmountsB.
+
+      // 3. Decide trigger (recenter? drift? fees-only?) and return:
+      return {
+        kind: "plan_and_reconcile",
+        plan: {
+          pmId: pm.pmId,
+          removeShares: new Map(/* current bins → shares, to redeploy from scratch */),
+          addAmountA: 0n, addAmountB: 0n,
+          addBins: [], addAmountsA: [], addAmountsB: [],
+          collectFees: pm.feeBag.a > 0n || pm.feeBag.b > 0n,
+          reason: "myStrategy: recenter",
+          plannedActiveBinId: pool.activeBinId,
+        },
+      };
     },
   };
 }
 ```
 
-Register: add one line in `src/strategies/registry.ts` and one member to the `StrategyName` union. Then `STRATEGY=myStrategy bun start`. References: `singleBin.ts` / `multiBinSpot.ts`.
+**Register** — three edits, all in `src/strategies/registry.ts`:
+
+```ts
+import { createMyStrategy } from "./myStrategy.ts";        // 1. import
+
+export type StrategyName =
+  | "singleBin" | "multiBinSpot" | "emaTrend"
+  | "presenceAnchor" | "presenceSweep" | "mlAgent"
+  | "myStrategy";                                          // 2. add to the union
+
+const BUILDERS: Record<Exclude<StrategyName, "mlAgent">, () => Strategy> = {
+  // ...existing...
+  myStrategy: () => createMyStrategy(),                    // 3. add to BUILDERS
+};
+```
+
+The `StrategyName` union is **exhaustive and type-checked** — if you forget to register, `bun run typecheck` fails. That's the seam working: registration is compiler-enforced, not convention.
+
+**Run it**: `STRATEGY=myStrategy bun start`.
+
+**Validate before you go live** (all provided by the framework, no extra wiring for the first two):
+
+- `bun run typecheck && bun test` — the exhaustive union + the strategy test suite catch wiring errors.
+- Add a unit test under `tests/strategies/` (copy `tests/strategies/presenceAnchor.test.ts` — feed a fixture `StrategyInput`, assert the `StrategyOutput`). No chain needed.
+- **Shadow mode** — validate the decisions against a rule baseline on live market data with **zero capital at risk** before submitting a single PTB (`src/services/shadowRunner`, `ML_SHADOW_MODE=true`; score with `shadow-report`). The shadow harness currently compares against the rule baseline — slot your strategy in as the candidate to A/B it.
+
+References: `singleBin.ts` (109 lines, simplest) · `multiBinSpot.ts` (probability-distribution placement) · `presenceAnchor.ts` (regime-gated, declares a 4h `historyWindowMs`).
 
 ### 2. Add a pool profile
 
@@ -174,7 +272,7 @@ export interface PredictionProvider {
 }
 ```
 
-Implement `PredictionProvider` and plug in your own sidecar / remote service / local implementation — the framework does not change. References: `src/prediction/sidecarProvider.ts` (HTTP → Python sidecar) and `nullProvider.ts` (rule-based fallback). The training pipeline lives in `ml/` (uv-managed, LightGBM quantile models); forks rebuild the training set with the shipped collectors (`cd ml && uv run python -m data.collectors.binance_klines --start … --end …`) and train their own.
+Implement `PredictionProvider` and plug in your own sidecar / remote service / local implementation — the framework does not change. References: `src/prediction/sidecarProvider.ts` (HTTP → Python sidecar) and `nullProvider.ts` (rule-based fallback). The training pipeline lives in `ml/` (uv-managed, LightGBM vol model — quantile loss on the volatility head only; the center head was falsified and removed, see `docs/decision-remove-center-prediction.md`); forks rebuild the training set with the shipped collectors (`cd ml && uv run python -m data.collectors.binance_klines --start … --end …`) and train their own.
 
 ## What you bring
 
@@ -186,7 +284,7 @@ Implement `PredictionProvider` and plug in your own sidecar / remote service / l
 
 ## Web portal (`web/`)
 
-A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dapp-kit-react` v2, dark quant-terminal UI. It is the user entry point for the agent:
+A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dapp-kit-react` v2, dark quant-terminal UI. **It is part of the template**: every operator who forks lp-agent self-hosts this portal for their own users — the front door where a user connects a wallet, enrolls a `PositionManager`, authorizes the operator's agent, tops up, and watches every rebalance on-chain. Fork it, rebrand it, or replace it — the agent only depends on the bind-local HTTP API, never on this UI. When the API serves the seeded demo dataset (`scripts/serve-demo-api.ts` sets `WEB_DEMO_MODE`), the portal shows a **"DEMO DATA"** banner so sample NAV / fees / rebalance figures are never mistaken for real performance. Its pages:
 
 - **Enroll** — create a custody `PositionManager` + add liquidity (tx 1), then whitelist the agent operator (tx 2). The agent's `AgentAdded` watcher picks the PM up automatically; the wizard cross-checks that the portal and the running agent point at the same CDPM deployment before signing.
 - **Dashboard** — NAV per PM, cumulative fee income, three-state timeline, live L1/L2/L3 risk events.
