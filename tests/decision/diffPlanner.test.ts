@@ -2,9 +2,10 @@
  * Tests for src/decision/diffPlanner.ts
  *
  * Coverage:
- *   - NORMAL state: weight construction (normal-shaped, center offset clipped)
+ *   - NORMAL state: weight construction (normal-shaped, centered on active bin)
  *   - TREND state: weak-trend bias, strong-trend 25% reverse position
  *   - EXTREME state: full withdrawal plan
+ *   - computeTargetCenterBin: always the active bin (center head removed)
  *   - Tolerance guard: returns null when position is already close enough
  *   - PTB op-count hard limit: shrink to ≤ 6 ops (property-style, widths 2..8)
  *   - Fee-aware ask-min filter
@@ -12,7 +13,12 @@
  */
 
 import { describe, it, expect } from "bun:test";
-import { diffPlan, countPlanOps, type DiffPlanInput } from "../../src/decision/diffPlanner.ts";
+import {
+  diffPlan,
+  countPlanOps,
+  computeTargetCenterBin,
+  type DiffPlanInput,
+} from "../../src/decision/diffPlanner.ts";
 import type { PMState, PoolState } from "../../src/domain/types.ts";
 import type { StateContext, PredictionResponse } from "../../src/prediction/types.ts";
 import type { PoolProfile } from "../../src/pools/types.ts";
@@ -72,7 +78,6 @@ function makeCtx(state: StateContext["state"], overrides: Partial<StateContext> 
     strongTrend: Math.abs(overrides.trendBias ?? 0) > 0.7,
     lendingPct: state === "EXTREME" ? 1 : state === "TREND" ? 0.5 : 0.35,
     toleranceBins: 2,
-    maxCenterOffset: 2,
     minDwellMs: state === "EXTREME" ? 10 * 60 * 1000 : 15 * 60 * 1000,
     ...overrides,
   };
@@ -80,9 +85,6 @@ function makeCtx(state: StateContext["state"], overrides: Partial<StateContext> 
 
 function makePred(overrides: Partial<PredictionResponse> = {}): PredictionResponse {
   return {
-    centerOffset: 0,
-    centerQ10: -2,
-    centerQ90: 2,
     widthSigma: 2,
     pAbove: 0.4,
     pBelow: 0.4,
@@ -199,19 +201,25 @@ describe("diffPlan — NORMAL state", () => {
     }
   });
 
-  it("clips center offset to ±maxCenterOffset (from ctx.maxCenterOffset — F5)", () => {
-    // maxCenterOffset = 1 (explicit), pred centerOffset = 10 → should be clipped to ±1
-    const ctx = makeCtx("NORMAL", { toleranceBins: 1, maxCenterOffset: 1, halfWidth: 2 });
-    const pred = makePred({ centerOffset: 10 });
-    const plan = diffPlan(makeInput({ ctx, pred }));
+  // "clips center offset to ±maxCenterOffset (F5)" removed with the center prediction head (docs/decision-remove-center-prediction.md)
+  it("computeTargetCenterBin always returns the active bin (center head removed)", () => {
+    // The predicted center offset was removed 2026-07 — the plan build centers
+    // on the active bin in every state (docs/decision-remove-center-prediction.md).
+    for (const state of ["NORMAL", "TREND", "EXTREME"] as const) {
+      expect(computeTargetCenterBin(state, 0)).toBe(0);
+      expect(computeTargetCenterBin(state, 100)).toBe(100);
+      expect(computeTargetCenterBin(state, -5990)).toBe(-5990);
+    }
+  });
+
+  it("NORMAL plan bins are centered on the active bin", () => {
+    const ctx = makeCtx("NORMAL", { toleranceBins: 1, halfWidth: 2 });
+    const plan = diffPlan(makeInput({ ctx, pool: makePool(0, 0) }));
     expect(plan).not.toBeNull();
-    // The actual bins should be centered around active + 1 (clipped), not active + 10.
     const bins = plan!.addBins;
-    const maxBin = Math.max(...bins);
-    const minBin = Math.min(...bins);
-    // With halfWidth=2, max bin from center+1 is 1+2=3, min is 1-2=-1.
-    expect(maxBin).toBeLessThanOrEqual(3);
-    expect(minBin).toBeGreaterThanOrEqual(-1);
+    // With halfWidth=2 around active bin 0: bins within [-2, 2], active excluded.
+    expect(Math.max(...bins)).toBeLessThanOrEqual(2);
+    expect(Math.min(...bins)).toBeGreaterThanOrEqual(-2);
   });
 
   it("returns null for fully empty PM with no position", () => {
@@ -234,7 +242,7 @@ describe("diffPlan — tolerance guard (returns null)", () => {
     // exclude is not a position the planner could ever actually build — see
     // the F1 quiet-gate regression tests below, which cover exactly that
     // "position matches only what survives the filter" scenario explicitly.
-    const pred = makePred({ widthSigma: 5, centerOffset: 0 });
+    const pred = makePred({ widthSigma: 5 });
     const ctx = makeCtx("NORMAL", { halfWidth: 3, toleranceBins: 2 });
     const pool = makePool();
 
@@ -256,7 +264,7 @@ describe("diffPlan — tolerance guard (returns null)", () => {
   });
 
   it("does NOT return null when position is out of range (active bin drifted far)", () => {
-    const pred = makePred({ widthSigma: 2, centerOffset: 0 });
+    const pred = makePred({ widthSigma: 2 });
     const ctx = makeCtx("NORMAL", { halfWidth: 3, toleranceBins: 1 });
 
     // Position at bins 10–16, but active is at 0 → center drift = 13, toleranceBins = 1
@@ -291,7 +299,7 @@ describe("diffPlan — F1 quiet-gate: filtered-bin basis consistency", () => {
   // this orientation.
   const POOL = makePool(0, 40);
   const CTX = makeCtx("NORMAL", { halfWidth: 3, toleranceBins: 2 });
-  const PRED = makePred({ widthSigma: 2, centerOffset: 0 });
+  const PRED = makePred({ widthSigma: 2 });
 
   function roundTrip(profile: PoolProfile) {
     const pm0 = makePm({ balanceA: 1_000_000n, balanceB: 1_000_000n });
@@ -343,9 +351,9 @@ describe("diffPlan — TREND state (weak)", () => {
     expect(totalBidA + totalAskB).toBeGreaterThan(0n);
   });
 
-  it("TREND center is always the active bin (not predicted offset)", () => {
+  it("TREND center is always the active bin", () => {
     const ctx = makeCtx("TREND", { trendBias: 0.3, halfWidth: 3 });
-    const pred = makePred({ centerOffset: 5 }); // large offset that would be ignored
+    const pred = makePred();
     const pool = makePool(100); // active at 100
     const pm = makePm({ balanceA: 1_000_000_000n, balanceB: 1_000_000n });
     const plan = diffPlan(makeInput({ pm, pool, ctx, pred }));
@@ -451,7 +459,7 @@ describe("countPlanOps — PTB hard limit", () => {
 
   it("property: diffPlan output always has plan-only ops ≤ 6 across halfWidths 2..8", () => {
     const pool = makePool(100, 40);
-    const pred = makePred({ widthSigma: 2, centerOffset: 1 });
+    const pred = makePred({ widthSigma: 2 });
 
     for (let hw = 2; hw <= 8; hw++) {
       const ctx = makeCtx("NORMAL", { halfWidth: hw, toleranceBins: 1 });

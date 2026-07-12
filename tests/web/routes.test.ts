@@ -137,7 +137,7 @@ function seedPnlTick(pmId: string, tsMs: number, navUsd: number): void {
 function seedPrediction(tsMs: number): void {
   getDb()
     .prepare(
-      "INSERT INTO predictions (pool_id, ts_ms, model_version, active_bin, center_q10, center_offset, center_q90, width_sigma, p_above, p_below, feature_completeness, psi, fallback, executed_path, infer_ms) VALUES (?, ?, 'v1.0', 100, -2.0, 0.5, 3.0, 1.2, 0.4, 0.3, 1.0, 0.05, NULL, 'model', 12)",
+      "INSERT INTO predictions (pool_id, ts_ms, model_version, active_bin, width_sigma, p_above, p_below, feature_completeness, psi, fallback, executed_path, infer_ms) VALUES (?, ?, 'v1.0', 100, 1.2, 0.4, 0.3, 1.0, 0.05, NULL, 'model', 12)",
     )
     .run(POOL_ID, tsMs);
 }

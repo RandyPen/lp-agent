@@ -16,7 +16,7 @@ LiquidityManager is an **open-source quantitative liquidity-custody agent** for 
 7. **Extension points** — `Strategy`, `PoolProfile`, `PriceFeed`, lending adapter pattern, `kaiVaults` config, per-user Seal reader (v2) — all explicit seams documented in `README.md` / `docs/`
 
 **What v1 added in-tree** (per `docs/implementation-plan-v1.md` — pipeline yes, alpha no; landed):
-- ML prediction pipeline: Python training + inference **sidecar** (`ml/`, uv-managed; LightGBM quantile models; training and serving share the same `ml/features/` code). TS consumes it only through the `PredictionProvider` interface (`src/prediction/`). **No Rust / napi in v1** — decision cadence is minutes, sub-ms inference buys nothing; revisit via the same interface in v2 if cadence drops to seconds.
+- ML prediction pipeline: Python training + inference **sidecar** (`ml/`, uv-managed; LightGBM **vol-only** since 2026-07 — the q10/q50/q90 center heads were falsified by walk-forward and removed, see `docs/decision-remove-center-prediction.md`; training and serving share the same `ml/features/` code). TS consumes it only through the `PredictionProvider` interface (`src/prediction/`). **No Rust / napi in v1** — decision cadence is minutes, sub-ms inference buys nothing; revisit via the same interface in v2 if cadence drops to seconds.
 - Three-state machine (`NORMAL` / `TREND` / `EXTREME`) with continuous width/bias parameters — deliberately NOT the six-state design from early drafts.
 - Layered risk controls (L1/L2/L3) + shadow mode, built **before** the model lands (W1–2): for a custody product, circuit breakers and audit logs are the product; the model is swappable alpha.
 - Trained model artifacts stay out of git — the repo ships the pipeline and reproducibility (data window + seed + git sha in `models_meta.json`); forks train their own.
@@ -222,7 +222,7 @@ These are loaded in this environment. Reach for them by name when their domain c
 
 Resolved by the v1 plan (`docs/implementation-plan-v1.md`; don't re-litigate, but flag evidence that contradicts them):
 
-- **Probability model for bin weighting**: LightGBM quantile regression (q10/q50/q90 + vol) → normal-shaped weights; rule-based log-normal (`multiBinSpot`) stays as Tier 0 fallback.
+- **Probability model for bin weighting**: ~~LightGBM quantile regression (q10/q50/q90 + vol)~~ **OVERTURNED by evidence 2026-07** (`docs/decision-remove-center-prediction.md`): walk-forward showed the q50 center placed worse than spot (MAE ratio 1.009–1.012) and direction ≈ coin flip, while the vol head beat the EWMA baseline by 20–25 %. The pipeline is vol-only: normal-shaped weights centered on the ACTIVE BIN with σ from the vol head; rule-based log-normal (`multiBinSpot`) stays as Tier 0 fallback. Directional intelligence lives in rule-based regime gates (presence strategies), never in a trained center head — the burden of proof to reintroduce one is in the decision doc.
 - **Rebalance trigger**: hybrid — state-machine eval intervals (20/15/1 min) + event-driven (active-bin drift ≥ tolerance, p_break jump, risk signals).
 - **Inference architecture**: Python sidecar behind `PredictionProvider`; no Rust in v1 (decision record in `docs/prediction-service-design.md` §1.2).
 - **Training data**: 6–12 months Binance backfill; Cetus-side features deferred to v1.1 (insufficient history).

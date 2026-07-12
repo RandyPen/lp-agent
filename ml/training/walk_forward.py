@@ -1,18 +1,20 @@
-"""Walk-forward evaluation with purged k-fold + embargo (plan W3 gate).
+"""Walk-forward evaluation with purged k-fold + embargo (vol head).
 
-Overlapping 30-min labels leak across a naive time split: a sample at T and a
-sample at T+1 share 29 minutes of future window. Purging removes the
+Overlapping horizon labels leak across a naive time split: a sample at T and a
+sample at T+1 share horizon−1 minutes of future window. Purging removes the
 ``purge`` (= label horizon) training bars immediately before each test fold;
 the embargo removes ``embargo`` bars immediately after it.
 
-Metrics (the falsifiable W3 gates, simulator-independent):
+Metrics (REVISED 2026-07 — the center/quantile heads were removed after this
+protocol falsified them; see docs/decision-remove-center-prediction.md):
 
-* pinball loss (mean over q10/q50/q90) vs the rule baseline
-  (center = 0, width from the EWMA-σ feature scaled to the horizon)
-  → gate: model < 0.9 × baseline
-* q10–q90 empirical coverage → gate: 76–84 %
-* q50 direction accuracy + one-sided binomial test → gate: > 52 %, p < 0.05
-* vol model MAE vs EWMA-σ baseline (informational)
+* vol MAE vs the EWMA-σ feature baseline
+  → THE gate: model < 0.9 × baseline
+* σ-band calibration (INFORMATIONAL): empirical coverage of
+  ±1.28 × σ̂ × √h / ln(1+bin_step) against the realized end-of-horizon bin
+  offset. Target ≈ 80 %. This guards the σ-scaling constant that serving's
+  pAbove/pBelow computation depends on; it is not a gate because band width
+  is a serving calibration knob, not a model property.
 
 Writes ``reports/wf_<date>.json``.
 
@@ -31,14 +33,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from data.collectors.binance_klines import parse_utc_ms
-from data.labels import DEFAULT_BIN_STEP, DEFAULT_HORIZON_BARS
+from data.labels import DEFAULT_BIN_STEP, DEFAULT_HORIZON_BARS, future_offset
 from data.parquet_writer import DEFAULT_DATA_ROOT
-from training.train_quantile import (
+from training.train_vol import (
     DEFAULT_SEED,
-    QUANTILES,
     build_training_set,
     load_canonical_frame,
     train_models,
@@ -46,13 +46,11 @@ from training.train_quantile import (
 
 DEFAULT_N_SPLITS = 5
 DEFAULT_REPORTS_DIR = Path("reports")
-Z_90 = float(stats.norm.ppf(0.9))  # 1.2816 — converts σ to the 10/90 quantile band
+Z_80_BAND = 1.28  # ±1.28 σ ≈ the 80 % equal-tailed interval of a normal
 
 GATES = {
-    "pinball_ratio_max": 0.9,
-    "coverage_range": (0.76, 0.84),
-    "direction_accuracy_min": 0.52,
-    "direction_pvalue_max": 0.05,
+    # vol head must beat the EWMA-σ persistence baseline by ≥ 10 %.
+    "vol_mae_ratio_max": 0.9,
 }
 
 
@@ -83,45 +81,26 @@ def purged_kfold_indices(
     return folds
 
 
-def pinball_loss(y: np.ndarray, pred: np.ndarray, alpha: float) -> float:
-    """Mean quantile (pinball) loss at level ``alpha``."""
-    diff = y - pred
-    return float(np.mean(np.maximum(alpha * diff, (alpha - 1.0) * diff)))
+def sigma_to_bins(sigma_per_bar: np.ndarray, horizon: int, bin_step: float) -> np.ndarray:
+    """Per-bar σ → σ of the end-of-horizon offset in bin units (√h scaling).
+    The SAME constant serving uses to build widthSigma from the vol head."""
+    return sigma_per_bar * np.sqrt(horizon) / np.log(1.0 + bin_step)
 
 
-def baseline_quantiles(
-    ewma_sigma_per_bar: np.ndarray,
+def band_coverage(
+    realized_offset: np.ndarray,
+    sigma_per_bar: np.ndarray,
     horizon: int,
     bin_step: float,
-) -> dict[str, np.ndarray]:
-    """Rule baseline: center 0, q10/q90 = ∓z₉₀ · σ_horizon in bin units."""
-    sigma_bins = ewma_sigma_per_bar * np.sqrt(horizon) / np.log(1.0 + bin_step)
-    return {
-        "q10": -Z_90 * sigma_bins,
-        "q50": np.zeros_like(sigma_bins),
-        "q90": Z_90 * sigma_bins,
-    }
-
-
-def empirical_coverage(y: np.ndarray, q10: np.ndarray, q90: np.ndarray) -> float:
-    return float(np.mean((y >= q10) & (y <= q90)))
-
-
-def direction_accuracy(y: np.ndarray, q50: np.ndarray) -> tuple[float, float, int]:
-    """Sign-agreement of q50 with the realised offset, plus a one-sided
-    binomial test against p=0.5. Zero-direction samples are excluded."""
-    mask = (y != 0) & (q50 != 0)
-    n = int(mask.sum())
-    if n == 0:
-        return float("nan"), 1.0, 0
-    hits = int((np.sign(y[mask]) == np.sign(q50[mask])).sum())
-    test = stats.binomtest(hits, n, p=0.5, alternative="greater")
-    return hits / n, float(test.pvalue), n
+    z: float = Z_80_BAND,
+) -> float:
+    """Fraction of realized end-of-horizon offsets inside ±z·σ̂_bins."""
+    band = z * sigma_to_bins(sigma_per_bar, horizon, bin_step)
+    return float(np.mean(np.abs(realized_offset) <= band))
 
 
 def run_walk_forward(
     X: pd.DataFrame,
-    y_center: pd.Series,
     y_vol: pd.Series,
     n_splits: int = DEFAULT_N_SPLITS,
     horizon: int = DEFAULT_HORIZON_BARS,
@@ -130,91 +109,83 @@ def run_walk_forward(
     bin_step: float = DEFAULT_BIN_STEP,
     num_boost_round: int = 200,
     params_override: dict | None = None,
+    y_offset: pd.Series | None = None,
 ) -> dict:
-    """Train/evaluate across purged folds; returns the report dict."""
-    yc = y_center.to_numpy(dtype=float)
+    """Train/evaluate across purged folds; returns the report dict.
+
+    ``y_offset`` (optional) is the realized end-of-horizon bin offset aligned
+    to ``X.index`` — supplying it enables the informational σ-band calibration
+    metric (see module docstring)."""
     yv = y_vol.to_numpy(dtype=float)
+    yo = None
+    if y_offset is not None:
+        if not y_offset.index.equals(X.index):
+            raise ValueError("run_walk_forward: y_offset index must match X")
+        yo = y_offset.to_numpy(dtype=float)
     folds = purged_kfold_indices(len(X), n_splits, purge=horizon, embargo=embargo)
 
     fold_reports: list[dict] = []
     pooled: dict[str, list[np.ndarray]] = {
-        "y": [], "q10": [], "q50": [], "q90": [],
-        "b10": [], "b50": [], "b90": [],
-        "vol_y": [], "vol_pred": [], "vol_base": [],
+        "vol_y": [], "vol_pred": [], "vol_base": [], "offset": [],
     }
 
     for k, (train_idx, test_idx) in enumerate(folds):
         models = train_models(
             X.iloc[train_idx],
-            y_center.iloc[train_idx],
             y_vol.iloc[train_idx],
             seed=seed,
             num_boost_round=num_boost_round,
             params_override=params_override,
         )
         X_test = X.iloc[test_idx].to_numpy(dtype=float)
-        preds = {key: models[key].predict(X_test) for key in ("q10", "q50", "q90", "vol")}
-        base = baseline_quantiles(X.iloc[test_idx]["ewma_sigma"].to_numpy(), horizon, bin_step)
+        vol_pred = models["vol"].predict(X_test)
+        vol_base = X.iloc[test_idx]["ewma_sigma"].to_numpy()
 
-        y_test, yv_test = yc[test_idx], yv[test_idx]
-        model_pinball = float(
-            np.mean([pinball_loss(y_test, preds[f"q{int(a*100)}"], a) for a in QUANTILES])
-        )
-        base_pinball = float(
-            np.mean([pinball_loss(y_test, base[f"q{int(a*100)}"], a) for a in QUANTILES])
-        )
-        acc, pval, n_dir = direction_accuracy(y_test, preds["q50"])
+        yv_test = yv[test_idx]
+        fold_mae_model = float(np.mean(np.abs(yv_test - vol_pred)))
+        fold_mae_base = float(np.mean(np.abs(yv_test - vol_base)))
         fold_reports.append(
             {
                 "fold": k,
                 "n_train": len(train_idx),
                 "n_test": len(test_idx),
-                "pinball_model": model_pinball,
-                "pinball_baseline": base_pinball,
-                "coverage": empirical_coverage(y_test, preds["q10"], preds["q90"]),
-                "direction_accuracy": acc,
-                "direction_pvalue": pval,
-                "direction_n": n_dir,
+                "vol_mae_model": fold_mae_model,
+                "vol_mae_baseline": fold_mae_base,
+                "vol_mae_ratio": fold_mae_model / fold_mae_base if fold_mae_base > 0 else float("inf"),
             }
         )
 
-        pooled["y"].append(y_test)
-        for q in ("q10", "q50", "q90"):
-            pooled[q].append(preds[q])
-            pooled[f"b{q[1:]}"].append(base[q])
         pooled["vol_y"].append(yv_test)
-        pooled["vol_pred"].append(preds["vol"])
-        pooled["vol_base"].append(X.iloc[test_idx]["ewma_sigma"].to_numpy())
+        pooled["vol_pred"].append(vol_pred)
+        pooled["vol_base"].append(vol_base)
+        if yo is not None:
+            pooled["offset"].append(yo[test_idx])
 
-    y_all = np.concatenate(pooled["y"])
-    q = {k: np.concatenate(pooled[k]) for k in ("q10", "q50", "q90", "b10", "b50", "b90")}
-    pin_model = float(np.mean([pinball_loss(y_all, q[f"q{int(a*100)}"], a) for a in QUANTILES]))
-    pin_base = float(np.mean([pinball_loss(y_all, q[f"b{int(a*100)}"], a) for a in QUANTILES]))
-    acc, pval, n_dir = direction_accuracy(y_all, q["q50"])
-    coverage = empirical_coverage(y_all, q["q10"], q["q90"])
     vol_y = np.concatenate(pooled["vol_y"])
-    vol_mae_model = float(np.mean(np.abs(vol_y - np.concatenate(pooled["vol_pred"]))))
-    vol_mae_base = float(np.mean(np.abs(vol_y - np.concatenate(pooled["vol_base"]))))
+    vol_pred_all = np.concatenate(pooled["vol_pred"])
+    vol_base_all = np.concatenate(pooled["vol_base"])
+    vol_mae_model = float(np.mean(np.abs(vol_y - vol_pred_all)))
+    vol_mae_base = float(np.mean(np.abs(vol_y - vol_base_all)))
+    vol_mae_ratio = vol_mae_model / vol_mae_base if vol_mae_base > 0 else float("inf")
 
-    pinball_ratio = pin_model / pin_base if pin_base > 0 else float("inf")
-    lo, hi = GATES["coverage_range"]
-    aggregate = {
-        "pinball_model": pin_model,
-        "pinball_baseline": pin_base,
-        "pinball_ratio": pinball_ratio,
-        "coverage_q10_q90": coverage,
-        "direction_accuracy": acc,
-        "direction_pvalue": pval,
-        "direction_n": n_dir,
+    aggregate: dict = {
         "vol_mae_model": vol_mae_model,
         "vol_mae_baseline": vol_mae_base,
+        "vol_mae_ratio": vol_mae_ratio,
     }
+    if yo is not None:
+        offset_all = np.concatenate(pooled["offset"])
+        finite = np.isfinite(offset_all)
+        aggregate["sigma_band_coverage"] = {
+            # informational: how often ±1.28·σ̂_bins covered the realized offset
+            "model": band_coverage(offset_all[finite], vol_pred_all[finite], horizon, bin_step),
+            "baseline": band_coverage(offset_all[finite], vol_base_all[finite], horizon, bin_step),
+            "target": 0.80,
+            "n": int(finite.sum()),
+        }
+
     gates = {
-        "pinball": pinball_ratio < GATES["pinball_ratio_max"],
-        "coverage": lo <= coverage <= hi,
-        "direction": bool(
-            acc > GATES["direction_accuracy_min"] and pval < GATES["direction_pvalue_max"]
-        ),
+        "vol": vol_mae_ratio < GATES["vol_mae_ratio_max"],
     }
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -240,7 +211,7 @@ def write_report(report: dict, reports_dir: Path | str = DEFAULT_REPORTS_DIR) ->
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Purged walk-forward evaluation")
+    parser = argparse.ArgumentParser(description="Purged walk-forward evaluation (vol head)")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_ROOT))
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
@@ -254,10 +225,10 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     frame = load_canonical_frame(args.data_dir, parse_utc_ms(args.start), parse_utc_ms(args.end))
-    X, y_center, y_vol = build_training_set(frame, horizon=args.horizon, bin_step=args.bin_step)
+    X, y_vol = build_training_set(frame, horizon=args.horizon)
+    offset = future_offset(frame, horizon=args.horizon, bin_step=args.bin_step).loc[X.index]
     report = run_walk_forward(
         X,
-        y_center,
         y_vol,
         n_splits=args.n_splits,
         horizon=args.horizon,
@@ -265,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         bin_step=args.bin_step,
         num_boost_round=args.num_boost_round,
+        y_offset=offset,
     )
     path = write_report(report, args.reports_dir)
     print(f"[walk-forward] report: {path}")

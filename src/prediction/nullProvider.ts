@@ -5,21 +5,17 @@
  * before any ML model is available. It is also the permanent last-resort
  * fallback used by `mlAgent` when `SidecarPredictionProvider` is unavailable.
  *
- * Output semantics:
- *   centerOffset = 0          (no directional prediction; stay at active bin)
- *   centerQ10/Q90             symmetric: active ± ceil(widthSigma × 1.28)
- *                             (±1.28 σ ≈ the 80 % equal-tailed interval)
+  * Output semantics (center-free since 2026-07 — the distribution is always
+ * centered on the active bin; docs/decision-remove-center-prediction.md):
  *   widthSigma                EWMA σ on `snapshot.binance.sui` close prices,
  *                             scaled to the 30-min horizon, then converted to
  *                             bin units (see σ→bin conversion note below).
- *                             NOTE: widthSigma measures center-prediction
- *                             uncertainty (quantile spread / 2.56), not raw
- *                             price σ.
+ *                             Same quantity the sidecar derives from its vol
+ *                             head — the two providers are unit-compatible.
  *   pAbove / pBelow           aligned with sidecar definition (F3):
- *                             pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
- *                             pBelow = Φ((lowerOffset − q50) / widthSigma)
+ *                             pAbove = 1 − Φ(upperOffset / widthSigma)
+ *                             pBelow = Φ(lowerOffset / widthSigma)
  *                             where offsets are in BIN UNITS relative to activeBin.
- *                             q50 = centerOffset = 0 for NullProvider.
  *                             lowerOffset / upperOffset are derived from
  *                             ctx.currentBins (same derivation as sidecarProvider),
  *                             defaulting to ±0.5 bin when currentBins is empty.
@@ -47,17 +43,17 @@
  *
  * pAbove / pBelow (aligned with sidecar — F3)
  * ─────────────────────────────────────────────
- * The sidecar computes (ml/serving/app.py lines 104–105, 208–209):
+ * The sidecar computes (ml/serving/app.py):
  *
- *   pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
- *   pBelow = Φ((lowerOffset − q50) / widthSigma)
+ *   pAbove = 1 − Φ(upperOffset / widthSigma)
+ *   pBelow = Φ(lowerOffset / widthSigma)
  *
- * where all offsets are in BIN UNITS relative to activeBin, and widthSigma
- * is the center-prediction uncertainty in bin units.  The sidecar defaults
- * lowerOffset = −0.5, upperOffset = +0.5 when no pmRangeContext is supplied.
+ * where all offsets are in BIN UNITS relative to activeBin, the center is
+ * pinned at 0 (spot), and widthSigma is the horizon offset σ in bin units.
+ * The sidecar defaults lowerOffset = −0.5, upperOffset = +0.5 when no
+ * pmRangeContext is supplied.
  *
  * NullProvider uses the same formula with:
- *   q50 = centerOffset = 0 (no directional prediction)
  *   widthSigma = computed EWMA-based value in bin units (above)
  *   lowerOffset / upperOffset derived from ctx.currentBins the same way
  *   sidecarProvider.buildPmRangeContext() does it:
@@ -65,8 +61,7 @@
  *     upperOffset = max(currentBins) − activeBin
  *   defaulting to ±0.5 when currentBins is empty (matching sidecar default).
  *
- * At the natural midpoint of a symmetric distribution with q50=0, these two
- * values are equal when the range is symmetric (both < 0.5). Their sum < 1.
+ * For a symmetric range the two values are equal and their sum < 1.
  *
  * Both use the Abramowitz & Stegun normCdf already exported from
  * `src/forecast/binWeights.ts`, so no new math dependency is introduced.
@@ -116,12 +111,11 @@ function computeWidthSigmaBins(snapshot: MarketSnapshot, binStep: number): numbe
 /**
  * Compute pAbove and pBelow using the sidecar-aligned definition (F3).
  *
- * Formula (mirrors ml/serving/app.py lines 104–105, 208–209):
- *   pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
- *   pBelow = Φ((lowerOffset − q50) / widthSigma)
+ * Formula (mirrors ml/serving/app.py; center pinned at 0):
+ *   pAbove = 1 − Φ(upperOffset / widthSigma)
+ *   pBelow = Φ(lowerOffset / widthSigma)
  *
  * All values are in BIN UNITS relative to activeBin.
- * q50 = centerOffset = 0 for NullProvider.
  *
  * When currentBins is empty, the offsets default to ±0.5 bin (sidecar default).
  * When currentBins is non-empty, lowerOffset and upperOffset are derived the
@@ -147,14 +141,14 @@ function computePAbovePBelow(
     upperOffset = DEFAULT_HALF_OFFSET;
   }
 
-  // q50 = centerOffset = 0 (NullProvider predicts no directional drift).
-  const q50 = 0;
+  // Center is pinned at 0 — no directional prediction (by design, see
+  // docs/decision-remove-center-prediction.md).
   const w = Math.max(widthSigma, 1e-9);
 
-  // pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
-  const pAbove = 1 - normCdf((upperOffset - q50) / w);
-  // pBelow = Φ((lowerOffset − q50) / widthSigma)
-  const pBelow = normCdf((lowerOffset - q50) / w);
+  // pAbove = 1 − Φ(upperOffset / widthSigma)
+  const pAbove = 1 - normCdf(upperOffset / w);
+  // pBelow = Φ(lowerOffset / widthSigma)
+  const pBelow = normCdf(lowerOffset / w);
 
   return { pAbove, pBelow };
 }
@@ -168,19 +162,10 @@ export class NullPredictionProvider implements PredictionProvider {
     // 1. Compute widthSigma in bin units.
     const widthSigma = computeWidthSigmaBins(snapshot, binStep);
 
-    // 2. Symmetric quantiles: ±1.28 σ in bin units covers ~80 % of the
-    //    distribution mass (Φ(1.28) ≈ 0.90, so Φ(1.28) − Φ(−1.28) ≈ 0.80).
-    const halfInterval = Math.ceil(widthSigma * 1.28);
-    const centerQ10 = -halfInterval;
-    const centerQ90 = +halfInterval;
-
-    // 3. pAbove / pBelow using the sidecar-aligned formula (F3).
+    // 2. pAbove / pBelow using the sidecar-aligned formula (F3).
     const { pAbove, pBelow } = computePAbovePBelow(widthSigma, ctx);
 
     return {
-      centerOffset: 0,
-      centerQ10,
-      centerQ90,
       widthSigma,
       pAbove,
       pBelow,

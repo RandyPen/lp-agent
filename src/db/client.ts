@@ -55,6 +55,34 @@ function applySchema(db: Database): void {
   const sql = readFileSync(resolve(here, SCHEMA_FILE), "utf8");
   db.exec(sql);
   ensureColumns(db, ADDITIVE_COLUMNS);
+  rejectLegacyCenterColumns(db);
+}
+
+/**
+ * DOCUMENTED DEVIATION #2 — legacy-layout REFUSAL (not a migration): the
+ * predictions table's center_q10/center_offset/center_q90 columns were
+ * removed 2026-07 with the center prediction head
+ * (docs/decision-remove-center-prediction.md). They were NOT NULL, so new
+ * code inserting without them would fail on every tick — a silent per-tick
+ * degradation. Instead of auto-dropping operator data, refuse to start with
+ * the exact remediation. Fresh DBs never hit this (schema.sql no longer has
+ * the columns).
+ */
+function rejectLegacyCenterColumns(db: Database): void {
+  const info = db
+    .prepare<{ name: string }, []>("PRAGMA table_info(predictions)")
+    .all();
+  const legacy = ["center_q10", "center_offset", "center_q90"].filter((c) =>
+    info.some((col) => col.name === c),
+  );
+  if (legacy.length === 0) return;
+  throw new Error(
+    `db: predictions table carries legacy center-prediction columns (${legacy.join(", ")}). ` +
+      "The center head was removed (docs/decision-remove-center-prediction.md). " +
+      "Archive the DB if you want the historical center values, then run once:\n" +
+      legacy.map((c) => `  ALTER TABLE predictions DROP COLUMN ${c};`).join("\n") +
+      "\n(sqlite3 <db-file> — requires SQLite ≥ 3.35), or rm the DB file if disposable.",
+  );
 }
 
 interface AdditiveColumn {

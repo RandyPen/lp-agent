@@ -21,14 +21,11 @@ import { fileURLToPath } from "node:url";
 import {
   deriveHalfWidth,
   deriveToleranceBins,
-  deriveMaxCenterOffset,
   deriveTrendBias,
   deriveLendingPct,
   DEFAULT_STATE_PARAMS,
   HALF_WIDTH_MIN,
   HALF_WIDTH_MAX,
-  MAX_CENTER_OFFSET_MIN,
-  MAX_CENTER_OFFSET_MAX,
   EVAL_INTERVAL_MS,
   MIN_DWELL_MS,
   TREND_BIAS_NORMALISER,
@@ -127,9 +124,6 @@ function makeSnapshot(suiBars: OhlcvBar[]): MarketSnapshot {
 
 function makePred(overrides: Partial<PredictionResponse> = {}): PredictionResponse {
   return {
-    centerOffset: 0,
-    centerQ10: -2,
-    centerQ90: 2,
     widthSigma: 2.0,
     pAbove: 0.3,
     pBelow: 0.3,
@@ -297,37 +291,7 @@ describe("deriveToleranceBins", () => {
   });
 });
 
-describe("deriveMaxCenterOffset", () => {
-  it("uncertainty high always returns 1", () => {
-    expect(deriveMaxCenterOffset(0, true)).toBe(1);
-    expect(deriveMaxCenterOffset(3, true)).toBe(1);
-    expect(deriveMaxCenterOffset(10, true)).toBe(1);
-  });
-
-  it("clamps to MAX_CENTER_OFFSET_MIN when sigma is tiny", () => {
-    expect(deriveMaxCenterOffset(0, false)).toBe(MAX_CENTER_OFFSET_MIN);
-  });
-
-  it("clamps to MAX_CENTER_OFFSET_MAX when sigma is large", () => {
-    expect(deriveMaxCenterOffset(10, false)).toBe(MAX_CENTER_OFFSET_MAX);
-  });
-
-  it("midpoint: widthSigma=2 → 2", () => {
-    expect(deriveMaxCenterOffset(2, false)).toBe(2);
-  });
-
-  it("widthSigma=3 → 3=MAX_CENTER_OFFSET_MAX", () => {
-    expect(deriveMaxCenterOffset(3, false)).toBe(MAX_CENTER_OFFSET_MAX);
-  });
-
-  it("result is always in [1, MAX_CENTER_OFFSET_MAX] when uncertainty is not high", () => {
-    for (const sigma of [0, 0.5, 1, 2, 3, 4, 10]) {
-      const v = deriveMaxCenterOffset(sigma, false);
-      expect(v).toBeGreaterThanOrEqual(MAX_CENTER_OFFSET_MIN);
-      expect(v).toBeLessThanOrEqual(MAX_CENTER_OFFSET_MAX);
-    }
-  });
-});
+// describe("deriveMaxCenterOffset") removed with the center prediction head (docs/decision-remove-center-prediction.md)
 
 describe("deriveTrendBias", () => {
   it("symmetric: pAbove=pBelow → 0", () => {
@@ -1054,26 +1018,8 @@ describe("StateMachine — StateContext fields", () => {
     expect(ctx.toleranceBins).toBeLessThanOrEqual(ctx.halfWidth);
   });
 
-  it("maxCenterOffset is populated in StateContext (F5)", () => {
-    const sm = createStateMachine({ poolId: "pool-ctx6", db, now: () => 0 });
-    const ctx = sm.advance(
-      makeSnapshot(flatBars(30)),
-      makePred({ widthSigma: 2.0, featureCompleteness: 1.0 }),
-      makeInput(),
-    );
-    // widthSigma=2.0, uncertaintyHigh=false → clamp(round(2),1,3)=2
-    expect(ctx.maxCenterOffset).toBe(2);
-  });
-
-  it("maxCenterOffset=1 when uncertainty is high (featureCompleteness < 0.8)", () => {
-    const sm = createStateMachine({ poolId: "pool-ctx7", db, now: () => 0 });
-    const ctx = sm.advance(
-      makeSnapshot(flatBars(30)),
-      makePred({ widthSigma: 3.0, featureCompleteness: 0.5 }),  // high uncertainty
-      makeInput(),
-    );
-    expect(ctx.maxCenterOffset).toBe(1);
-  });
+  // "maxCenterOffset is populated in StateContext (F5)" and "maxCenterOffset=1 when
+  // uncertainty is high" removed with the center prediction head (docs/decision-remove-center-prediction.md)
 
   it("TREND: trendBias is computed from pAbove-pBelow", () => {
     let t = 0;
@@ -1186,9 +1132,7 @@ describe("params.ts / transitions.ts — non-finite input guards (fail loud)", (
     expect(() => deriveToleranceBins(NaN, 4)).toThrow(RangeError);
   });
 
-  it("deriveMaxCenterOffset(NaN, false) throws", () => {
-    expect(() => deriveMaxCenterOffset(NaN, false)).toThrow(RangeError);
-  });
+  // "deriveMaxCenterOffset(NaN, false) throws" removed with the center prediction head (docs/decision-remove-center-prediction.md)
 
   it("deriveTrendBias(NaN, 0.3) throws", () => {
     expect(() => deriveTrendBias(NaN, 0.3)).toThrow(RangeError);

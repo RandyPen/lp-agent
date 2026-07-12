@@ -96,7 +96,7 @@ The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `ml
   - `singleBin` — P0 baseline: all liquidity in the active bin, re-centre on drift.
   - `multiBinSpot` — log-normal distribution across bins, with out-of-range / drift / fees-only triggers and a fee dead-zone derate on bin weights.
   - `emaTrend` — dual-EMA (12/26) trend classifier; tent-shaped weights, range center offset by ±halfWidth/2 toward trend side, ×1.5 skew on the trend side.
-  - `mlAgent` — v1 main strategy: consumes `PredictionProvider` output (quantile-derived center/width/probabilities) + the three-state machine's parameters; explicit Tier 0 fallback to rule strategies when the sidecar is unavailable (built via `buildStrategy("mlAgent", mlDeps)`).
+  - `mlAgent` — v1 main strategy: consumes `PredictionProvider` output (vol-head σ width + range-break probabilities; the range always centers on the active bin — the center prediction head was falsified and removed, see `decision-remove-center-prediction.md`) + the three-state machine's parameters; explicit Tier 0 fallback to rule strategies when the sidecar is unavailable (built via `buildStrategy("mlAgent", mlDeps)`).
 - `StrategyOutput` 4-state union (`plan_and_reconcile | plan_only | reconcile_only | quiet`).
 - `fillBoundary` persistence in `position_state` (table exists; only consumed by future bid-ask-style strategies — v0 strategies don't write it).
 - **Unified rebalance PTB** behind `UNIFIED_TX=true` flag — atomic DLMM ops, single gas envelope. I32 → u32 two's-complement bit serialisation handled correctly in both legacy and unified paths.
@@ -142,7 +142,7 @@ The repo ships **four strategies** (`singleBin`, `multiBinSpot`, `emaTrend`, `ml
 - **Risk controls** (`src/risk/`) — layered L1/L2/L3 circuits (`circuits.ts`), pre-tick monitor (`monitor.ts`), emergency handling (`emergency.ts`), PnL attribution (`pnlAttribution.ts`); events persisted to `risk_events`.
 - **Decision helpers** (`src/decision/`) — diff planner (minimal bin moves), inventory tracking, age-based stop-loss.
 - **Shadow mode** (`src/services/shadowRunner.ts`) — runs the full decision path without submitting PTBs; decisions land in `shadow_decisions` for calibration.
-- **ML pipeline** (`ml/`, uv-managed Python) — `data/` collectors + parquet store, `features/` (shared by training and serving), `training/` (LightGBM quantile q10/q50/q90 + vol, walk-forward, `models_meta.json` with data window + seed + git sha), `serving/` (FastAPI sidecar), `backtest/` (fee model + L1 runner), 100 pytest tests. Artifacts (`ml/artifacts/`) never committed — forks rebuild the dataset via `scripts/collect-historical.ts` / `scripts/backfill-cetus-events.ts` and train their own.
+- **ML pipeline** (`ml/`, uv-managed Python) — `data/` collectors + parquet store, `features/` (shared by training and serving), `training/` (LightGBM vol model — vol-only: the q10/q50/q90 center heads were falsified by walk-forward and removed, see `decision-remove-center-prediction.md`; purged walk-forward with a vol-MAE gate; `models_meta.json` with data window + seed + git sha), `serving/` (FastAPI sidecar), `backtest/` (fee model + L1 runner), ~120 pytest tests. Artifacts (`ml/artifacts/`) never committed — forks rebuild the dataset via `scripts/collect-historical.ts` / `scripts/backfill-cetus-events.ts` and train their own.
 
 ---
 

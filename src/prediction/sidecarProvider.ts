@@ -8,16 +8,15 @@
  * Fallback semantics (§3.2 / prediction-service-design.md §4.4):
  *   timeout        — AbortSignal fired before the sidecar responded
  *   sidecar_down   — network/connection error, non-200 HTTP status, or a
- *                    response body that fails the 10-key shape / type contract
- *                    or violates quantile monotonicity (q10 ≤ q50 ≤ q90)
+ *                    response body that fails the 7-key shape / type contract
  *   psi / missing  — sidecar returns these directly; passed through unchanged
  *   false          — normal inference, all fields from the sidecar
  *
  * Every degraded path:
  *   1. Sets `fallback` to the appropriate reason string.
  *   2. Emits a structured `warn` log with the reason and detail.
- *   3. Returns the NEUTRAL fallback response (centerOffset=0, quantiles=0,
- *      widthSigma=0, pAbove=0, pBelow=0, featureCompleteness=0, psi=0).
+ *   3. Returns the NEUTRAL fallback response (widthSigma=0, pAbove=0,
+ *      pBelow=0, featureCompleteness=0, psi=0).
  *      modelVersion is taken from the last successful /health call, or "unknown".
  *
  * The provider NEVER throws and NEVER fabricates a non-fallback response.
@@ -44,11 +43,10 @@ import type {
 // Internal types
 // ---------------------------------------------------------------------------
 
-/** The 10 keys we expect from the sidecar's /predict response, all camelCase. */
+/** The 7 keys we expect from the sidecar's /predict response, all camelCase.
+ * (centerOffset/centerQ10/centerQ90 were removed with the center head —
+ * docs/decision-remove-center-prediction.md.) */
 const REQUIRED_PREDICT_KEYS = [
-  "centerOffset",
-  "centerQ10",
-  "centerQ90",
   "widthSigma",
   "pAbove",
   "pBelow",
@@ -61,9 +59,6 @@ type RequiredKey = (typeof REQUIRED_PREDICT_KEYS)[number];
 
 /** Shape returned by the sidecar for a successful /predict. */
 interface RawPredictResponse {
-  centerOffset: number;
-  centerQ10: number;
-  centerQ90: number;
   widthSigma: number;
   pAbove: number;
   pBelow: number;
@@ -135,9 +130,6 @@ function validatePredictBody(body: unknown): string | null {
 
   // Type checks for numeric fields.
   const numericKeys: RequiredKey[] = [
-    "centerOffset",
-    "centerQ10",
-    "centerQ90",
     "widthSigma",
     "pAbove",
     "pBelow",
@@ -162,14 +154,6 @@ function validatePredictBody(body: unknown): string | null {
     return `fallback has unrecognised value: ${JSON.stringify(fb)}`;
   }
 
-  // Quantile monotonicity: q10 ≤ q50 (centerOffset) ≤ q90.
-  const q10 = obj["centerQ10"] as number;
-  const q50 = obj["centerOffset"] as number;
-  const q90 = obj["centerQ90"] as number;
-  if (q10 > q50 || q50 > q90) {
-    return `quantile monotonicity violated: q10=${q10} q50=${q50} q90=${q90}`;
-  }
-
   return null;
 }
 
@@ -187,9 +171,6 @@ function neutralFallback(
   lastKnownModelVersion: string,
 ): PredictionResponse {
   return {
-    centerOffset: 0,
-    centerQ10: 0,
-    centerQ90: 0,
     widthSigma: 0,
     pAbove: 0,
     pBelow: 0,
@@ -336,9 +317,6 @@ class SidecarPredictionProvider implements PredictionProvider {
     }
 
     return {
-      centerOffset: parsed.centerOffset,
-      centerQ10: parsed.centerQ10,
-      centerQ90: parsed.centerQ90,
       widthSigma: parsed.widthSigma,
       pAbove: parsed.pAbove,
       pBelow: parsed.pBelow,

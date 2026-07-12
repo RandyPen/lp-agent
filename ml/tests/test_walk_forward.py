@@ -1,17 +1,21 @@
-"""Walk-forward: purge/embargo leakage guarantees, metric math, end-to-end run."""
+"""Walk-forward: purge/embargo leakage guarantees, metric math, end-to-end run.
+
+The pinball/coverage/direction/center metrics were removed with the center
+head (2026-07, docs/decision-remove-center-prediction.md); the vol MAE ratio
+is the gate and σ-band coverage is informational."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
+from data.labels import future_offset, make_labels
 from training.walk_forward import (
-    baseline_quantiles,
-    direction_accuracy,
-    empirical_coverage,
-    pinball_loss,
+    band_coverage,
     purged_kfold_indices,
     run_walk_forward,
+    sigma_to_bins,
 )
-from tests.conftest import make_training_set
+from tests.conftest import make_canonical_frame, make_training_set
 
 TINY_LGB = {"min_data_in_leaf": 5}
 
@@ -46,55 +50,30 @@ class TestPurgedKfold:
 
 
 class TestMetricMath:
-    def test_pinball_hand_computed_overprediction(self):
-        # y=0, pred=1, α=0.1: diff = −1 → max(−0.1, 0.9) = 0.9
-        assert pinball_loss(np.array([0.0]), np.array([1.0]), 0.1) == pytest.approx(0.9)
-
-    def test_pinball_hand_computed_underprediction(self):
-        # y=1, pred=0, α=0.9: diff = 1 → max(0.9, −0.1) = 0.9
-        assert pinball_loss(np.array([1.0]), np.array([0.0]), 0.9) == pytest.approx(0.9)
-
-    def test_pinball_perfect_prediction_is_zero(self):
-        y = np.array([1.0, -2.0, 0.5])
-        assert pinball_loss(y, y, 0.5) == 0.0
-
-    def test_pinball_median_is_half_mae(self):
-        y, pred = np.array([1.0, 3.0]), np.array([2.0, 2.0])
-        assert pinball_loss(y, pred, 0.5) == pytest.approx(0.5 * np.mean(np.abs(y - pred)))
-
-    def test_coverage(self):
-        y = np.array([0.0, 1.0, 5.0, -5.0])
-        q10 = np.array([-1.0, -1.0, -1.0, -1.0])
-        q90 = np.array([1.0, 1.0, 1.0, 1.0])
-        assert empirical_coverage(y, q10, q90) == pytest.approx(0.5)
-
-    def test_direction_accuracy_and_binomial_test(self):
-        y = np.array([1.0, 2.0, 3.0, -1.0])
-        q50 = np.array([0.5, 0.5, 0.5, 0.5])
-        acc, pvalue, n = direction_accuracy(y, q50)
-        assert (acc, n) == (0.75, 4)
-        assert 0.0 < pvalue <= 1.0
-
-    def test_direction_excludes_zero_samples(self):
-        y = np.array([0.0, 1.0])
-        q50 = np.array([1.0, 1.0])
-        acc, _, n = direction_accuracy(y, q50)
-        assert (acc, n) == (1.0, 1)
-
-    def test_baseline_band_is_symmetric_and_scales_with_sigma(self):
+    def test_sigma_to_bins_sqrt_horizon_scaling(self):
         sigma = np.array([0.001, 0.002])
-        base = baseline_quantiles(sigma, horizon=30, bin_step=0.005)
-        assert np.allclose(base["q50"], 0.0)
-        assert np.allclose(base["q10"], -base["q90"])
-        assert base["q90"][1] == pytest.approx(2 * base["q90"][0])
+        bins30 = sigma_to_bins(sigma, horizon=30, bin_step=0.005)
+        bins120 = sigma_to_bins(sigma, horizon=120, bin_step=0.005)
+        # √(120/30) = 2 and linear in σ
+        assert bins120[0] == pytest.approx(2 * bins30[0])
+        assert bins30[1] == pytest.approx(2 * bins30[0])
+        # hand value: 0.001·√30/ln(1.005)
+        assert bins30[0] == pytest.approx(0.001 * np.sqrt(30) / np.log(1.005))
+
+    def test_band_coverage_hand_computed(self):
+        # band = 1.28 · 1.0 · √1 / ln(1.005) ≈ 256.6 bins for σ=1 — use small σ
+        # so the band is exactly ±1.28 bins: σ_bins = 1 ⇒ σ = ln(1.005)/√1.
+        sigma = np.full(4, np.log(1.005))
+        offsets = np.array([0.0, 1.0, 2.0, -3.0])  # |x| ≤ 1.28 → first two inside
+        cov = band_coverage(offsets, sigma, horizon=1, bin_step=0.005)
+        assert cov == pytest.approx(0.5)
 
 
 class TestEndToEnd:
     def test_report_structure_and_gates(self):
-        X, y_center, y_vol = make_training_set(n=500)
+        X, y_vol = make_training_set(n=500)
         report = run_walk_forward(
             X,
-            y_center,
             y_vol,
             n_splits=3,
             horizon=30,
@@ -105,24 +84,51 @@ class TestEndToEnd:
         assert report["n_splits"] == 3
         assert len(report["folds"]) == 3
         agg = report["aggregate"]
-        for key in (
-            "pinball_model",
-            "pinball_baseline",
-            "pinball_ratio",
-            "coverage_q10_q90",
-            "direction_accuracy",
-            "direction_pvalue",
-            "vol_mae_model",
-            "vol_mae_baseline",
-        ):
+        for key in ("vol_mae_model", "vol_mae_baseline", "vol_mae_ratio"):
             assert key in agg
-        assert set(report["gates"]) == {"pinball", "coverage", "direction"}
+        for fold in report["folds"]:
+            assert {"vol_mae_model", "vol_mae_baseline", "vol_mae_ratio"} <= set(fold)
+        # 2026-07 revision: vol is THE gate; center/pinball/coverage are gone.
+        assert set(report["gates"]) == {"vol"}
         assert isinstance(report["gates_passed"], bool)
-        assert 0.0 <= agg["coverage_q10_q90"] <= 1.0
+        # no σ-band coverage without y_offset
+        assert "sigma_band_coverage" not in agg
+
+    def test_sigma_band_coverage_reported_when_offset_supplied(self):
+        frame = make_canonical_frame(n=500)
+        from features.registry import build_feature_matrix
+
+        X, _ = build_feature_matrix(frame)
+        labels = make_labels(frame, horizon=30)
+        X = X.loc[labels.index]
+        offset = future_offset(frame, horizon=30, bin_step=0.005).loc[X.index]
+        report = run_walk_forward(
+            X,
+            labels["label_vol"],
+            n_splits=3,
+            horizon=30,
+            embargo=10,
+            num_boost_round=5,
+            params_override=TINY_LGB,
+            y_offset=offset,
+        )
+        cov = report["aggregate"]["sigma_band_coverage"]
+        assert set(cov) == {"model", "baseline", "target", "n"}
+        assert 0.0 <= cov["model"] <= 1.0
+        assert cov["n"] > 0
+
+    def test_y_offset_index_mismatch_raises(self):
+        X, y_vol = make_training_set(n=400)
+        bad = pd.Series(np.zeros(len(X)))  # RangeIndex ≠ X's DatetimeIndex
+        with pytest.raises(ValueError, match="y_offset"):
+            run_walk_forward(
+                X, y_vol, n_splits=3, embargo=10, num_boost_round=5,
+                params_override=TINY_LGB, y_offset=bad,
+            )
 
     def test_deterministic_given_seed(self):
-        X, y_center, y_vol = make_training_set(n=400)
+        X, y_vol = make_training_set(n=400)
         kwargs = dict(n_splits=3, embargo=10, num_boost_round=5, params_override=TINY_LGB, seed=7)
-        r1 = run_walk_forward(X, y_center, y_vol, **kwargs)
-        r2 = run_walk_forward(X, y_center, y_vol, **kwargs)
+        r1 = run_walk_forward(X, y_vol, **kwargs)
+        r2 = run_walk_forward(X, y_vol, **kwargs)
         assert r1["aggregate"] == r2["aggregate"]

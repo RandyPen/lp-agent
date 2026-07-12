@@ -162,26 +162,18 @@ function scalePrincipal(principal: bigint, scale: number): bigint {
 // ---------------------------------------------------------------------------
 
 /**
- * Derive the target center bin exactly the way the plan build does:
- *   - NORMAL: activeBin + clamp(round(centerOffset), -maxCenterOffset, +maxCenterOffset)
- *   - TREND / EXTREME: activeBin (TREND never follows the moving predicted
- *     center per §3.2; EXTREME has no center concept and callers shouldn't
- *     reach this path for it, but activeBin is the safe/no-op answer).
- *
- * Exported so `mlAgent.ts` can compute `fillBoundary` from the SAME clamped
- * value diffPlan actually built the position around, instead of the raw
- * (unclamped) prediction offset — the two must never diverge (F10).
+ * The target center bin is ALWAYS the active bin (2026-07): the predicted
+ * center offset this function used to clamp was removed with the center
+ * head — walk-forward showed it placed the center worse than spot
+ * (docs/decision-remove-center-prediction.md). Kept as a named function so
+ * the "plan build and mlAgent's fillBoundary must use the same center"
+ * invariant (F10) stays greppable.
  */
 export function computeTargetCenterBin(
-  state: StateContext["state"],
+  _state: StateContext["state"],
   activeBin: number,
-  centerOffset: number,
-  maxCenterOffset: number,
 ): number {
-  if (state !== "NORMAL") return activeBin;
-  const rawOffset = Math.round(centerOffset);
-  const clippedOffset = Math.max(-maxCenterOffset, Math.min(maxCenterOffset, rawOffset));
-  return activeBin + clippedOffset;
+  return activeBin;
 }
 
 // ---------------------------------------------------------------------------
@@ -708,20 +700,11 @@ export function diffPlan(input: DiffPlanInput): RebalancePlan | null {
     return buildExtremeWithdrawPlan(pm);
   }
 
-  // --- maxCenterOffset: read directly from ctx (F5) ---
-  // The state machine populates ctx.maxCenterOffset via deriveMaxCenterOffset(),
-  // which handles the uncertainty-high path (featureCompleteness < U_HIGH → 1 bin)
-  // and the normal path (clamp(round(widthSigma), 1, 3)).
-  // diffPlanner no longer re-derives this value — the state machine is the
-  // single source of truth (eliminates the local re-derivation that had no
-  // uncertainty input and used toleranceBins as a proxy).
-  const maxCenterOffset = ctx.maxCenterOffset;
-
-  // --- NORMAL: center derived from predicted offset (clamped) ---
-  // --- TREND:  center = active bin (don't follow moving target) ---
-  // Shared with mlAgent's fillBoundary (F10) so the fill-detection boundary
-  // never disagrees with where this function actually centers the position.
-  const targetCenterBin = computeTargetCenterBin(ctx.state, activeBin, pred.centerOffset, maxCenterOffset);
+  // --- Center = active bin (all states; the predicted center was removed
+  // 2026-07 — docs/decision-remove-center-prediction.md). Shared with
+  // mlAgent's fillBoundary (F10) so the fill-detection boundary never
+  // disagrees with where this function actually centers the position.
+  const targetCenterBin = computeTargetCenterBin(ctx.state, activeBin);
 
   // --- Inventory imbalance assessment (C1 wiring) ---
   // Computed on the FULL deployable capital (incl. any injected positionValue)

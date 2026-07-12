@@ -24,15 +24,12 @@ from serving.app import (
 )
 from serving.registry import ModelRegistry, load_bundle
 from training.export import export_artifacts
-from training.train_quantile import train_models
+from training.train_vol import train_models
 from tests.conftest import make_ohlcv, make_training_set
 
 TINY_LGB = {"min_data_in_leaf": 5}
 
 PREDICTION_RESPONSE_KEYS = {
-    "centerOffset",
-    "centerQ10",
-    "centerQ90",
     "widthSigma",
     "pAbove",
     "pBelow",
@@ -47,10 +44,10 @@ PREDICTION_RESPONSE_KEYS = {
 def artifact_root(tmp_path_factory):
     """Two exported artifact versions trained on synthetic data."""
     root = tmp_path_factory.mktemp("artifacts")
-    X, y_center, y_vol = make_training_set(n=500)
+    X, y_vol = make_training_set(n=500)
     for version, seed in (("v1.0.0", 42), ("v1.1.0", 43)):
         models = train_models(
-            X, y_center, y_vol, seed=seed, num_boost_round=8, params_override=TINY_LGB
+            X, y_vol, seed=seed, num_boost_round=8, params_override=TINY_LGB
         )
         export_artifacts(
             models,
@@ -97,7 +94,7 @@ class TestArtifactsAndRegistry:
     def test_load_bundle_roundtrip(self, artifact_root):
         bundle = load_bundle(artifact_root / "v1.0.0")
         assert bundle.version == "v1.0.0"
-        assert set(bundle.boosters) == {"q10", "q50", "q90", "vol"}
+        assert set(bundle.boosters) == {"vol"}
         assert bundle.feature_names == FEATURE_NAMES
         assert set(bundle.psi_baseline) == set(FEATURE_NAMES)
         assert bundle.meta["seed"] == 42
@@ -107,7 +104,7 @@ class TestArtifactsAndRegistry:
 
         corrupt = tmp_path / "corrupt"
         shutil.copytree(artifact_root / "v1.0.0", corrupt)
-        with open(corrupt / "q50.txt", "a") as fh:
+        with open(corrupt / "vol.txt", "a") as fh:
             fh.write("\ntampered\n")
         with pytest.raises(ValueError, match="sha256 mismatch"):
             load_bundle(corrupt)
@@ -153,7 +150,6 @@ class TestPredictContract:
 
     def test_predict_values_are_coherent(self, client):
         body = client.post("/predict", json=make_snapshot()).json()
-        assert body["centerQ10"] <= body["centerOffset"] <= body["centerQ90"]
         assert body["widthSigma"] > 0
         assert 0.0 <= body["pAbove"] <= 1.0
         assert 0.0 <= body["pBelow"] <= 1.0
@@ -166,7 +162,7 @@ class TestPredictContract:
         snapshot = make_snapshot()
         b1 = client.post("/predict", json=snapshot).json()
         b2 = client.post("/predict", json=snapshot).json()
-        for key in ("centerOffset", "centerQ10", "centerQ90", "widthSigma"):
+        for key in ("widthSigma", "pAbove", "pBelow"):
             assert b1[key] == b2[key]
 
     def test_sparse_snapshot_flags_missing_fallback(self, client):
@@ -174,7 +170,7 @@ class TestPredictContract:
         assert body["fallback"] == "missing"
         assert body["featureCompleteness"] < 0.7
         # full prediction is still returned for shadow comparison
-        assert body["centerQ10"] <= body["centerOffset"] <= body["centerQ90"]
+        assert body["widthSigma"] > 0
 
     def test_reload_swaps_model_and_bad_dir_keeps_serving(self, client, artifact_root):
         resp = client.post("/reload", json={"artifact_dir": str(artifact_root / "v1.1.0")})
@@ -293,10 +289,12 @@ class TestPsiExclusions:
     def test_fresh_snapshot_excludes_all_history_features(self):
         # A frame with derivative scalars on the last row only (no history)
         # must exclude every history-dependent derivative feature from PSI —
-        # they are defaults-by-construction, not drift.
+        # they are defaults-by-construction, not drift. Since the 2026-07
+        # retrain removed oi_change_30m / liq_volume_5m from the registry,
+        # the funding MA is the only history-dependent feature left.
         snapshot = MarketSnapshot(**make_snapshot())
         frame = snapshot_to_frame(snapshot)
-        assert _psi_exclusions(frame) == {"funding_ma_8h", "oi_change_30m", "liq_volume_5m"}
+        assert _psi_exclusions(frame) == {"funding_ma_8h"}
 
     def test_oi_becomes_real_after_31_minutes_of_history(self):
         snapshot = MarketSnapshot(**make_snapshot())
@@ -309,20 +307,10 @@ class TestPsiExclusions:
         for col, series in cols.items():
             frame[col] = frame[col].fillna(series)
         excl = _psi_exclusions(frame)
-        assert "oi_change_30m" not in excl
         assert "funding_ma_8h" in excl  # 120-row frame < 480-row MA window
-        assert "liq_volume_5m" not in excl  # 35 consecutive liq observations
-
-    def test_nonpositive_oi_stays_excluded(self):
-        snapshot = MarketSnapshot(**make_snapshot())
-        frame = snapshot_to_frame(snapshot)
-        hist = DerivativesHistory()
-        for ts in frame.index[-35:]:
-            hist.record(int(ts.value // 1_000_000), 0.0001, 0.0, 0.0)
-        cols = hist.columns(frame.index)
-        for col, series in cols.items():
-            frame[col] = frame[col].fillna(series)
-        assert "oi_change_30m" in _psi_exclusions(frame)
+        # Removed features never appear in exclusions.
+        assert "oi_change_30m" not in excl
+        assert "liq_volume_5m" not in excl
 
     def test_full_coverage_excludes_nothing(self):
         n = 480

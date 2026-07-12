@@ -168,7 +168,7 @@ export function createPresenceSweepStrategy(
           });
         }
         const trig = `volRatio=${readout.volRatio.toFixed(2)} driftZ=${Number.isFinite(readout.driftZ) ? readout.driftZ.toFixed(2) : "n/a"}${readout.reentryBlocked ? ", re-entry blocked" : ""}`;
-        const stateCtx = buildStateCtx("DEFENSE", nowMs, halfWidth, toleranceBins, 0, p);
+        const stateCtx = buildStateCtx("DEFENSE", nowMs, halfWidth, toleranceBins, p);
         const withdraw = buildExtremeWithdrawPlan(
           pm,
           `presenceSweep: DEFENSE full withdrawal (${trig})`,
@@ -280,7 +280,7 @@ export function createPresenceSweepStrategy(
       const drift = posCenter !== null ? Math.abs(posCenter - targetCenterBin) : Infinity;
 
       const stateCtx = buildStateCtx(
-        readout.regime, nowMs, halfWidth, toleranceBins, p.maxCenterOffsetBins, p,
+        readout.regime, nowMs, halfWidth, toleranceBins, p,
       );
       if (!sweepDue && drift <= toleranceBins && !outOfRange && !hasFees) {
         return {

@@ -251,13 +251,11 @@ CREATE TABLE IF NOT EXISTS predictions (
   ts_ms           INTEGER NOT NULL,
   model_version   TEXT NOT NULL,
   active_bin      INTEGER NOT NULL,
-  center_q10      REAL NOT NULL,
-  -- center_offset: the q50 center offset in bin units relative to activeBin (F8).
-  -- Named center_offset (not center_q50) because the model predicts an offset
-  -- from the active bin, not an absolute bin position.  centerOffset = 0 means
-  -- "predicted center coincides with the current active bin".
-  center_offset   REAL NOT NULL,
-  center_q90      REAL NOT NULL,
+  -- center_q10 / center_offset / center_q90 were removed 2026-07 with the
+  -- center prediction head (docs/decision-remove-center-prediction.md): the
+  -- distribution is center ≡ active_bin with width_sigma from the vol head.
+  -- Legacy DBs carrying the old NOT NULL columns are refused at startup
+  -- (src/db/client.ts rejectLegacyCenterColumns) with a one-off remediation.
   width_sigma     REAL NOT NULL,
   p_above         REAL NOT NULL,
   p_below         REAL NOT NULL,

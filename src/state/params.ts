@@ -86,11 +86,9 @@ export const HALF_WIDTH_MIN = 2;
 /** Maximum allowed halfWidth in bins. */
 export const HALF_WIDTH_MAX = 8;
 
-/** Minimum maxCenterOffset in bins (non-high-uncertainty path). */
-export const MAX_CENTER_OFFSET_MIN = 1;
-
-/** Maximum maxCenterOffset in bins. */
-export const MAX_CENTER_OFFSET_MAX = 3;
+// MAX_CENTER_OFFSET_* and deriveMaxCenterOffset were removed 2026-07 with
+// the center prediction head: the range center is always the active bin now
+// (docs/decision-remove-center-prediction.md).
 
 /** Denominator used to normalise (pAbove - pBelow) into trendBias. */
 export const TREND_BIAS_NORMALISER = 0.5;
@@ -192,34 +190,16 @@ export function deriveToleranceBins(widthSigma: number, halfWidth: number): numb
 }
 
 /**
- * Derive the maximum allowed center offset (in bins from active bin).
- *
- *   When uncertainty is high (featureCompleteness > U_HIGH threshold):
- *     maxCenterOffset = 1   (center is forced back to active bin)
- *   Otherwise:
- *     maxCenterOffset = clamp(round(widthSigma), 1, 3)
- *
- * "Uncertainty high" here means featureCompleteness is below U_HIGH, making
- * the model less reliable — so we shrink the offset rather than follow the
- * predicted center.
- */
-export function deriveMaxCenterOffset(
-  widthSigma: number,
-  uncertaintyHigh: boolean,
-): number {
-  assertFinite(widthSigma, "deriveMaxCenterOffset", "widthSigma");
-  if (uncertaintyHigh) return 1;
-  const raw = Math.round(widthSigma);
-  return Math.max(MAX_CENTER_OFFSET_MIN, Math.min(MAX_CENTER_OFFSET_MAX, raw));
-}
-
-/**
  * Derive the directional trend bias from prediction probabilities.
  *
  *   trendBias = clamp((pAbove − pBelow) / TREND_BIAS_NORMALISER, -1, 1)
  *
  * Positive → bullish (price expected to move up); negative → bearish.
  * Used only in TREND state.
+ *
+ * NOTE (2026-07, center removal): with the prediction center pinned at 0,
+ * pAbove − pBelow reflects range asymmetry around the active bin, not a
+ * learned market direction — see PredictionResponse.pAbove docs.
  */
 export function deriveTrendBias(pAbove: number, pBelow: number): number {
   assertFinite(pAbove, "deriveTrendBias", "pAbove");

@@ -188,9 +188,12 @@ export function buildFanPoints(
     }
     if (!nearest || best > 15 * 60 * 1000) continue;
     const at = (offset: number) => nearest!.price * Math.pow(ratio, -offset);
-    const lo = Math.min(at(pred.center_q10), at(pred.center_q90));
-    const hi = Math.max(at(pred.center_q10), at(pred.center_q90));
-    bandPoints.push({ ts_ms: pred.ts_ms, band: [lo, hi], center: at(pred.center_offset) });
+    // Center is spot by design (the center head was removed 2026-07); the
+    // band is the ±1.28σ 80 % interval from the vol head.
+    const half = 1.28 * pred.width_sigma;
+    const lo = Math.min(at(-half), at(half));
+    const hi = Math.max(at(-half), at(half));
+    bandPoints.push({ ts_ms: pred.ts_ms, band: [lo, hi], center: at(0) });
   }
   bandPoints.sort((a, b) => a.ts_ms - b.ts_ms);
   return { pricePoints, bandPoints };

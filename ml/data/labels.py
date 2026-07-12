@@ -1,27 +1,25 @@
-"""Label generation for the 30-min-ahead quantile models (plan §3.1).
+"""Label generation for the volatility model.
 
-Two labels per sample timestamp T, both built from the strictly-future window
+One label per sample timestamp T, built from the strictly-future window
 ``(T, T + horizon]`` (the bar at T itself is *feature* territory):
-
-* ``label_center`` — future volume-weighted average price, expressed as a
-  **continuous bin offset** relative to the close at T:
-
-      label_center = log(vwap_future / close_T) / log(1 + bin_step)
-
-  The models regress the continuous offset; integer-bin rounding (``bin_of``)
-  is a presentation/decision concern, not a training one.
 
 * ``label_vol`` — population std (ddof=0) of the ``horizon`` 1-minute log
   returns inside the future window, i.e. a per-bar σ on the same scale as the
   ``ewma_sigma`` feature.
 
+There is deliberately NO price-center label. The pipeline originally also
+produced ``label_center`` (future VWAP as a continuous bin offset) and trained
+q10/q50/q90 quantile heads on it; walk-forward falsified that head
+(center MAE *worse* than centering on spot, direction ≈ coin flip) — see
+docs/decision-remove-center-prediction.md. The serving distribution is
+center ≡ spot with width from the vol head.
+
 Future-window truncation: rows whose window extends past the end of the
 series are **dropped, not padded** — the last ``horizon`` rows of the input
 never produce labels.
 
-VWAP edge case (documented): if total volume over the window is zero, the
-plain mean of the window's closes is used. This is a deterministic definition
-choice, not an error fallback.
+``bin_of`` / ``bin_offset`` remain here as the canonical price↔bin unit
+conversions (used by the backtest harness and by σ→bin scaling).
 """
 
 from __future__ import annotations
@@ -79,14 +77,35 @@ def _future_window_sum(values: np.ndarray, horizon: int) -> np.ndarray:
     return out
 
 
-def make_labels(
+def future_offset(
     df: pd.DataFrame,
     horizon: int = DEFAULT_HORIZON_BARS,
     bin_step: float = DEFAULT_BIN_STEP,
     close_col: str = "sui_close",
-    volume_col: str = "sui_volume",
+) -> pd.Series:
+    """Realized end-of-horizon bin offset: ``log(close_{T+h}/close_T)/log(1+step)``.
+
+    NOT a training label — walk-forward uses it as the *evaluation* yardstick
+    for σ-band calibration (does ±1.28·σ̂ cover ~80 % of realized offsets),
+    which guards the σ-scaling constant that serving's pAbove/pBelow use.
+    NaN where the horizon extends past the series end.
+    """
+    if horizon < 1:
+        raise ValueError("future_offset: horizon must be >= 1")
+    if close_col not in df.columns:
+        raise ValueError(f"future_offset: missing column {close_col!r}")
+    close = df[close_col].astype(float)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        offset = np.log(close.shift(-horizon) / close) / np.log(1.0 + bin_step)
+    return pd.Series(offset, index=df.index, name="future_offset")
+
+
+def make_labels(
+    df: pd.DataFrame,
+    horizon: int = DEFAULT_HORIZON_BARS,
+    close_col: str = "sui_close",
 ) -> pd.DataFrame:
-    """Build ``label_center`` / ``label_vol`` for each row of ``df``.
+    """Build ``label_vol`` for each row of ``df``.
 
     ``df`` is the canonical aligned frame (see ``features.registry``) on a
     1-minute grid. Returns a frame indexed by the subset of ``df.index`` that
@@ -95,20 +114,10 @@ def make_labels(
     """
     if horizon < 1:
         raise ValueError("make_labels: horizon must be >= 1")
-    for col in (close_col, volume_col):
-        if col not in df.columns:
-            raise ValueError(f"make_labels: missing column {col!r}")
+    if close_col not in df.columns:
+        raise ValueError(f"make_labels: missing column {close_col!r}")
 
     close = df[close_col].to_numpy(dtype=float)
-    volume = df[volume_col].to_numpy(dtype=float)
-
-    pv_sum = _future_window_sum(close * volume, horizon)
-    v_sum = _future_window_sum(volume, horizon)
-    c_sum = _future_window_sum(close, horizon)
-
-    with np.errstate(invalid="ignore", divide="ignore"):
-        vwap = np.where(v_sum > 0, pv_sum / v_sum, c_sum / horizon)
-        label_center = np.log(vwap / close) / np.log(1.0 + bin_step)
 
     # Future per-bar σ: population std of the horizon 1-min log returns.
     with np.errstate(invalid="ignore", divide="ignore"):
@@ -123,8 +132,5 @@ def make_labels(
         var = r2_sum / horizon - mean * mean
         label_vol = np.sqrt(np.clip(var, 0.0, None))
 
-    out = pd.DataFrame(
-        {"label_center": label_center, "label_vol": label_vol},
-        index=df.index,
-    )
+    out = pd.DataFrame({"label_vol": label_vol}, index=df.index)
     return out.dropna()

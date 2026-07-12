@@ -44,7 +44,10 @@ class TestNanPolicy:
         full_X, full_c = build_feature_matrix(canonical_frame)
         stripped = canonical_frame.drop(columns=["funding", "oi", "liq_1m"])
         X, c = build_feature_matrix(stripped)
-        derivative_features = ["funding_rate", "funding_ma_8h", "oi_change_30m", "liq_volume_5m"]
+        # oi_change_30m / liq_volume_5m were removed from the registry
+        # (2026-07 retrain) — only the funding features consume derivative
+        # columns now.
+        derivative_features = ["funding_rate", "funding_ma_8h"]
         for name in derivative_features:
             default = next(s.default for s in FEATURES if s.name == name)
             assert (X[name] == default).all()
@@ -61,6 +64,35 @@ class TestNanPolicy:
         _, c = build_feature_matrix(canonical_frame)
         assert c.iloc[-1] > c.iloc[0]
         assert c.iloc[-1] == 1.0  # full synthetic frame: everything computable
+
+
+class TestAnchorFeatures:
+    """Anchor-deviation features (2026-07 retrain): the reversion coordinate."""
+
+    def _frame_from_closes(self, closes):
+        index = pd.date_range("2025-01-06", periods=len(closes), freq="1min", tz="UTC")
+        return pd.DataFrame({"sui_close": closes}, index=index)
+
+    def test_dev_nan_before_window_then_filled_default(self):
+        from features.anchor import dev_4h
+
+        frame = self._frame_from_closes([1.0] * 300)
+        dev = dev_4h(frame)
+        assert dev.iloc[:239].isna().all()  # needs 240 bars
+        assert dev.iloc[239:].abs().max() == pytest.approx(0.0)  # flat series → 0
+
+    def test_dev_positive_when_stretched_above_anchor(self):
+        from features.anchor import dev_1h
+
+        closes = [1.0] * 100 + [1.05] * 5  # jump above the rolling mean
+        dev = dev_1h(self._frame_from_closes(closes))
+        assert dev.iloc[-1] > 0
+
+    def test_dev_z_finite_and_default_filled_in_matrix(self, canonical_frame):
+        X, _ = build_feature_matrix(canonical_frame)
+        for name in ("dev_30m", "dev_1h", "dev_4h", "dev_z_4h"):
+            assert name in X.columns
+            assert np.isfinite(X[name]).all()
 
 
 class TestTsParity:

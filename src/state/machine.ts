@@ -30,10 +30,9 @@
  * to Tier 0 before calling `advance`.  The machine assumes `pred.fallback` is
  * `false` on every call.
  *
- * "Uncertainty high" semantics: when `pred.featureCompleteness < U_HIGH`, only
- * `maxCenterOffset` is tightened (to 1 bin).  `halfWidth`, `toleranceBins`,
- * and `lendingPct` are unaffected.  `maxCenterOffset` is not part of
- * `StateContext` (it is consumed by `diffPlanner`) — see docs.
+ * (2026-07) `maxCenterOffset` and its "uncertainty high" tightening were
+ * removed with the center prediction head: the range center is always the
+ * active bin now — docs/decision-remove-center-prediction.md.
  */
 
 import type { Database } from "bun:sqlite";
@@ -54,7 +53,6 @@ import {
   deriveLendingPct,
   deriveTrendBias,
   deriveToleranceBins,
-  deriveMaxCenterOffset,
 } from "./params.ts";
 import {
   type ExtremeSignal,
@@ -187,11 +185,6 @@ export function createStateMachine(deps: {
     const halfWidth = deriveHalfWidth(pred.widthSigma, params);
     const toleranceBins = deriveToleranceBins(pred.widthSigma, halfWidth);
 
-    // F5: populate maxCenterOffset in the context so diffPlanner doesn't need to
-    // re-derive it. The state machine owns the derivation; diffPlanner reads it.
-    const uncertaintyHigh = pred.featureCompleteness < params.uHigh;
-    const maxCenterOffset = deriveMaxCenterOffset(pred.widthSigma, uncertaintyHigh);
-
     const ctx: StateContext = {
       state,
       enteredAtMs,
@@ -201,7 +194,6 @@ export function createStateMachine(deps: {
       strongTrend: Math.abs(trendBias) > params.trendBiasStrong,
       lendingPct,
       toleranceBins,
-      maxCenterOffset,
       minDwellMs: MIN_DWELL_MS[state],
     };
     // Cache the advance()-derived context so current() reflects the real
@@ -264,15 +256,6 @@ export function createStateMachine(deps: {
     const nowMs = now();
     const { state, enteredAtMs } = internalState;
     const dwellOk = dwellElapsed(state, enteredAtMs, nowMs);
-
-    const uncertaintyHigh = pred.featureCompleteness < params.uHigh;
-
-    if (uncertaintyHigh) {
-      log.debug("state_machine: uncertainty high, tightening maxCenterOffset", {
-        pool_id: poolId,
-        featureCompleteness: pred.featureCompleteness,
-      });
-    }
 
     // EXTREME entry is an EMERGENCY transition and deliberately bypasses the
     // min-dwell gate: a flash crash or L2 circuit-breaker signal arriving 1
@@ -367,7 +350,6 @@ export function createStateMachine(deps: {
       strongTrend: false,
       lendingPct: deriveLendingPct(internalState.state, 0),
       toleranceBins: 1,
-      maxCenterOffset: 1,     // conservative default; real value requires featureCompleteness
       minDwellMs: MIN_DWELL_MS[internalState.state],
     };
   }

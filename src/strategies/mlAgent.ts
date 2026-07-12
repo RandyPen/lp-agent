@@ -379,13 +379,13 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
           db.prepare(`
             INSERT INTO predictions (
               pool_id, ts_ms, model_version, active_bin,
-              center_q10, center_offset, center_q90, width_sigma,
-              p_above, p_below, feature_completeness, psi,
+              width_sigma, p_above, p_below,
+              feature_completeness, psi,
               fallback, executed_path, infer_ms, snapshot_digest
             ) VALUES (
               ?, ?, ?, ?,
-              ?, ?, ?, ?,
-              ?, ?, ?, ?,
+              ?, ?, ?,
+              ?, ?,
               ?, ?, ?, ?
             )
           `).run(
@@ -393,9 +393,6 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
             snapshot.ts,
             pred.modelVersion,
             snapshot.cetus.activeBin,
-            pred.centerQ10,
-            pred.centerOffset,   // the q50 center offset in bin units (F8)
-            pred.centerQ90,
             pred.widthSigma,
             pred.pAbove,
             pred.pBelow,
@@ -564,16 +561,12 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
       });
       if (!plan) return { kind: "quiet", reason: "below min threshold" };
 
-      // fillBoundary: the SAME clamped center diffPlan actually built the
-      // position around (F10) — using the raw (unclamped) predicted offset
-      // here would disagree with where liquidity actually sits whenever
-      // |offset| > maxCenterOffset (NORMAL state; TREND always centers on
-      // the active bin per §3.2, which computeTargetCenterBin also honours).
+      // fillBoundary: the SAME center diffPlan actually built the position
+      // around (F10). Since the center-prediction removal this is always the
+      // active bin; the shared helper keeps the invariant greppable.
       const fillBoundary = computeTargetCenterBin(
         adjustedCtx.state,
         input.pool.activeBinId,
-        pred.centerOffset,
-        adjustedCtx.maxCenterOffset,
       );
 
       return {

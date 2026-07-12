@@ -1,4 +1,7 @@
-"""Label generation: bin math, future-window truncation, hand-computed values."""
+"""Label generation: bin math, future-window truncation, hand-computed values.
+
+label_center / VWAP tests were removed with the center head (2026-07,
+docs/decision-remove-center-prediction.md); label_vol is the only label."""
 
 import math
 
@@ -6,15 +9,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data.labels import bin_of, bin_offset, make_labels
+from data.labels import bin_of, bin_offset, future_offset, make_labels
 from tests.conftest import make_canonical_frame
 
 
-def _tiny_frame(closes, volumes=None):
+def _tiny_frame(closes):
     n = len(closes)
-    volumes = volumes if volumes is not None else [10.0] * n
     index = pd.date_range("2025-01-06", periods=n, freq="1min", tz="UTC")
-    return pd.DataFrame({"sui_close": closes, "sui_volume": volumes}, index=index)
+    return pd.DataFrame({"sui_close": closes}, index=index)
 
 
 class TestBinOf:
@@ -72,25 +74,26 @@ class TestFutureWindowTruncation:
 class TestLabelValues:
     def test_constant_price_gives_zero_labels(self):
         labels = make_labels(_tiny_frame([2.0] * 10), horizon=3)
-        assert np.allclose(labels["label_center"], 0.0)
         assert np.allclose(labels["label_vol"], 0.0)
-
-    def test_center_label_is_future_vwap_offset(self):
-        closes = [1.0, 1.02, 1.04]
-        volumes = [5.0, 10.0, 30.0]
-        labels = make_labels(_tiny_frame(closes, volumes), horizon=2, bin_step=0.005)
-        vwap = (1.02 * 10 + 1.04 * 30) / 40
-        expected = math.log(vwap / 1.0) / math.log(1.005)
-        assert labels["label_center"].iloc[0] == pytest.approx(expected)
-
-    def test_zero_volume_window_uses_mean_close(self):
-        closes = [1.0, 2.0, 4.0]
-        labels = make_labels(_tiny_frame(closes, [0.0, 0.0, 0.0]), horizon=2, bin_step=0.005)
-        expected = math.log(3.0 / 1.0) / math.log(1.005)  # mean(2, 4) = 3
-        assert labels["label_center"].iloc[0] == pytest.approx(expected)
 
     def test_vol_label_is_population_std_of_future_returns(self):
         closes = [1.0, 1.1, 0.9, 1.05]
         labels = make_labels(_tiny_frame(closes), horizon=3)
         r = np.diff(np.log(closes))  # the three returns in (T0, T0+3]
         assert labels["label_vol"].iloc[0] == pytest.approx(np.std(r))
+
+    def test_only_vol_label_is_produced(self):
+        labels = make_labels(_tiny_frame([1.0, 1.1, 0.9, 1.05]), horizon=2)
+        assert list(labels.columns) == ["label_vol"]
+
+
+class TestFutureOffset:
+    def test_endpoint_offset_matches_log_ratio(self):
+        closes = [1.0, 1.02, 1.04]
+        offset = future_offset(_tiny_frame(closes), horizon=2, bin_step=0.005)
+        expected = math.log(1.04 / 1.0) / math.log(1.005)
+        assert offset.iloc[0] == pytest.approx(expected)
+
+    def test_tail_rows_are_nan(self):
+        offset = future_offset(_tiny_frame([1.0, 1.02, 1.04]), horizon=2)
+        assert offset.iloc[-2:].isna().all()

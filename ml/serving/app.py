@@ -5,9 +5,13 @@ Endpoints
 ``GET /health``    → ``{status, model_version, loaded_at, psi_summary}``
 ``POST /predict``  → input ``MarketSnapshot`` (camelCase, same shape as
                      ``src/prediction/types.ts``), output ``PredictionResponse``
-                     with exactly these keys: ``centerOffset, centerQ10,
-                     centerQ90, widthSigma, pAbove, pBelow, modelVersion,
-                     featureCompleteness, psi, fallback``
+                     with exactly these keys: ``widthSigma, pAbove, pBelow,
+                     modelVersion, featureCompleteness, psi, fallback``
+
+The center quantile heads (centerOffset/centerQ10/centerQ90) were removed
+2026-07 after walk-forward falsified them — the served distribution is
+center ≡ spot with width from the vol head. See
+docs/decision-remove-center-prediction.md.
 ``POST /reload``   → ``{"artifact_dir": …}``; hot-swap via the model registry,
                      HTTP 409 + old model keeps serving on failure.
 
@@ -39,17 +43,19 @@ atomic step.
 
 Contract decisions beyond the docs (documented here on purpose):
 
-* ``pAbove``/``pBelow`` are the probabilities that the predicted 30-min
-  center lands above/below the current active bin, i.e. outside the
-  ``[lowerOffset, upperOffset]`` band (default ±0.5 bin). A caller that wants
-  range-break probabilities for a wider position passes the optional
+* ``widthSigma`` is the vol head's per-bar σ scaled to the model horizon and
+  converted to bin units: ``σ̂ × √horizon_bars / ln(1 + bin_step)``, with
+  horizon/bin_step taken from ``models_meta.json``. This is the σ of the
+  end-of-horizon price-offset distribution, centered on spot.
+* ``pAbove``/``pBelow`` are the probabilities (under that center-0 normal)
+  that the horizon price lands above/below the ``[lowerOffset, upperOffset]``
+  band (default ±0.5 bin). A caller that wants range-break probabilities for
+  a wider position passes the optional
   ``pmRangeContext: {lowerOffset, upperOffset}`` field on the snapshot.
-* Quantile crossings (q10 > q50 etc., possible with independently trained
-  quantile models) are repaired by sorting the three predictions.
 * ``cetus.binStep`` on the snapshot is accepted but not used in computation:
-  the models are trained for a fixed bin step recorded in
+  the model is trained for a fixed bin step recorded in
   ``models_meta.json``; mixing per-request bin steps would silently change
-  the unit of the labels.
+  the unit of the output.
 
 The server binds 127.0.0.1 only.
 
@@ -72,21 +78,20 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
-from features.derivatives import FUNDING_MA_WINDOW, LIQ_SUM_WINDOW, OI_CHANGE_WINDOW
+from features.derivatives import FUNDING_MA_WINDOW
 from features.registry import build_feature_vector
 from serving.psi import PsiTracker
 from serving.registry import ModelRegistry
 
 DEFAULT_PORT = 8765
 BIND_HOST = "127.0.0.1"  # local sidecar only — never expose externally
-WIDTH_DIVISOR = 2.56  # (q90 - q10) / 2.56 ≈ σ for a normal distribution
 MIN_WIDTH_SIGMA = 1e-9
 PSI_FALLBACK_THRESHOLD = 0.25
 COMPLETENESS_FALLBACK_THRESHOLD = 0.7
 
 # Forward-fill limits for reconstructing derivative grid columns from the
 # sidecar's own accumulated history. MUST mirror training
-# (training.train_quantile FUNDING_FFILL_LIMIT / OI_FFILL_LIMIT) so the
+# (training.train_vol FUNDING_FFILL_LIMIT / OI_FFILL_LIMIT) so the
 # alignment semantics are identical on both sides of the model. Liquidation
 # volume gets no fill — training has no liq backfill path at all, and the
 # 1-minute notional is only meaningful at the minute it was observed.
@@ -264,19 +269,11 @@ def _psi_exclusions(frame: pd.DataFrame) -> set[str]:
     funding = frame["funding"]
     if len(funding) < FUNDING_MA_WINDOW or funding.iloc[-FUNDING_MA_WINDOW:].isna().any():
         excl.add("funding_ma_8h")
-    oi = frame["oi"]
-    # oi_change_30m needs strictly positive OI now and 30 minutes ago
-    # (features.derivatives invalidates non-positive OI). NaN comparisons are
-    # False, so missing history lands here too.
-    if (
-        len(oi) <= OI_CHANGE_WINDOW
-        or not (oi.iloc[-1] > 0)
-        or not (oi.iloc[-1 - OI_CHANGE_WINDOW] > 0)
-    ):
-        excl.add("oi_change_30m")
-    liq = frame["liq_1m"]
-    if len(liq) < LIQ_SUM_WINDOW or liq.iloc[-LIQ_SUM_WINDOW:].isna().any():
-        excl.add("liq_volume_5m")
+    # oi_change_30m / liq_volume_5m were removed from the feature registry
+    # (2026-07 retrain: dead over the whole training year — see
+    # features/registry.py). Their scalar history is still recorded into the
+    # canonical frame (harmless, and available if they are reintroduced), but
+    # no PSI exclusions are needed for features that no longer exist.
     return excl
 
 
@@ -358,13 +355,18 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-        raw = [float(bundle.boosters[k].predict(x)[0]) for k in ("q10", "q50", "q90")]
-        q10, q50, q90 = sorted(raw)  # repair quantile crossings (documented)
-        width_sigma = max((q90 - q10) / WIDTH_DIVISOR, MIN_WIDTH_SIGMA)
+        # Vol head → σ of the end-of-horizon offset in bin units, center = spot.
+        vol_per_bar = float(bundle.boosters["vol"].predict(x)[0])
+        horizon = int(bundle.meta["horizon_bars"])
+        bin_step = float(bundle.meta["bin_step"])
+        width_sigma = max(
+            vol_per_bar * math.sqrt(horizon) / math.log(1.0 + bin_step),
+            MIN_WIDTH_SIGMA,
+        )
 
         ctx = snapshot.pmRangeContext or PmRangeContext()
-        p_above = 1.0 - _norm_cdf((ctx.upperOffset - q50) / width_sigma)
-        p_below = _norm_cdf((ctx.lowerOffset - q50) / width_sigma)
+        p_above = 1.0 - _norm_cdf(ctx.upperOffset / width_sigma)
+        p_below = _norm_cdf(ctx.lowerOffset / width_sigma)
 
         psi_summary = tracker.observe(x[0], exclude=exclusions)
         psi_max = float(psi_summary["max"])
@@ -376,9 +378,6 @@ def create_app(
             fallback = "psi"
 
         return {
-            "centerOffset": q50,
-            "centerQ10": q10,
-            "centerQ90": q90,
             "widthSigma": width_sigma,
             "pAbove": p_above,
             "pBelow": p_below,

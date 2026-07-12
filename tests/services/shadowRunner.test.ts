@@ -65,7 +65,6 @@ function makeCtx(state: StateContext["state"] = "NORMAL"): StateContext {
     strongTrend: false,
     lendingPct: 0.35,
     toleranceBins: 2,
-    maxCenterOffset: 2,
     minDwellMs: 15 * 60 * 1000,
   };
 }

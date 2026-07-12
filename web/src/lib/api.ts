@@ -74,9 +74,8 @@ export interface Prediction {
   ts_ms: number;
   model_version: string;
   active_bin: number;
-  center_q10: number;
-  center_offset: number;
-  center_q90: number;
+  // center_* columns were removed with the center prediction head (2026-07):
+  // the band is now active_bin ± 1.28 × width_sigma.
   width_sigma: number;
   p_above: number;
   p_below: number;

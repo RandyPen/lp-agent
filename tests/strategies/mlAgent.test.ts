@@ -91,9 +91,6 @@ function makeSnapshot(): MarketSnapshot {
 
 function makePred(overrides: Partial<PredictionResponse> = {}): PredictionResponse {
   return {
-    centerOffset: 0,
-    centerQ10: -1,
-    centerQ90: 1,
     widthSigma: 1,
     pAbove: 0.2,
     pBelow: 0.2,
@@ -115,7 +112,6 @@ function makeCtx(state: StateContext["state"] = "NORMAL"): StateContext {
     strongTrend: false,
     lendingPct: 0.35,
     toleranceBins: 2,
-    maxCenterOffset: 2,
     minDwellMs: 15 * 60 * 1000,
   };
 }
@@ -613,20 +609,21 @@ describe("mlAgent — output kinds", () => {
 });
 
 // ---------------------------------------------------------------------------
-// F10 — fillBoundary must match diffPlan's clamped center, not the raw
-// (unclamped) predicted offset.
+// F10 — fillBoundary must match the center diffPlan actually builds around.
+// Since the center prediction head was removed, that center is always the
+// active bin (docs/decision-remove-center-prediction.md).
 // ---------------------------------------------------------------------------
 
-describe("mlAgent — fillBoundary uses the clamped plan center (F10)", () => {
+describe("mlAgent — fillBoundary uses the plan center (F10)", () => {
   beforeEach(() => {
     db = freshDb();
   });
 
-  it("clamps fillBoundary to ±maxCenterOffset instead of the raw centerOffset", async () => {
-    const ctx: StateContext = { ...makeCtx("NORMAL"), maxCenterOffset: 1 };
-    // Raw predicted offset (10) far exceeds maxCenterOffset (1) — diffPlan
-    // clamps its center to activeBin+1; fillBoundary must agree.
-    const pred = makePred({ centerOffset: 10, fallback: false });
+  // "clamps fillBoundary to ±maxCenterOffset instead of the raw centerOffset" removed
+  // with the center prediction head (docs/decision-remove-center-prediction.md)
+  it("fillBoundary is the active bin — the center diffPlan builds around", async () => {
+    const ctx: StateContext = makeCtx("NORMAL");
+    const pred = makePred({ fallback: false });
     const strategy = createMlAgentStrategy(makeDeps({
       provider: makeMockProvider(pred),
       stateMachine: makeMockStateMachine(ctx),
@@ -636,8 +633,8 @@ describe("mlAgent — fillBoundary uses the clamped plan center (F10)", () => {
     if (output.kind !== "plan_and_reconcile" && output.kind !== "plan_only") {
       throw new Error(`expected a plan, got ${output.kind}`);
     }
-    // activeBin=100 (fixture) + clamp(round(10), -1, 1) = 101, NOT 110.
-    expect(output.fillBoundary).toBe(101);
+    // activeBin=100 (fixture) — the plan is always centered on it.
+    expect(output.fillBoundary).toBe(100);
   });
 });
 
@@ -669,10 +666,10 @@ describe("mlAgent — restart rehydration", () => {
     db.prepare(`
       INSERT INTO predictions (
         pool_id, ts_ms, model_version, active_bin,
-        center_q10, center_offset, center_q90, width_sigma,
+        width_sigma,
         p_above, p_below, feature_completeness, psi,
         fallback, executed_path, infer_ms, snapshot_digest
-      ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, 0.1, 'sidecar_down', 'tier0_fallback', 50, 'x')
+      ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, 0.1, 'sidecar_down', 'tier0_fallback', 50, 'x')
     `).run(POOL_ID, BASE_NOW - 1000);
 
     // Construct a NEW agent instance on the same DB — simulates restart.
@@ -694,10 +691,10 @@ describe("mlAgent — restart rehydration", () => {
       db.prepare(`
         INSERT INTO predictions (
           pool_id, ts_ms, model_version, active_bin,
-          center_q10, center_offset, center_q90, width_sigma,
+          width_sigma,
           p_above, p_below, feature_completeness, psi,
           fallback, executed_path, infer_ms, snapshot_digest
-        ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, ?, ?, ?, 50, 'x')
+        ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, ?, ?, ?, 50, 'x')
       `).run(POOL_ID, ts, psi, fallbackVal, executedPath);
     };
 
@@ -751,10 +748,10 @@ describe("mlAgent — restart rehydration", () => {
       db.prepare(`
         INSERT INTO predictions (
           pool_id, ts_ms, model_version, active_bin,
-          center_q10, center_offset, center_q90, width_sigma,
+          width_sigma,
           p_above, p_below, feature_completeness, psi,
           fallback, executed_path, infer_ms, snapshot_digest
-        ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, 0.1, NULL, 'model', 50, 'x')
+        ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, 0.1, NULL, 'model', 50, 'x')
       `).run(POOL_ID, BASE_NOW - (3 - i) * 1000);
     }
 
@@ -779,10 +776,10 @@ describe("mlAgent — restart rehydration", () => {
     db.prepare(`
       INSERT INTO predictions (
         pool_id, ts_ms, model_version, active_bin,
-        center_q10, center_offset, center_q90, width_sigma,
+        width_sigma,
         p_above, p_below, feature_completeness, psi,
         fallback, executed_path, infer_ms, snapshot_digest
-      ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, 0.1, 'timeout', 'tier0_fallback', 50, 'x')
+      ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, 0.1, 'timeout', 'tier0_fallback', 50, 'x')
     `).run(POOL_ID, BASE_NOW - 1000);
 
     const fallback: Strategy = {
@@ -802,19 +799,19 @@ describe("mlAgent — restart rehydration", () => {
     db.prepare(`
       INSERT INTO predictions (
         pool_id, ts_ms, model_version, active_bin,
-        center_q10, center_offset, center_q90, width_sigma,
+        width_sigma,
         p_above, p_below, feature_completeness, psi,
         fallback, executed_path, infer_ms, snapshot_digest
-      ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, 0.1, 'sidecar_down', 'tier0_fallback', 50, 'x')
+      ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, 0.1, 'sidecar_down', 'tier0_fallback', 50, 'x')
     `).run(POOL_ID, BASE_NOW - 2000);
 
     db.prepare(`
       INSERT INTO predictions (
         pool_id, ts_ms, model_version, active_bin,
-        center_q10, center_offset, center_q90, width_sigma,
+        width_sigma,
         p_above, p_below, feature_completeness, psi,
         fallback, executed_path, infer_ms, snapshot_digest
-      ) VALUES (?, ?, 'v1', 100, -1, 0, 1, 1, 0.2, 0.2, 1.0, 0.1, NULL, 'model', 50, 'x')
+      ) VALUES (?, ?, 'v1', 100, 1, 0.2, 0.2, 1.0, 0.1, NULL, 'model', 50, 'x')
     `).run(POOL_ID, BASE_NOW - 1000);
 
     const fallback: Strategy = {

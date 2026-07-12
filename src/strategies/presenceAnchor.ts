@@ -361,7 +361,6 @@ export function buildStateCtx(
   nowMs: number,
   halfWidth: number,
   toleranceBins: number,
-  maxCenterOffset: number,
   p: Required<PresenceAnchorParams>,
 ): StateContext {
   const state: MarketState = regime === "DEFENSE" ? "EXTREME" : regime;
@@ -376,7 +375,6 @@ export function buildStateCtx(
     strongTrend: false,
     lendingPct,
     toleranceBins,
-    maxCenterOffset,
     minDwellMs: MIN_DWELL_MS[state],
   };
 }
@@ -464,7 +462,7 @@ export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}):
           `volRatio=${readout.volRatio.toFixed(2)}` +
           ` driftZ=${Number.isFinite(readout.driftZ) ? readout.driftZ.toFixed(2) : "n/a"}` +
           `${readout.reentryBlocked ? ", re-entry blocked" : ""}`;
-        const stateCtx = buildStateCtx("DEFENSE", nowMs, halfWidth, toleranceBins, 0, p);
+        const stateCtx = buildStateCtx("DEFENSE", nowMs, halfWidth, toleranceBins, p);
         const withdraw = buildExtremeWithdrawPlan(
           pm,
           `presenceAnchor: DEFENSE full withdrawal (${trig})`,
@@ -522,7 +520,6 @@ export function createPresenceAnchorStrategy(params: PresenceAnchorParams = {}):
         nowMs,
         halfWidth,
         toleranceBins,
-        p.maxCenterOffsetBins,
         p,
       );
 

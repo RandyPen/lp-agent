@@ -77,8 +77,13 @@ export interface MarketSnapshot {
 // ---------------------------------------------------------------------------
 
 /**
- * Output of `PredictionProvider.predict`. All center offsets are in bin units,
- * relative to the current `activeBin`.
+ * Output of `PredictionProvider.predict`.
+ *
+ * There is deliberately NO predicted center: the former q50/q10/q90 center
+ * heads were removed 2026-07 after walk-forward showed the q50 placed the
+ * center WORSE than spot and its sign was a coin flip
+ * (docs/decision-remove-center-prediction.md). The served distribution is
+ * center ≡ activeBin with width from the vol head.
  *
  * `fallback` semantics (see prediction-service-design.md §4.2 and §4.4):
  *   false          — normal inference, all fields reflect the model's output
@@ -93,45 +98,40 @@ export interface MarketSnapshot {
  * switch to Tier 0 and record the fallback reason.
  */
 export interface PredictionResponse {
-  /** q50: predicted center bin offset relative to active bin. */
-  centerOffset: number;
-  /** q10: lower quantile of center offset distribution. */
-  centerQ10: number;
-  /** q90: upper quantile of center offset distribution. */
-  centerQ90: number;
   /**
-   * Predicted distribution width in bin units.
-   * widthSigma = (centerQ90 − centerQ10) / 2.56
-   * (dividing by 2.56 converts the 80 % quantile spread to a σ-equivalent).
+   * σ of the end-of-horizon price-offset distribution, in bin units,
+   * centered on the active bin.
    *
-   * Note: the sidecar's widthSigma measures center-prediction uncertainty
-   * (quantile spread / 2.56), NOT raw price σ. It represents how uncertain
-   * the model is about where the center will be, in bin units.
+   * Sidecar: the vol head's per-bar σ scaled to the model horizon —
+   *   widthSigma = σ̂_perBar × √horizon_bars / ln(1 + bin_step)
+   * NullProvider: EWMA σ scaled the same way. The two providers now ship the
+   * SAME quantity (before the center removal the sidecar sent the q10–q90
+   * quantile spread / 2.56, a subtly different measure).
    */
   widthSigma: number;
   /**
-   * Probability that the price will move above the upper boundary of the
-   * current active bin range within the prediction horizon.
+   * Probability that the price ends above the upper boundary of the current
+   * bin range at the prediction horizon.
    *
    * Definition (aligned with sidecar ml/serving/app.py):
-   *   pAbove = 1 − Φ((upperOffset − q50) / widthSigma)
+   *   pAbove = 1 − Φ(upperOffset / widthSigma)
    * where upperOffset is the upper boundary of the PM's current bin range
    * (in bin units relative to activeBin), defaulting to +0.5 bin when no
-   * range context is provided. q50 = centerOffset (= 0 for NullProvider).
+   * range context is provided. The center is pinned at 0 (spot).
    *
    * Both pAbove and pBelow use bin-unit offsets so they are scale-invariant
    * with respect to the pool's binStep.
    */
   pAbove: number;
   /**
-   * Probability that the price will move below the lower boundary of the
-   * current active bin range within the prediction horizon.
+   * Probability that the price ends below the lower boundary of the current
+   * bin range at the prediction horizon.
    *
    * Definition (aligned with sidecar ml/serving/app.py):
-   *   pBelow = Φ((lowerOffset − q50) / widthSigma)
+   *   pBelow = Φ(lowerOffset / widthSigma)
    * where lowerOffset is the lower boundary of the PM's current bin range
    * (in bin units, typically negative), defaulting to −0.5 bin when no
-   * range context is provided. q50 = centerOffset (= 0 for NullProvider).
+   * range context is provided. The center is pinned at 0 (spot).
    */
   pBelow: number;
   /** Model artifact version string (e.g. "null-v0", "v1.0.0"). */
@@ -184,6 +184,12 @@ export interface StateContext {
    * Trend bias in [-1, 1]. Non-zero only in TREND state.
    * trendBias = clamp((pAbove − pBelow) / 0.5, -1, 1).
    * Positive → bullish skew; negative → bearish skew.
+   *
+   * NOTE (2026-07, center removal): with the prediction center pinned at 0,
+   * pAbove − pBelow is non-zero only when the position range sits
+   * asymmetrically around the active bin — i.e. this now measures "which
+   * side of our range is price closer to breaking", not a learned market
+   * direction (the old q50-derived tilt was statistically a coin flip).
    */
   trendBias: number;
   /**
@@ -199,8 +205,8 @@ export interface StateContext {
    */
   lendingPct: number;
   /**
-   * Maximum allowed drift in bins from the predicted center before a
-   * recenter is triggered.
+   * Maximum allowed drift in bins from the range center (the active bin at
+   * placement time) before a recenter is triggered.
    *
    * Derivation (params.ts §5.1):
    *   toleranceBins = max(1, round(widthSigma))
@@ -208,17 +214,6 @@ export interface StateContext {
    *   permanently true when real SUI vol causes widthSigma >> halfWidth.
    */
   toleranceBins: number;
-  /**
-   * Maximum allowed center offset in bins from the active bin (F5).
-   *
-   * Derivation (params.ts deriveMaxCenterOffset):
-   *   When featureCompleteness < U_HIGH (uncertainty high):  maxCenterOffset = 1
-   *   Otherwise: clamp(round(widthSigma), 1, 3)
-   *
-   * diffPlanner reads this directly instead of re-deriving it, ensuring the
-   * state machine is the single source of truth for this parameter.
-   */
-  maxCenterOffset: number;
   /**
    * Minimum time (ms) to remain in the current state before a transition is
    * allowed. Prevents rapid oscillation at state boundaries.

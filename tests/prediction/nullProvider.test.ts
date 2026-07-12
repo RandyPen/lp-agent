@@ -7,8 +7,11 @@
  *   2. σ → bin unit conversion sanity.
  *   3. pAbove + pBelow < 1 (by log-normal construction they are symmetric but
  *      their sum must be < 1 for any non-degenerate σ).
- *   4. Symmetric quantiles: centerQ10 = −centerQ90 when centerOffset = 0.
- *   5. health() always returns ok=true.
+ *   4. health() always returns ok=true.
+ *
+ * There is no predicted center: the centerOffset/centerQ10/centerQ90 fields
+ * were removed with the center prediction head (docs/decision-remove-center-prediction.md);
+ * the distribution is always centered on the active bin.
  */
 
 import { describe, it, expect, beforeEach } from "bun:test";
@@ -87,9 +90,6 @@ describe("NullPredictionProvider", () => {
       const ctx = makeCtx();
       const resp = await provider.predict(snapshot, ctx);
 
-      expect(typeof resp.centerOffset).toBe("number");
-      expect(typeof resp.centerQ10).toBe("number");
-      expect(typeof resp.centerQ90).toBe("number");
       expect(typeof resp.widthSigma).toBe("number");
       expect(typeof resp.pAbove).toBe("number");
       expect(typeof resp.pBelow).toBe("number");
@@ -100,10 +100,7 @@ describe("NullPredictionProvider", () => {
       expect(resp.fallback).toBe(false);
     });
 
-    it("centerOffset is always 0 (no directional prediction)", async () => {
-      const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.002)), makeCtx());
-      expect(resp.centerOffset).toBe(0);
-    });
+    // "centerOffset is always 0 (no directional prediction)" removed with the center prediction head (docs/decision-remove-center-prediction.md)
 
     it("modelVersion is 'null-v0'", async () => {
       const resp = await provider.predict(makeSnapshot(makeBars(10, 2.5)), makeCtx());
@@ -235,24 +232,8 @@ describe("NullPredictionProvider", () => {
     });
   });
 
-  describe("symmetric quantiles", () => {
-    it("centerQ10 = −centerQ90 (symmetric around centerOffset=0)", async () => {
-      const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.002)), makeCtx());
-      expect(resp.centerQ90).toBe(-resp.centerQ10);
-    });
-
-    it("centerQ90 ≥ 1 (interval is at least ±1 bin)", async () => {
-      const resp = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.002)), makeCtx());
-      expect(resp.centerQ90).toBeGreaterThanOrEqual(1);
-    });
-
-    it("wider σ gives wider quantile interval", async () => {
-      const ctx = makeCtx();
-      const lowVol = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.0001)), ctx);
-      const highVol = await provider.predict(makeSnapshot(makeBars(30, 2.5, 0.01)), ctx);
-      expect(highVol.centerQ90).toBeGreaterThanOrEqual(lowVol.centerQ90);
-    });
-  });
+  // "symmetric quantiles" describe (centerQ10 = −centerQ90, centerQ90 ≥ 1, wider σ → wider interval)
+  // removed with the center prediction head (docs/decision-remove-center-prediction.md)
 
   describe("edge cases", () => {
     it("handles empty sui bar array gracefully (produces valid output)", async () => {
@@ -275,9 +256,6 @@ describe("NullPredictionProvider", () => {
       const ctx = makeCtx();
       const r1 = await provider.predict(snapshot, ctx);
       const r2 = await provider.predict(snapshot, ctx);
-      expect(r1.centerOffset).toBe(r2.centerOffset);
-      expect(r1.centerQ10).toBe(r2.centerQ10);
-      expect(r1.centerQ90).toBe(r2.centerQ90);
       expect(r1.widthSigma).toBe(r2.widthSigma);
       expect(r1.pAbove).toBe(r2.pAbove);
       expect(r1.pBelow).toBe(r2.pBelow);

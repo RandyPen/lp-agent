@@ -91,9 +91,6 @@ function makeSnapshot(
 
 function makePrediction(overrides: Partial<PredictionResponse> = {}): PredictionResponse {
   return {
-    centerOffset: 0,
-    centerQ10: -1,
-    centerQ90: 1,
     widthSigma: 0.78,
     pAbove: 0.15,
     pBelow: 0.15,

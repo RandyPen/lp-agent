@@ -217,7 +217,7 @@ function handlePredictions(cfg: AppConfig, url: URL): Response {
   if (limit instanceof Response) return limit;
   const rows = getDb()
     .prepare(
-      "SELECT ts_ms, model_version, active_bin, center_q10, center_offset, center_q90, width_sigma, p_above, p_below, feature_completeness, psi, fallback, executed_path, infer_ms FROM predictions WHERE pool_id = ? ORDER BY ts_ms DESC LIMIT ?",
+      "SELECT ts_ms, model_version, active_bin, width_sigma, p_above, p_below, feature_completeness, psi, fallback, executed_path, infer_ms FROM predictions WHERE pool_id = ? ORDER BY ts_ms DESC LIMIT ?",
     )
     .all(cfg.poolProfile.poolId, limit);
   return json(rows);

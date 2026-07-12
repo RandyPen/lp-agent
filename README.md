@@ -53,7 +53,7 @@ flowchart TB
     end
 
     subgraph ml["🐍 ML sidecar · Python / uv (optional)"]
-        PRED["PredictionProvider seam"] --> LGBM["LightGBM quantile<br/>q10 / q50 / q90 + vol"]
+        PRED["PredictionProvider seam"] --> LGBM["LightGBM vol model<br/>σ + range-break probabilities"]
     end
 
     AGG -- "market snapshot" --> PRED
@@ -81,7 +81,7 @@ flowchart TB
 | Executor (atomic PTB) | `EXEC` | `src/services/executor.ts` |
 | Treasury (billing) | `TRE` | `src/treasury/` |
 | PredictionProvider seam | `PRED` | `src/prediction/` |
-| LightGBM quantile model | `LGBM` | `ml/` (Python sidecar, uv-managed) |
+| LightGBM vol model | `LGBM` | `ml/` (Python sidecar, uv-managed) — vol-only by design; the center head was falsified and removed, see `docs/decision-remove-center-prediction.md` |
 | PositionManager / pool / lending | `PM` · `POOL` · `LEND` | on-chain: CDPM PositionManager, Cetus DLMM pool, Scallop/Kai (adapters in `src/sui/lending/`) |
 
 **One tick, per subscribed PM:** fetch PM state + pool active bin + spot + history → pre-tick **risk** check → **state** machine eval → **strategy** plan — consuming either the ML prediction or the rule-based **forecast** layer (σ + bin weights), plus the state params → lending router decides redeem/supply → (optional) **treasury** pre-debit → **executor** submits the unified PTB → on failure refund the charge → record to SQLite. The ML sidecar is consumed only through the `PredictionProvider` seam; if it is unavailable the agent degrades explicitly to the rule-based forecast (the Tier 0 floor) and logs the reason — never a silent fallback.
@@ -190,7 +190,7 @@ A standalone user-facing site ships in `web/` — Vite + React 19 + `@mysten/dap
 
 - **Enroll** — create a custody `PositionManager` + add liquidity (tx 1), then whitelist the agent operator (tx 2). The agent's `AgentAdded` watcher picks the PM up automatically; the wizard cross-checks that the portal and the running agent point at the same CDPM deployment before signing.
 - **Dashboard** — NAV per PM, cumulative fee income, three-state timeline, live L1/L2/L3 risk events.
-- **Intelligence** — observed price vs the model's q10–q90 quantile fan, model-vs-fallback share, shadow-mode ML-vs-rule comparison.
+- **Intelligence** — observed price vs the model's ±1.28σ vol band (centered on spot — the pipeline deliberately predicts no price direction), model-vs-fallback share, shadow-mode ML-vs-rule comparison.
 - **Positions** — per-PM rebalance history with full plan drill-down and explorer links.
 - **Account** — signature-only registration, per-user deposit address, credit balance, deposit history.
 

@@ -7,16 +7,20 @@
  *   3. Connection / network error → fallback="sidecar_down".
  *   4. Non-200 HTTP status → fallback="sidecar_down".
  *   5. Malformed body (not JSON, missing keys, wrong types) → fallback="sidecar_down".
- *   6. Quantile-crossing body (q10 > q50) → fallback="sidecar_down".
- *   7. Sidecar-reported fallback="psi" passthrough — returned as-is, not overridden.
- *   8. Sidecar-reported fallback="missing" passthrough.
- *   9. Model version switch reflected across successive responses.
- *  10. health() — ok path (status="ok" from sidecar).
- *  11. health() — sidecar returns non-200 → ok=false.
- *  12. health() — network error → ok=false, never throws.
- *  13. Integration: one Bun.serve mock sidecar — real fetch, localhost only.
- *  14. pmRangeContext derived from ctx.currentBins is included in POST body.
- *  15. pmRangeContext omitted when ctx.currentBins is empty.
+ *   6. Sidecar-reported fallback="psi" passthrough — returned as-is, not overridden.
+ *   7. Sidecar-reported fallback="missing" passthrough.
+ *   8. Model version switch reflected across successive responses.
+ *   9. health() — ok path (status="ok" from sidecar).
+ *  10. health() — sidecar returns non-200 → ok=false.
+ *  11. health() — network error → ok=false, never throws.
+ *  12. Integration: one Bun.serve mock sidecar — real fetch, localhost only.
+ *  13. pmRangeContext derived from ctx.currentBins is included in POST body.
+ *  14. pmRangeContext omitted when ctx.currentBins is empty.
+ *
+ * The sidecar contract is the 7-key shape (widthSigma, pAbove, pBelow,
+ * modelVersion, featureCompleteness, psi, fallback); the center quantile keys
+ * and their monotonicity validation were removed with the center prediction
+ * head (docs/decision-remove-center-prediction.md).
  *
  * Strategy: the majority of tests use an injected `fetchImpl` (no network I/O,
  * deterministic). One integration test spins up a real `Bun.serve` on port 0
@@ -66,12 +70,9 @@ function makeCtx(overrides?: Partial<PmRangeContext>): PmRangeContext {
   };
 }
 
-/** A fully valid sidecar /predict response body. */
+/** A fully valid sidecar /predict response body (the 7-key contract). */
 function validPredictBody(
   overrides?: Partial<{
-    centerOffset: number;
-    centerQ10: number;
-    centerQ90: number;
     widthSigma: number;
     pAbove: number;
     pBelow: number;
@@ -82,9 +83,6 @@ function validPredictBody(
   }>,
 ) {
   return {
-    centerOffset: 1,
-    centerQ10: -2,
-    centerQ90: 3,
     widthSigma: 1.95,
     pAbove: 0.35,
     pBelow: 0.28,
@@ -172,9 +170,6 @@ describe("SidecarPredictionProvider: normal inference", () => {
     const resp = await provider.predict(makeSnapshot(), makeCtx());
 
     expect(resp.fallback).toBe(false);
-    expect(resp.centerOffset).toBe(1);
-    expect(resp.centerQ10).toBe(-2);
-    expect(resp.centerQ90).toBe(3);
     expect(resp.widthSigma).toBeCloseTo(1.95);
     expect(resp.pAbove).toBeCloseTo(0.35);
     expect(resp.pBelow).toBeCloseTo(0.28);
@@ -209,9 +204,6 @@ describe("SidecarPredictionProvider: timeout", () => {
 
     expect(resp.fallback).toBe("timeout");
     // Neutral values
-    expect(resp.centerOffset).toBe(0);
-    expect(resp.centerQ10).toBe(0);
-    expect(resp.centerQ90).toBe(0);
     expect(resp.widthSigma).toBe(0);
     expect(resp.pAbove).toBe(0);
     expect(resp.pBelow).toBe(0);
@@ -282,8 +274,9 @@ describe("SidecarPredictionProvider: connection error", () => {
     const resp = await provider.predict(makeSnapshot(), makeCtx());
 
     expect(resp.fallback).toBe("sidecar_down");
-    expect(resp.centerOffset).toBe(0);
     expect(resp.widthSigma).toBe(0);
+    expect(resp.pAbove).toBe(0);
+    expect(resp.pBelow).toBe(0);
     expect(resp.featureCompleteness).toBe(0);
   });
 
@@ -336,7 +329,7 @@ describe("SidecarPredictionProvider: malformed body", () => {
   });
 
   it("returns fallback='sidecar_down' for a JSON object missing required keys", async () => {
-    const incomplete = { centerOffset: 1, modelVersion: "v1.0.0" }; // missing many keys
+    const incomplete = { widthSigma: 1.95, modelVersion: "v1.0.0" }; // missing pAbove/pBelow/… keys
     const provider = createSidecarPredictionProvider({
       baseUrl: "http://127.0.0.1:9999",
       timeoutMs: 2000,
@@ -348,7 +341,7 @@ describe("SidecarPredictionProvider: malformed body", () => {
   });
 
   it("returns fallback='sidecar_down' when a numeric field is a string", async () => {
-    const bad = validPredictBody({ centerOffset: "one" as unknown as number });
+    const bad = validPredictBody({ pAbove: "one" as unknown as number });
     const provider = createSidecarPredictionProvider({
       baseUrl: "http://127.0.0.1:9999",
       timeoutMs: 2000,
@@ -397,55 +390,33 @@ describe("SidecarPredictionProvider: malformed body", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. Quantile-crossing body
+// "quantile monotonicity" describe (q10>q50 / q50>q90 crossing → sidecar_down,
+// equal quantiles accepted) removed with the center prediction head — the
+// quantile keys and their monotonicity validation no longer exist
+// (docs/decision-remove-center-prediction.md). Extra keys in the body are
+// still tolerated (only the 7 required keys are validated):
 // ---------------------------------------------------------------------------
 
-describe("SidecarPredictionProvider: quantile monotonicity", () => {
-  it("returns fallback='sidecar_down' when q10 > q50 (crossing)", async () => {
-    // q10=5, q50=2 — q10 > q50 violates monotonicity.
-    const bad = validPredictBody({ centerQ10: 5, centerOffset: 2, centerQ90: 8 });
+describe("SidecarPredictionProvider: extra keys tolerated", () => {
+  it("accepts a body carrying unknown extra keys (e.g. legacy center fields)", async () => {
+    const withExtras = { ...validPredictBody(), centerOffset: 1, centerQ10: -2, centerQ90: 3 };
     const provider = createSidecarPredictionProvider({
       baseUrl: "http://127.0.0.1:9999",
       timeoutMs: 2000,
-      fetchImpl: makeMockFetch({ status: 200, body: bad }),
+      fetchImpl: makeMockFetch({ status: 200, body: withExtras }),
     });
 
     const resp = await provider.predict(makeSnapshot(), makeCtx());
-    expect(resp.fallback).toBe("sidecar_down");
-  });
-
-  it("returns fallback='sidecar_down' when q50 > q90 (crossing)", async () => {
-    // q50=10, q90=3 — q50 > q90 violates monotonicity.
-    const bad = validPredictBody({ centerQ10: -2, centerOffset: 10, centerQ90: 3 });
-    const provider = createSidecarPredictionProvider({
-      baseUrl: "http://127.0.0.1:9999",
-      timeoutMs: 2000,
-      fetchImpl: makeMockFetch({ status: 200, body: bad }),
-    });
-
-    const resp = await provider.predict(makeSnapshot(), makeCtx());
-    expect(resp.fallback).toBe("sidecar_down");
-  });
-
-  it("accepts equal quantiles (q10=q50=q90=0 is degenerate but monotone)", async () => {
-    const degenerate = validPredictBody({ centerQ10: 0, centerOffset: 0, centerQ90: 0 });
-    const provider = createSidecarPredictionProvider({
-      baseUrl: "http://127.0.0.1:9999",
-      timeoutMs: 2000,
-      fetchImpl: makeMockFetch({ status: 200, body: degenerate }),
-    });
-
-    const resp = await provider.predict(makeSnapshot(), makeCtx());
-    // Not a crossing — should pass through.
+    // Extra keys are not rejected; the 7-key contract is satisfied.
     expect(resp.fallback).toBe(false);
-    expect(resp.centerQ10).toBe(0);
-    expect(resp.centerOffset).toBe(0);
-    expect(resp.centerQ90).toBe(0);
+    expect(resp.widthSigma).toBeCloseTo(1.95);
+    // …and the extras are NOT propagated onto the PredictionResponse.
+    expect("centerOffset" in resp).toBe(false);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 7 & 8. Sidecar-reported fallback passthrough
+// 6 & 7. Sidecar-reported fallback passthrough
 // ---------------------------------------------------------------------------
 
 describe("SidecarPredictionProvider: sidecar-side fallback passthrough", () => {
@@ -461,7 +432,7 @@ describe("SidecarPredictionProvider: sidecar-side fallback passthrough", () => {
     expect(resp.fallback).toBe("psi");
     // The rest of the fields are still populated (from the sidecar).
     expect(resp.modelVersion).toBe("v1.0.0");
-    expect(resp.centerOffset).toBe(1);
+    expect(resp.widthSigma).toBeCloseTo(1.95);
   });
 
   it("passes through fallback='missing' unchanged", async () => {
@@ -685,7 +656,7 @@ describe("SidecarPredictionProvider: integration (Bun.serve loopback)", () => {
     const resp = await provider.predict(makeSnapshot(), makeCtx());
     expect(resp.fallback).toBe(false);
     expect(resp.modelVersion).toBe("v1.0.0-integration");
-    expect(resp.centerOffset).toBe(1);
+    expect(resp.widthSigma).toBeCloseTo(1.95);
   });
 
   it("round-trips a health() call over localhost HTTP", async () => {

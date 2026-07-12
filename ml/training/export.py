@@ -3,12 +3,16 @@
 Layout per plan §2.3 (artifacts never enter git — forks train their own):
 
     <out_dir>/<version>/
-        q10.txt q50.txt q90.txt vol.txt     LightGBM native text format
+        vol.txt                              LightGBM native text format
         models_meta.json                     version, trained_at, data_window,
                                              seed, git_sha, bin_step, horizon,
                                              features, sha256 per model file
         psi_baseline.json                    per-feature decile buckets of the
                                              training distribution (PSI input)
+
+The q10/q50/q90 quantile files were removed 2026-07 along with the center
+head (docs/decision-remove-center-prediction.md); artifacts produced under
+the old four-file layout fail `serving.registry.load_bundle` by design.
 """
 
 from __future__ import annotations
@@ -26,7 +30,7 @@ import pandas as pd
 from features.registry import FEATURE_NAMES
 
 PSI_BUCKETS = 10
-MODEL_FILES: tuple[str, ...] = ("q10", "q50", "q90", "vol")
+MODEL_FILES: tuple[str, ...] = ("vol",)
 
 
 def sha256_file(path: Path) -> str:

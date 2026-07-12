@@ -1,9 +1,14 @@
-"""LightGBM quantile training pipeline (plan W3).
+"""LightGBM volatility-model training pipeline.
 
-Trains four boosters on the 30-min-ahead labels from ``data.labels``:
+Trains ONE booster on the horizon-ahead label from ``data.labels``:
 
-    q10 / q50 / q90   objective=quantile (α = 0.1 / 0.5 / 0.9), center-offset
-    vol               objective=regression_l1, future per-bar σ
+    vol    objective=regression_l1, future per-bar σ
+
+This module was ``train_quantile.py`` until 2026-07: it also trained
+q10/q50/q90 quantile heads on a future-VWAP center offset. Walk-forward
+falsified the center head (worse than centering on spot; direction ≈ coin
+flip) and showed the q10/q90 lift was the vol edge re-expressed — see
+docs/decision-remove-center-prediction.md. The vol head is the only model.
 
 Everything is seeded and LightGBM runs in deterministic single-strategy mode,
 so a fork re-running the same data window reproduces the same artifacts
@@ -11,7 +16,7 @@ so a fork re-running the same data window reproduces the same artifacts
 
 CLI:
 
-    uv run python -m training.train_quantile \
+    uv run python -m training.train_vol \
         --start 2025-09-01 --end 2026-03-01 \
         --version v1.0.0 [--data-dir data/parquet] [--out-dir artifacts] \
         [--seed 42] [--bin-step 0.005] [--horizon 30]
@@ -33,8 +38,7 @@ from features.registry import FEATURE_NAMES, build_feature_matrix
 from training.export import export_artifacts
 
 DEFAULT_SEED = 42
-QUANTILES: tuple[float, ...] = (0.1, 0.5, 0.9)
-MODEL_KEYS: tuple[str, ...] = ("q10", "q50", "q90", "vol")
+MODEL_KEYS: tuple[str, ...] = ("vol",)
 
 # Hyper-parameter starting point per prediction-service-design.md §3.2.
 BASE_PARAMS: dict = {
@@ -58,30 +62,29 @@ OI_FFILL_LIMIT = 5  # OI history is sampled at 5m
 
 def train_models(
     X: pd.DataFrame,
-    y_center: pd.Series,
     y_vol: pd.Series,
     seed: int = DEFAULT_SEED,
     num_boost_round: int = DEFAULT_NUM_BOOST_ROUND,
     params_override: dict | None = None,
 ) -> dict[str, lgb.Booster]:
-    """Train the four boosters. ``params_override`` lets tests shrink
-    ``min_data_in_leaf`` etc. for tiny synthetic datasets."""
+    """Train the vol booster. ``params_override`` lets tests shrink
+    ``min_data_in_leaf`` etc. for tiny synthetic datasets. Returns a dict
+    (single key ``"vol"``) so export/registry keep one artifact shape."""
     if list(X.columns) != FEATURE_NAMES:
         raise ValueError("train_models: X columns must match features.registry.FEATURE_NAMES")
-    if not (len(X) == len(y_center) == len(y_vol)):
+    if len(X) != len(y_vol):
         raise ValueError("train_models: X / y length mismatch")
 
-    def fit(objective_params: dict, y: pd.Series) -> lgb.Booster:
-        params = {**BASE_PARAMS, **objective_params, "seed": seed, **(params_override or {})}
-        dataset = lgb.Dataset(X.to_numpy(dtype=float), label=y.to_numpy(dtype=float), feature_name=FEATURE_NAMES)
-        return lgb.train(params, dataset, num_boost_round=num_boost_round)
-
-    models: dict[str, lgb.Booster] = {}
-    for alpha in QUANTILES:
-        key = f"q{int(alpha * 100)}"
-        models[key] = fit({"objective": "quantile", "alpha": alpha}, y_center)
-    models["vol"] = fit({"objective": "regression_l1"}, y_vol)
-    return models
+    params = {
+        **BASE_PARAMS,
+        "objective": "regression_l1",
+        "seed": seed,
+        **(params_override or {}),
+    }
+    dataset = lgb.Dataset(
+        X.to_numpy(dtype=float), label=y_vol.to_numpy(dtype=float), feature_name=FEATURE_NAMES
+    )
+    return {"vol": lgb.train(params, dataset, num_boost_round=num_boost_round)}
 
 
 def load_canonical_frame(
@@ -127,17 +130,16 @@ def load_canonical_frame(
 def build_training_set(
     df: pd.DataFrame,
     horizon: int = DEFAULT_HORIZON_BARS,
-    bin_step: float = DEFAULT_BIN_STEP,
-) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """Canonical frame → (X, y_center, y_vol) on the common labelled index."""
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Canonical frame → (X, y_vol) on the common labelled index."""
     X, _completeness = build_feature_matrix(df)
-    labels = make_labels(df, horizon=horizon, bin_step=bin_step)
+    labels = make_labels(df, horizon=horizon)
     X = X.loc[labels.index]
-    return X, labels["label_center"], labels["label_vol"]
+    return X, labels["label_vol"]
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Train LightGBM quantile + vol models")
+    parser = argparse.ArgumentParser(description="Train the LightGBM vol model")
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA_ROOT), help="parquet root")
     parser.add_argument("--start", required=True, help="training window start (ISO, UTC)")
     parser.add_argument("--end", required=True, help="training window end (ISO, UTC, exclusive)")
@@ -151,10 +153,10 @@ def main(argv: list[str] | None = None) -> None:
 
     start_ms, end_ms = parse_utc_ms(args.start), parse_utc_ms(args.end)
     frame = load_canonical_frame(args.data_dir, start_ms, end_ms)
-    X, y_center, y_vol = build_training_set(frame, horizon=args.horizon, bin_step=args.bin_step)
+    X, y_vol = build_training_set(frame, horizon=args.horizon)
     print(f"[train] {len(X)} samples, {len(FEATURE_NAMES)} features")
 
-    models = train_models(X, y_center, y_vol, seed=args.seed, num_boost_round=args.num_boost_round)
+    models = train_models(X, y_vol, seed=args.seed, num_boost_round=args.num_boost_round)
     out = export_artifacts(
         models,
         args.out_dir,

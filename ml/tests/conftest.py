@@ -58,7 +58,7 @@ def make_canonical_frame(n: int = 800, seed: int = SEED) -> pd.DataFrame:
 
 
 def make_training_set(n: int = 800, seed: int = SEED):
-    """(X, y_center, y_vol) built through the real feature/label pipeline."""
+    """(X, y_vol) built through the real feature/label pipeline."""
     from data.labels import make_labels
     from features.registry import build_feature_matrix
 
@@ -66,7 +66,7 @@ def make_training_set(n: int = 800, seed: int = SEED):
     X, _ = build_feature_matrix(frame)
     labels = make_labels(frame)
     X = X.loc[labels.index]
-    return X, labels["label_center"], labels["label_vol"]
+    return X, labels["label_vol"]
 
 
 @pytest.fixture

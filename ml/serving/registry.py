@@ -3,7 +3,8 @@
 A bundle is one ``ml/artifacts/<version>/`` directory (see
 ``training.export``). Loading validates:
 
-* all four model files present, sha256 matching ``models_meta.json``
+* all model files (``training.export.MODEL_FILES``; vol-only since the
+  2026-07 center-head removal) present, sha256 matching ``models_meta.json``
   (a corrupted / hand-edited artifact refuses to load);
 * the artifact's feature list equals the **current**
   ``features.registry.FEATURE_NAMES`` — an artifact trained against an older
