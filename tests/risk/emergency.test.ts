@@ -66,7 +66,7 @@ describe("createEmergencyStop", () => {
 
   it("trip() enters DRAINING, not HALTED — the agent must exit before it freezes", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("manual test");
+    stop.trip("manual test", { kind: "global" });
 
     // The load-bearing change: L3 used to halt immediately, leaving the user's
     // liquidity deployed and unmanaged. It now force-exits first.
@@ -80,7 +80,7 @@ describe("createEmergencyStop", () => {
   it("persists an L3 risk_event row on trip", () => {
     const stop = createEmergencyStop({ db, nowMs });
     expect(countRiskEvents(db)).toBe(0);
-    stop.trip("test reason");
+    stop.trip("test reason", { kind: "global" });
     expect(countRiskEvents(db)).toBe(1);
 
     const events = getRiskEvents(db);
@@ -91,15 +91,15 @@ describe("createEmergencyStop", () => {
 
   it("trip is idempotent — second call does NOT write another DB row", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("first reason");
-    stop.trip("second reason"); // should be no-op on DB
+    stop.trip("first reason", { kind: "global" });
+    stop.trip("second reason", { kind: "global" }); // should be no-op on DB
     expect(countRiskEvents(db)).toBe(1);
     expect(stop.state()).toBe("DRAINING");
   });
 
   it("reset clears the latch", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("test");
+    stop.trip("test", { kind: "global" });
     stop.reset("acknowledged: test resolved");
     expect(stop.state()).toBe("ARMED");
     expect(stop.isTripped()).toBe(false);
@@ -107,7 +107,7 @@ describe("createEmergencyStop", () => {
 
   it("reset persists a reset event and resolves the original event", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("test");
+    stop.trip("test", { kind: "global" });
     advanceMs(5000);
     stop.reset("acknowledged");
 
@@ -133,9 +133,9 @@ describe("createEmergencyStop", () => {
 
   it("can be tripped again after reset", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("first");
+    stop.trip("first", { kind: "global" });
     stop.reset("ack");
-    stop.trip("second");
+    stop.trip("second", { kind: "global" });
     expect(stop.state()).toBe("DRAINING");
     // Should have: trip + reset + trip_again = 3 rows
     expect(countRiskEvents(db)).toBe(3);
@@ -144,7 +144,7 @@ describe("createEmergencyStop", () => {
   it("uses injected nowMs for timestamps", () => {
     const fixedNow = 9_999_999_999_000;
     const stop = createEmergencyStop({ db, nowMs: () => fixedNow });
-    stop.trip("test");
+    stop.trip("test", { kind: "global" });
 
     const row = db
       .prepare<{ ts_ms: number }, []>("SELECT ts_ms FROM risk_events LIMIT 1")
@@ -162,7 +162,7 @@ import { resolveEmergencyStopInDb } from "../../src/risk/emergency.ts";
 describe("emergency stop rehydration (restart survival)", () => {
   it("a tripped latch survives a process restart via DB rehydration", () => {
     const stop1 = createEmergencyStop({ db, nowMs });
-    stop1.trip("first process trips");
+    stop1.trip("first process trips", { kind: "global" });
     expect(stop1.state()).toBe("DRAINING");
 
     // A NEW latch over the same DB comes up HALTED, not DRAINING: we cannot
@@ -176,7 +176,7 @@ describe("emergency stop rehydration (restart survival)", () => {
 
   it("a resolved (operator-reset) trip does NOT re-trip on restart", () => {
     const stop1 = createEmergencyStop({ db, nowMs });
-    stop1.trip("trip then resolve");
+    stop1.trip("trip then resolve", { kind: "global" });
     resolveEmergencyStopInDb(db, "verified safe to resume", nowMs());
 
     const stop2 = createEmergencyStop({ db, nowMs });
@@ -209,10 +209,10 @@ describe("L3 drain-then-latch", () => {
     const { alerts, dispatcher } = captureAlerts();
     const stop = createEmergencyStop({ db, nowMs, alerts: dispatcher });
 
-    stop.trip("catastrophic pnl");
+    stop.trip("catastrophic pnl", { kind: "global" });
     expect(stop.state()).toBe("DRAINING");
 
-    stop.recordDrainAttempt({ positionEmpty: true, pmId: "0xpm" });
+    stop.recordDrainAttempt({}, { positionEmpty: true, pmId: "0xpm" });
 
     expect(stop.state()).toBe("HALTED");
     expect(stop.isTripped()).toBe(true);
@@ -228,14 +228,14 @@ describe("L3 drain-then-latch", () => {
     const { alerts, dispatcher } = captureAlerts();
     const stop = createEmergencyStop({ db, nowMs, alerts: dispatcher, drainMaxAttempts: 3 });
 
-    stop.trip("5 consecutive tx failures");
+    stop.trip("5 consecutive tx failures", { kind: "global" });
 
-    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    stop.recordDrainAttempt({}, { positionEmpty: false, error: "rpc down" });
     expect(stop.state()).toBe("DRAINING"); // attempt 1 — keep trying
-    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    stop.recordDrainAttempt({}, { positionEmpty: false, error: "rpc down" });
     expect(stop.state()).toBe("DRAINING"); // attempt 2
 
-    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    stop.recordDrainAttempt({}, { positionEmpty: false, error: "rpc down" });
     expect(stop.state()).toBe("HALTED"); // attempt 3 — give up
 
     await Promise.resolve();
@@ -250,26 +250,101 @@ describe("L3 drain-then-latch", () => {
 
   it("bounded attempts: a broken chain cannot make the drain retry forever", () => {
     const stop = createEmergencyStop({ db, nowMs, drainMaxAttempts: 2 });
-    stop.trip("chain unreachable");
+    stop.trip("chain unreachable", { kind: "global" });
 
-    stop.recordDrainAttempt({ positionEmpty: false });
-    stop.recordDrainAttempt({ positionEmpty: false });
+    stop.recordDrainAttempt({}, { positionEmpty: false });
+    stop.recordDrainAttempt({}, { positionEmpty: false });
     expect(stop.state()).toBe("HALTED");
 
     // Further reports are ignored — we are already terminal.
-    stop.recordDrainAttempt({ positionEmpty: false });
+    stop.recordDrainAttempt({}, { positionEmpty: false });
     expect(stop.state()).toBe("HALTED");
+  });
+
+  it("tells the truth about WHERE the funds are — not 'the PM balance' by assumption", async () => {
+    // The L2→L3 path: L2 EXTREME already withdrew the DLMM position and swept
+    // 100% of the capital into Scallop. L3 then finds nothing to withdraw.
+    // The price exposure IS gone (that is what L3 is for), but the money is NOT
+    // in the PM balance — and an operator woken at 3am must not be told it is.
+    const { alerts, dispatcher } = captureAlerts();
+    const stop = createEmergencyStop({ db, nowMs, alerts: dispatcher });
+
+    stop.trip("repeated L2", { kind: "pool", poolId: "0xpool" });
+    stop.recordDrainAttempt(
+      { poolId: "0xpool", pmId: "0xpm" },
+      {
+        positionEmpty: true, // no DLMM bins — exposure is zero
+        pmId: "0xpm",
+        funds: {
+          balanceA: 0n,
+          balanceB: 0n,
+          lending: {
+            scallop: {
+              "0x2::usdc::USDC": {
+                protocol: "scallop",
+                coinType: "0x2::usdc::USDC",
+                ytType: "",
+                underlyingPrincipal: 12_400_000_000n,
+                marketCoinAmount: 12_000_000_000n,
+              },
+            },
+            kai: {},
+          },
+        },
+      },
+    );
+
+    await Promise.resolve();
+    const drained = alerts.find((a) => a.code === "l3_drained")!;
+    expect(drained.message).toContain("scallop lending");
+    expect(drained.message).toContain("12400000000");
+    // It must NOT claim the money is sitting in the PM balance.
+    expect(drained.message).not.toContain("PM balance (");
+  });
+
+  it("a PM-scoped trip does NOT halt other PMs", () => {
+    // One user's malformed position, dust plan, or revoked authorization must
+    // not force-exit every other user's position.
+    const stop = createEmergencyStop({ db, nowMs });
+
+    stop.trip("5 consecutive tx failures", { kind: "pm", pmId: "0xbad" });
+
+    expect(stop.state({ poolId: "0xpool", pmId: "0xbad" })).toBe("DRAINING");
+    expect(stop.state({ poolId: "0xpool", pmId: "0xhealthy" })).toBe("ARMED");
+  });
+
+  it("a POOL-scoped trip DOES apply to every PM on that pool", () => {
+    const stop = createEmergencyStop({ db, nowMs });
+
+    stop.trip("catastrophic pnl", { kind: "pool", poolId: "0xpool" });
+
+    expect(stop.state({ poolId: "0xpool", pmId: "0xa" })).toBe("DRAINING");
+    expect(stop.state({ poolId: "0xpool", pmId: "0xb" })).toBe("DRAINING");
+    // ...but not to a different pool.
+    expect(stop.state({ poolId: "0xother", pmId: "0xc" })).toBe("ARMED");
+  });
+
+  it("recordDrainAttempt only advances the latches that apply to the given PM", () => {
+    const stop = createEmergencyStop({ db, nowMs, drainMaxAttempts: 1 });
+    stop.trip("bad pm", { kind: "pm", pmId: "0xbad" });
+    stop.trip("bad pm 2", { kind: "pm", pmId: "0xbad2" });
+
+    // Report a failure for 0xbad only.
+    stop.recordDrainAttempt({ pmId: "0xbad" }, { positionEmpty: false, pmId: "0xbad" });
+
+    expect(stop.state({ pmId: "0xbad" })).toBe("HALTED");
+    expect(stop.state({ pmId: "0xbad2" })).toBe("DRAINING"); // untouched
   });
 
   it("recordDrainAttempt is a no-op when not draining", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.recordDrainAttempt({ positionEmpty: true });
+    stop.recordDrainAttempt({}, { positionEmpty: true });
     expect(stop.state()).toBe("ARMED");
   });
 
   it("a rehydrated latch alerts — a restarted-but-frozen agent must announce itself", async () => {
     const first = createEmergencyStop({ db, nowMs });
-    first.trip("something bad");
+    first.trip("something bad", { kind: "global" });
 
     const { alerts, dispatcher } = captureAlerts();
     const restarted = createEmergencyStop({ db, nowMs, alerts: dispatcher });
@@ -284,9 +359,10 @@ describe("L3 drain-then-latch", () => {
 describe("resolveEmergencyStopInDb (operator reset path)", () => {
   it("resolves the unresolved row and writes an audit row with the ack reason", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("something bad");
+    stop.trip("something bad", { kind: "global" });
 
-    const { resolvedEventId } = resolveEmergencyStopInDb(db, "rpc outage over", nowMs());
+    const { resolvedEventIds } = resolveEmergencyStopInDb(db, "rpc outage over", nowMs());
+    const resolvedEventId = resolvedEventIds[0]!;
 
     const resolved = db
       .prepare<{ resolved_at_ms: number | null }, [number]>(
@@ -310,7 +386,7 @@ describe("resolveEmergencyStopInDb (operator reset path)", () => {
 
   it("throws on an empty ack reason", () => {
     const stop = createEmergencyStop({ db, nowMs });
-    stop.trip("x");
+    stop.trip("x", { kind: "global" });
     expect(() => resolveEmergencyStopInDb(db, "  ")).toThrow(/ackReason/);
   });
 });

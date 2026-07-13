@@ -576,9 +576,12 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
    *      the L2 daily-loss threshold). Inert until a PnL source is wired.
    */
   function evaluateL3(input: StrategyInput, state: PoolRiskState): void {
-    if (emergencyStop.isTripped()) return;
     const poolId = input.pm.poolId;
     const pmId = input.pm.pmId;
+    // Already tripped (draining or halted) for this tick's scopes — nothing to
+    // re-evaluate. Checked against the SCOPES, not a global boolean, so one
+    // PM's latch does not suppress evaluation for every other PM.
+    if (emergencyStop.state({ poolId, pmId }) !== "ARMED") return;
     const now = nowMs();
 
     // 1. Repeated L2 within window
@@ -589,25 +592,46 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         poolId, pmId, "L3", "emergency_trip", "repeated_l2",
         l3.repeatedL2Count, recentL2.length, "trip_emergency_stop",
       );
+      // POOL scope: repeated L2 is a property of the market, so it applies to
+      // every PM on this pool.
       emergencyStop.trip(
         `repeated L2: ${recentL2.length} EXTREME activations within ${l3.repeatedL2WindowMs}ms for pool ${poolId}`,
+        { kind: "pool", poolId },
       );
       return;
     }
 
-    // 2. Data outage while a position is open
+    // 2. We cannot SEE THE POOL while a position is open.
+    //
+    // This used to key off `latestSnapshotTs`, which only advances when the
+    // market aggregator can assemble a full snapshot — i.e. it required Binance
+    // AND derivatives AND Cetus. So a Binance outage (or a geo-block, or a rate
+    // limit) counted as "we are blind" and tripped L3.
+    //
+    // But you do not need Binance funding rates to hold or exit a DLMM
+    // position. The only feed that genuinely blinds the core loop is the
+    // ON-CHAIN one: `cetus.lastUpdatedMs` advances on every successful POOL
+    // STATE READ (not on swaps), so its staleness means exactly "we cannot read
+    // the pool". Binance and derivatives degrade the model; they do not blind
+    // us to the market we are making.
+    //
+    // This matters more now that L3 force-exits: under the old halt-only
+    // behaviour a spurious trip merely froze (position intact), whereas now it
+    // would LIQUIDATE a healthy position because an external API was down.
+    const cetusStaleMs = state.latestSourceStaleness?.cetus ?? null;
     if (
-      state.latestSnapshotTs !== null &&
-      now - state.latestSnapshotTs > l3.outageMs &&
+      cetusStaleMs !== null &&
+      cetusStaleMs > l3.outageMs &&
       input.pm.positionBins.length > 0
     ) {
-      const observed = now - state.latestSnapshotTs;
       persistRiskEvent(
-        poolId, pmId, "L3", "emergency_trip", "outage_with_position",
-        l3.outageMs, observed, "trip_emergency_stop",
+        poolId, pmId, "L3", "emergency_trip", "pool_unreadable_with_position",
+        l3.outageMs, cetusStaleMs, "trip_emergency_stop",
       );
+      // POOL scope: if we cannot read the pool, every PM on it is affected.
       emergencyStop.trip(
-        `data outage ${observed}ms (> ${l3.outageMs}ms) with open position on pool ${poolId}`,
+        `cannot read pool state for ${cetusStaleMs}ms (> ${l3.outageMs}ms) with an open position on pool ${poolId}`,
+        { kind: "pool", poolId },
       );
       return;
     }
@@ -618,8 +642,10 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
         poolId, pmId, "L3", "emergency_trip", "pnl_catastrophic",
         l3.pnlPct, state.latest24hPnl, "trip_emergency_stop",
       );
+      // POOL scope: a catastrophic loss is a property of the market.
       emergencyStop.trip(
         `24h PnL ${state.latest24hPnl} below catastrophic threshold ${l3.pnlPct} for pool ${poolId}`,
+        { kind: "pool", poolId },
       );
     }
   }
@@ -637,14 +663,14 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     //   HALTED   → nothing runs (terminal, needs an operator).
     //   DRAINING → force-exit the position. Removing liquidity needs no price,
     //              so this is safe to do even when the trigger was "we are blind".
-    if (emergencyStop.isTripped()) {
+    if (emergencyStop.isTripped({ poolId, pmId })) {
       return {
         kind: "emergency",
         level: "L3",
         reason: "emergency stop is active (HALTED)",
       };
     }
-    if (emergencyStop.isDraining()) {
+    if (emergencyStop.isDraining({ poolId, pmId })) {
       return {
         kind: "drain",
         level: "L3",
@@ -742,7 +768,7 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   function activeLevel(poolId: string): "L1" | "L2" | "L3" | null {
     // DRAINING is still L3 — the emergency is active, we are just exiting
     // rather than frozen. Only ARMED is "no L3".
-    if (emergencyStop.state() !== "ARMED") return "L3";
+    if (emergencyStop.state({ poolId }) !== "ARMED") return "L3";
     const state = poolStates.get(poolId);
     if (!state) return null;
     if (state.extremeActive) return "L2";

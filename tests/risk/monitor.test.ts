@@ -171,7 +171,7 @@ describe("L3 emergency stop veto", () => {
     const emergencyStop = createEmergencyStop({ db });
     const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
 
-    emergencyStop.trip("manual test");
+    emergencyStop.trip("manual test", { kind: "global" });
     const veto = monitor.checkPreTick(makeStrategyInput());
     expect(veto).not.toBeNull();
     expect(veto!.level).toBe("L3");
@@ -184,8 +184,8 @@ describe("L3 emergency stop veto", () => {
     const emergencyStop = createEmergencyStop({ db });
     const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
 
-    emergencyStop.trip("manual test");
-    emergencyStop.recordDrainAttempt({ positionEmpty: true }); // exit succeeded → HALTED
+    emergencyStop.trip("manual test", { kind: "global" });
+    emergencyStop.recordDrainAttempt({}, { positionEmpty: true }); // exit succeeded → HALTED
 
     const veto = monitor.checkPreTick(makeStrategyInput());
     expect(veto!.level).toBe("L3");
@@ -196,7 +196,7 @@ describe("L3 emergency stop veto", () => {
     const emergencyStop = createEmergencyStop({ db });
     const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
 
-    emergencyStop.trip("test");
+    emergencyStop.trip("test", { kind: "global" });
     expect(monitor.activeLevel(POOL_ID)).toBe("L3");
   });
 
@@ -204,7 +204,7 @@ describe("L3 emergency stop veto", () => {
     const emergencyStop = createEmergencyStop({ db });
     const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
 
-    emergencyStop.trip("test");
+    emergencyStop.trip("test", { kind: "global" });
     emergencyStop.reset("acknowledged");
     const veto = monitor.checkPreTick(makeStrategyInput());
     expect(veto).toBeNull();
@@ -744,29 +744,63 @@ describe("L3 auto-trip: repeated L2 activations", () => {
   });
 });
 
-describe("L3 auto-trip: data outage with open position", () => {
+describe("L3 auto-trip: cannot read the POOL, with a position open", () => {
   beforeEach(() => { db = freshDb(); });
 
-  it("trips when data is stale beyond outageMs AND a position is open", () => {
+  /** Feed a staleness sample: how long since each source last updated. */
+  function staleness(monitor: ReturnType<typeof createRiskMonitor>, now: number, s: {
+    sui?: number; cetus?: number; derivatives?: number;
+  }): void {
+    monitor.observeSourceStaleness(POOL_ID, {
+      sui: s.sui ?? 0,
+      btc: 0,
+      eth: 0,
+      derivatives: s.derivatives ?? 0,
+      cetus: s.cetus ?? 0,
+    });
+  }
+
+  it("trips when the POOL is unreadable beyond outageMs AND a position is open", () => {
     let now = BASE_NOW;
     const monitor = createRiskMonitor({
       db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
     });
-    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
-    now += TEST_L3.outageMs + 1_000;
+    // cetus.lastUpdatedMs advances on every successful POOL STATE READ, so a
+    // stale cetus source means exactly "we cannot see the pool".
+    staleness(monitor, now, { cetus: TEST_L3.outageMs + 1_000 });
 
     const veto = monitor.checkPreTick(makeInputWithPosition());
     expect(veto?.kind).toBe("drain");
-    expect(monitor.emergencyStop.state()).toBe("DRAINING");
+    expect(monitor.emergencyStop.state({ poolId: POOL_ID })).toBe("DRAINING");
   });
 
-  it("does NOT trip on outage when no position is open (L2 handles it)", () => {
+  it("does NOT trip when only BINANCE is down — an external API outage must not liquidate", () => {
+    // The regression this guards: `outage_with_position` used to key off the
+    // aggregate snapshot, which required Binance AND derivatives AND Cetus. So a
+    // Binance geo-block or rate-limit counted as "we are blind" — and once L3
+    // began force-exiting, that would have LIQUIDATED a healthy position because
+    // an external API was unreachable. You do not need funding rates to hold or
+    // exit a DLMM position.
     let now = BASE_NOW;
     const monitor = createRiskMonitor({
       db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
     });
-    monitor.observeForPool(POOL_ID, makeSnapshot({ ts: now }));
-    now += TEST_L3.outageMs + 1_000;
+    staleness(monitor, now, {
+      sui: TEST_L3.outageMs + 60_000,          // Binance long gone
+      derivatives: TEST_L3.outageMs + 60_000,  // derivatives long gone
+      cetus: 0,                                 // but we can still read the pool
+    });
+
+    monitor.checkPreTick(makeInputWithPosition());
+    expect(monitor.emergencyStop.state({ poolId: POOL_ID })).toBe("ARMED");
+  });
+
+  it("does NOT trip when the pool is unreadable but no position is open", () => {
+    let now = BASE_NOW;
+    const monitor = createRiskMonitor({
+      db, thresholds: DEFAULT_THRESHOLDS, l3: TEST_L3, nowMs: () => now,
+    });
+    staleness(monitor, now, { cetus: TEST_L3.outageMs + 1_000 });
 
     monitor.checkPreTick(makeStrategyInput()); // empty positionBins
     expect(monitor.emergencyStop.isTripped()).toBe(false);

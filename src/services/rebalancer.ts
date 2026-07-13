@@ -534,12 +534,17 @@ export function createRebalancerService(
           // deployed. Silently retrying forever would be worse.
           riskMonitor.emergencyStop.trip(
             `chain unreachable: ${failures} consecutive read failures for pm ${pmId} (last: ${msg})`,
+            { kind: "pm", pmId },
           );
-          riskMonitor.emergencyStop.recordDrainAttempt({
-            positionEmpty: false,
-            pmId,
-            error: `cannot read chain state: ${msg}`,
-          });
+          riskMonitor.emergencyStop.recordDrainAttempt(
+            { pmId },
+            {
+              positionEmpty: false,
+              pmId,
+              error: `cannot read chain state: ${msg}`,
+              // funds omitted: we could not read the PM, so we do not know.
+            },
+          );
         }
         return;
       }
@@ -595,16 +600,32 @@ export function createRebalancerService(
       let drainAttempt = false;
 
       const emergency = riskMonitor.emergencyStop;
-      if (emergency.isTripped()) {
+      // Scoped: a latch on ANOTHER PM must not halt this one.
+      const emCtx = { poolId: pm.poolId, pmId };
+
+      if (emergency.isTripped(emCtx)) {
         log.warn("rebalancer: L3 HALTED — skipping tick", { tickId, pmId });
         return;
       }
 
-      if (emergency.isDraining()) {
+      // Where the money actually is, so the drain alert can tell the truth
+      // rather than assume "PM balance". After an L2 EXTREME swept 100% into
+      // Scallop/Kai, "exited" means the DLMM position is gone — NOT that the
+      // funds are sitting in the PM.
+      const fundsNow = {
+        balanceA: pm.balance.a,
+        balanceB: pm.balance.b,
+        lending: pm.lending,
+      };
+
+      if (emergency.isDraining(emCtx)) {
         const drainPlan = buildExtremeWithdrawPlan(pm, "L3 emergency drain: force-exit before halt");
         if (!drainPlan) {
-          // Nothing left to withdraw — the position is already flat. Done.
-          emergency.recordDrainAttempt({ positionEmpty: true, pmId });
+          // No DLMM bins and no fees left: the price exposure L3 exists to
+          // remove is already gone (typically because an L2 EXTREME withdrew
+          // first). Capital may well be in lending — that is fine, and the
+          // alert will say so.
+          emergency.recordDrainAttempt(emCtx, { positionEmpty: true, pmId, funds: fundsNow });
           return;
         }
         drainPlan.priority = "emergency";
@@ -634,7 +655,7 @@ export function createRebalancerService(
           // rather than waiting for the next one.
           const drainPlan = buildExtremeWithdrawPlan(pm, `L3 emergency drain: ${veto.reason}`);
           if (!drainPlan) {
-            emergency.recordDrainAttempt({ positionEmpty: true, pmId });
+            emergency.recordDrainAttempt(emCtx, { positionEmpty: true, pmId, funds: fundsNow });
             return;
           }
           drainPlan.priority = "emergency";
@@ -1126,11 +1147,10 @@ export function createRebalancerService(
         // emergency stop goes HALTED and raises `l3_drain_failed` (position
         // still deployed, automation off, human needed now).
         if (drainAttempt) {
-          riskMonitor.emergencyStop.recordDrainAttempt({
-            positionEmpty: false,
-            pmId,
-            error: finalError,
-          });
+          riskMonitor.emergencyStop.recordDrainAttempt(
+            { poolId: pm.poolId, pmId },
+            { positionEmpty: false, pmId, error: finalError, funds: fundsNow },
+          );
         }
 
         // L3 escalation on repeated failures: something is systematically
@@ -1138,8 +1158,11 @@ export function createRebalancerService(
         const failures = (consecutiveTxFailures.get(pmId) ?? 0) + 1;
         consecutiveTxFailures.set(pmId, failures);
         if (failures >= cfg.risk.l3.txFailureCount) {
+          // PM scope: one user's malformed position, dust plan, or revoked
+          // authorization must not force-exit every other user's position.
           riskMonitor.emergencyStop.trip(
             `${failures} consecutive failed rebalance attempts for pm ${pmId} (last: ${finalError})`,
+            { kind: "pm", pmId },
           );
         }
 
@@ -1160,7 +1183,21 @@ export function createRebalancerService(
       // with `l3_drained` — capital sits in the PositionManager balance, where
       // the owner can withdraw it without us.
       if (drainAttempt && finalStatus === "succeeded") {
-        riskMonitor.emergencyStop.recordDrainAttempt({ positionEmpty: true, pmId });
+        // The withdraw PTB landed, so every bin is gone. Re-read balances is not
+        // needed for safety (exposure is what matters) but the freed principal is
+        // now in the PM balance — reflect that in the alert.
+        riskMonitor.emergencyStop.recordDrainAttempt(
+          { poolId: pm.poolId, pmId },
+          {
+            positionEmpty: true,
+            pmId,
+            funds: {
+              balanceA: fundsNow.balanceA + (pm.positionValue?.a ?? 0n),
+              balanceB: fundsNow.balanceB + (pm.positionValue?.b ?? 0n),
+              lending: pm.lending,
+            },
+          },
+        );
       }
 
       // Update the rebalance row.

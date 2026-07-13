@@ -31,7 +31,8 @@ if (!ackReason || ackReason.trim() === "") {
 const cfg = loadConfig();
 openDb(cfg.dbFile);
 
-const { resolvedEventId } = resolveEmergencyStopInDb(getDb(), ackReason);
+const { resolvedEventIds } = resolveEmergencyStopInDb(getDb(), ackReason);
 
-console.log(`✅ resolved emergency_stop risk_event id=${resolvedEventId}`);
+// Latches are scoped (global / pool / pm), so a crisis can leave more than one.
+console.log(`✅ resolved ${resolvedEventIds.length} emergency_stop risk_event(s): ${resolvedEventIds.join(", ")}`);
 console.log("Now RESTART the agent — the latch clears via boot rehydration.");
