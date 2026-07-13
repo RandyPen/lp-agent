@@ -81,6 +81,16 @@ export function Panel(props: { title: string; right?: ReactNode; children: React
   );
 }
 
+/**
+ * Wraps a wide table. Without this the table's min-content width (mono columns
+ * don't compress) exceeds a phone viewport and the *document* scrolls sideways,
+ * clipping the header, nav and stat tiles. Scroll the table locally instead;
+ * the min-width keeps columns legible rather than crushing them.
+ */
+export function TableScroll({ children }: { children: ReactNode }) {
+  return <div className="overflow-x-auto">{children}</div>;
+}
+
 export function EmptyState({ children }: { children: ReactNode }) {
   return (
     <div className="border-line-2 text-ink-3 rounded-md border border-dashed px-4 py-8 text-center text-sm">

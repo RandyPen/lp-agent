@@ -8,6 +8,7 @@ import {
   RiskLevelBadge,
   StatTile,
   StateBadge,
+  TableScroll,
 } from "@/components/primitives";
 import { formatAgo, formatTs, formatUsd, truncateAddress } from "@/lib/format";
 
@@ -42,11 +43,14 @@ export function DashboardPage() {
   const allSeries = pnlQueries.data ?? [];
   const navNow = allSeries.reduce((sum, s) => sum + (s.ticks.at(-1)?.nav_usd ?? 0), 0);
   const dayAgo = Date.now() - 24 * 3600 * 1000;
-  const navDayAgo = allSeries.reduce((sum, s) => {
-    const first = s.ticks.find((t) => t.ts_ms >= dayAgo) ?? s.ticks.at(-1);
-    return sum + (first?.nav_usd ?? 0);
-  }, 0);
-  const pnl24hPct = navDayAgo > 0 ? ((navNow - navDayAgo) / navDayAgo) * 100 : null;
+  // Baseline = each series' first NAV sample inside the 24h window. A series
+  // whose samples are all older than a day has no baseline, and there is no
+  // honest 24h number to show — falling back to its latest tick would make
+  // navDayAgo === navNow and render a confident "+0.00%" over stale data.
+  const baselines = allSeries.map((s) => s.ticks.find((t) => t.ts_ms >= dayAgo));
+  const has24hBaseline = allSeries.length > 0 && baselines.every((b) => b != null);
+  const navDayAgo = has24hBaseline ? baselines.reduce((sum, b) => sum + b!.nav_usd, 0) : 0;
+  const pnl24hPct = has24hBaseline && navDayAgo > 0 ? ((navNow - navDayAgo) / navDayAgo) * 100 : null;
   const cumFees = allSeries.reduce(
     (sum, s) => sum + s.ticks.reduce((f, t) => f + t.fee_income_usd, 0),
     0,
@@ -73,7 +77,7 @@ export function DashboardPage() {
         <StatTile
           label="Managed NAV"
           value={pnlQueries.isSuccess ? `$${formatUsd(navNow)}` : "—"}
-          sub={`${summary.data?.activePms ?? "—"} active PM`}
+          sub={`${summary.data?.activePms ?? "—"} active PM${summary.data?.activePms === 1 ? "" : "s"}`}
         />
         <StatTile
           label="24h PnL"
@@ -87,7 +91,7 @@ export function DashboardPage() {
               </span>
             )
           }
-          sub="mark-to-market"
+          sub={pnl24hPct == null ? "no NAV sample in the last 24h" : "mark-to-market"}
         />
         <StatTile
           label="Fees harvested"
@@ -163,42 +167,44 @@ export function DashboardPage() {
             they trip.
           </EmptyState>
         ) : (
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="text-ink-3 border-line border-b font-mono text-[11px] uppercase">
-                <th className="py-2 pr-3">level</th>
-                <th className="py-2 pr-3">kind</th>
-                <th className="py-2 pr-3">metric</th>
-                <th className="py-2 pr-3">observed / threshold</th>
-                <th className="py-2 pr-3">action</th>
-                <th className="py-2 pr-3">time</th>
-                <th className="py-2">status</th>
-              </tr>
-            </thead>
-            <tbody className="mono-num">
-              {(risk.data ?? []).map((e, i) => (
-                <tr key={i} className="border-line/60 border-b last:border-0">
-                  <td className="py-2 pr-3">
-                    <RiskLevelBadge level={e.level} />
-                  </td>
-                  <td className="py-2 pr-3">{e.kind}</td>
-                  <td className="text-ink-2 py-2 pr-3">{e.metric}</td>
-                  <td className="py-2 pr-3">
-                    {e.observed} / {e.threshold}
-                  </td>
-                  <td className="text-ink-2 py-2 pr-3">{e.action}</td>
-                  <td className="text-ink-3 py-2 pr-3">{formatTs(e.ts_ms)}</td>
-                  <td className="py-2">
-                    {e.resolved_at_ms ? (
-                      <span className="text-ink-3">resolved</span>
-                    ) : (
-                      <span style={{ color: "var(--color-l2)" }}>open</span>
-                    )}
-                  </td>
+          <TableScroll>
+            <table className="w-full min-w-[720px] text-left text-sm">
+              <thead>
+                <tr className="text-ink-3 border-line border-b font-mono text-[11px] uppercase">
+                  <th className="py-2 pr-3">level</th>
+                  <th className="py-2 pr-3">kind</th>
+                  <th className="py-2 pr-3">metric</th>
+                  <th className="py-2 pr-3">observed / threshold</th>
+                  <th className="py-2 pr-3">action</th>
+                  <th className="py-2 pr-3">time</th>
+                  <th className="py-2">status</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody className="mono-num">
+                {(risk.data ?? []).map((e, i) => (
+                  <tr key={i} className="border-line/60 border-b last:border-0">
+                    <td className="py-2 pr-3">
+                      <RiskLevelBadge level={e.level} />
+                    </td>
+                    <td className="py-2 pr-3">{e.kind}</td>
+                    <td className="text-ink-2 py-2 pr-3">{e.metric}</td>
+                    <td className="py-2 pr-3">
+                      {e.observed} / {e.threshold}
+                    </td>
+                    <td className="text-ink-2 py-2 pr-3">{e.action}</td>
+                    <td className="text-ink-3 py-2 pr-3">{formatTs(e.ts_ms)}</td>
+                    <td className="py-2">
+                      {e.resolved_at_ms ? (
+                        <span className="text-ink-3">resolved</span>
+                      ) : (
+                        <span style={{ color: "var(--color-l2)" }}>open</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </TableScroll>
         )}
       </Panel>
     </div>

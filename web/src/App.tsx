@@ -64,7 +64,8 @@ export function App() {
             <span className="text-ink-3 hidden items-center gap-2 text-xs md:flex">
               <span className="live-dot" />
               <span className="mono-num">
-                {summary.data.activePms} PM · {summary.data.succeededRebalances} rebalances
+                {summary.data.activePms} active PM{summary.data.activePms === 1 ? "" : "s"} ·{" "}
+                {summary.data.succeededRebalances} rebalances
               </span>
             </span>
           )}
@@ -72,12 +73,12 @@ export function App() {
         </div>
       </header>
 
-      <nav className="border-line mt-0 flex gap-1 border-b">
+      <nav className="border-line mt-0 flex gap-1 overflow-x-auto border-b">
         {PAGES.map((p) => (
           <button
             key={p.id}
             onClick={() => navigate(p.id)}
-            className={`font-display px-4 py-3 text-[0.78rem] font-semibold tracking-[0.12em] uppercase transition-colors ${
+            className={`font-display shrink-0 px-3 py-3 text-[0.78rem] font-semibold tracking-[0.12em] uppercase transition-colors sm:px-4 ${
               page === p.id
                 ? "text-mint border-mint -mb-px border-b-2"
                 : "text-ink-3 hover:text-ink-2"
@@ -105,7 +106,7 @@ export function App() {
         {page === "account" && <AccountPage />}
       </main>
 
-      <footer className="text-ink-3 mt-16 flex items-center justify-between gap-4 text-xs">
+      <footer className="text-ink-3 mt-16 flex flex-col items-start justify-between gap-2 text-xs sm:flex-row sm:items-center sm:gap-4">
         <span>
           Reference portal from the open-source <b className="text-ink-2">lp-agent framework</b>{" "}
           (Apache-2.0) — each operator self-hosts it for their own users. Non-custodial: the agent

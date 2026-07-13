@@ -115,8 +115,8 @@ export function IntelligencePage() {
             side by side with the live rule-based strategy — without executing it.
           </EmptyState>
         ) : (
-          <div className="max-h-96 overflow-y-auto">
-            <table className="w-full text-left text-sm">
+          <div className="max-h-96 overflow-auto">
+            <table className="w-full min-w-[720px] text-left text-sm">
               <thead className="bg-panel sticky top-0">
                 <tr className="text-ink-3 border-line border-b font-mono text-[11px] uppercase">
                   <th className="py-2 pr-3">time</th>

@@ -148,19 +148,81 @@ body::before {
   cursor: not-allowed;
 }
 
-/* dapp-kit ConnectButton override — align with the terminal chrome */
-.wallet-connect-unconnected button {
-  font-family: var(--font-display) !important;
-  font-weight: 600 !important;
-  letter-spacing: 0.08em !important;
-  text-transform: uppercase !important;
-  font-size: 0.78rem !important;
-  color: #06231a !important;
-  background: var(--color-mint) !important;
-  border-radius: 4px !important;
-  padding: 0.55rem 1.1rem !important;
-  border: none !important;
-  cursor: pointer !important;
+/* --------------------------------------------------------------------------
+ * dapp-kit theming.
+ *
+ * ConnectButton / ConnectModal are Lit web components: their internals live in
+ * a shadow root, so ordinary descendant selectors never reach them (an earlier
+ * `.wallet-connect-unconnected button` override silently did nothing and both
+ * rendered in dapp-kit's default LIGHT theme — a white pill and a white modal
+ * on our dark chrome). Two mechanisms do cross the boundary:
+ *
+ *   1. Custom properties. Note dapp-kit declares its own `--dapp-kit-*` tokens
+ *      on each component's :host as `var(--<name>, <light default>)`. A :host
+ *      declaration beats an inherited one, so overriding `--dapp-kit-*` from
+ *      here does NOTHING — the theming surface is the UNPREFIXED names below,
+ *      which are what those tokens fall back to.
+ *   2. `::part()` reaches elements the component explicitly exports. The
+ *      connect button forwards its `trigger` part, which is the button itself.
+ *
+ * The modal is rendered INSIDE <mysten-dapp-kit-connect-button>, so scoping a
+ * token override to that host would leak into the modal. Hence: tokens global,
+ * button-specific styling via ::part(trigger).
+ * ------------------------------------------------------------------------ */
+
+:root {
+  --background: var(--color-panel);
+  --foreground: var(--color-ink);
+  --popover: var(--color-panel);
+  --popover-foreground: var(--color-ink);
+
+  --primary: var(--color-mint);
+  --primary-foreground: #06231a;
+
+  --secondary: var(--color-panel-2);
+  --secondary-foreground: var(--color-ink);
+
+  --muted: var(--color-panel-2);
+  --muted-foreground: var(--color-ink-2);
+
+  --accent: var(--color-line);
+  --accent-foreground: var(--color-ink);
+
+  --border: var(--color-line-2);
+  --input: var(--color-line-2);
+  --ring: var(--color-mint-dim);
+
+  --destructive: var(--color-l3);
+  --positive: var(--color-mint);
+
+  --font-sans: var(--font-body);
+  --radius: 6px;
+
+  /* dapp-kit defaults these to `default`, which reads as non-interactive */
+  --cursor-button: pointer;
+  --cursor-menu-item: pointer;
+  --cursor-radio: pointer;
+}
+
+/* The connect button is our primary CTA — match .btn-primary exactly. */
+mysten-dapp-kit-connect-button::part(trigger) {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+  color: #06231a;
+  background: var(--color-mint);
+  border: none;
+  border-radius: 4px;
+  padding: 0.55rem 1.1rem;
+  transition: filter 120ms ease, transform 120ms ease;
+}
+mysten-dapp-kit-connect-button::part(trigger):hover {
+  filter: brightness(1.12);
+}
+mysten-dapp-kit-connect-button::part(trigger):active {
+  transform: translateY(1px);
 }
 
 @keyframes rise-in {

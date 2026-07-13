@@ -3,7 +3,7 @@ import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 import { useCurrentAccount } from "@mysten/dapp-kit-react";
 import { api, type RebalanceEntry } from "@/lib/api";
 import { NavChart } from "@/components/charts";
-import { EmptyState, LoadingRow, Panel, StatusPill } from "@/components/primitives";
+import { EmptyState, LoadingRow, Panel, StatusPill, TableScroll } from "@/components/primitives";
 import { EnrollWizard } from "./EnrollWizard";
 import {
   explorerAddressUrl,
@@ -36,16 +36,22 @@ export function PositionsPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-ink-3 text-sm">
           {account
             ? "PositionManagers you own that this agent manages."
             : "Connect your wallet to see your managed positions."}
         </p>
-        <button className="btn-primary" onClick={() => setWizardOpen(true)} disabled={!account}>
+        <button
+          className="btn-primary shrink-0"
+          onClick={() => setWizardOpen(true)}
+          disabled={!account}
+        >
           + Enroll position
         </button>
       </div>
+
+      {!account && <CustodyCallout />}
 
       {wizardOpen && <EnrollWizard onClose={() => setWizardOpen(false)} />}
 
@@ -95,6 +101,77 @@ export function PositionsPage() {
         </>
       )}
     </div>
+  );
+}
+
+const AGENT_CAN = [
+  "Add liquidity from the PositionManager balance",
+  "Remove liquidity back into that balance",
+  "Collect swap fees and rewards",
+  "Park idle assets in lending",
+];
+
+const AGENT_CANNOT = [
+  "Withdraw funds out of the PositionManager",
+  "Close your positions",
+  "Authorize or revoke other agents",
+  "Swap — it is a pure maker, never a taker",
+];
+
+/**
+ * Shown in place of the (empty) position list before a wallet connects. The
+ * permission split is the product's load-bearing claim — it is enforced by the
+ * CDPM contract, not by this agent's good behaviour — so state it up front
+ * rather than leaving a bare "connect your wallet" line.
+ */
+function CustodyCallout() {
+  return (
+    <Panel
+      title="Non-custodial by construction"
+      right={
+        <span className="text-ink-3 font-mono text-[11px]">
+          enforced on-chain by CDPM · not by agent good behaviour
+        </span>
+      }
+    >
+      <div className="grid gap-x-8 gap-y-4 sm:grid-cols-2">
+        <div>
+          <div className="font-display text-mint mb-2 text-[11px] font-semibold tracking-[0.14em] uppercase">
+            The agent can
+          </div>
+          <ul className="space-y-1.5">
+            {AGENT_CAN.map((t) => (
+              <li key={t} className="text-ink-2 flex gap-2 text-sm">
+                <span className="text-mint" aria-hidden>
+                  +
+                </span>
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div>
+          <div className="font-display text-l3 mb-2 text-[11px] font-semibold tracking-[0.14em] uppercase">
+            The agent cannot
+          </div>
+          <ul className="space-y-1.5">
+            {AGENT_CANNOT.map((t) => (
+              <li key={t} className="text-ink-2 flex gap-2 text-sm">
+                <span className="text-l3" aria-hidden>
+                  −
+                </span>
+                {t}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+      <p className="text-ink-3 border-line mt-4 border-t pt-3 text-xs leading-relaxed">
+        Your funds stay in a <span className="text-ink-2">PositionManager</span> object you own.
+        Enrolling authorizes this agent as an operator with the permission set above — you can
+        revoke it at any time, and only you can withdraw.
+      </p>
+    </Panel>
   );
 }
 
@@ -261,24 +338,26 @@ function OnchainActivityPanel() {
       ) : events.length === 0 ? (
         <EmptyState>No agent events found on-chain yet.</EmptyState>
       ) : (
-        <div className="space-y-1.5">
-          {events.map((e, i) => (
-            <AgentEventRow key={`${e.digest}-${e.kind}-${e.pmId}-${i}`} e={e} />
-          ))}
-          <div className="pt-2 text-center">
-            {q.hasNextPage ? (
-              <button
-                onClick={() => q.fetchNextPage()}
-                disabled={q.isFetchingNextPage}
-                className="font-display text-ink-2 hover:text-mint border-line-2 hover:border-mint-dim rounded-md border px-4 py-1.5 text-xs tracking-wider uppercase transition-colors disabled:opacity-50"
-              >
-                {q.isFetchingNextPage ? "Loading…" : "Load more ↓"}
-              </button>
-            ) : (
-              <span className="text-ink-3 text-xs">— end of history —</span>
-            )}
+        <TableScroll>
+          <div className="min-w-[600px] space-y-1.5">
+            {events.map((e, i) => (
+              <AgentEventRow key={`${e.digest}-${e.kind}-${e.pmId}-${i}`} e={e} />
+            ))}
+            <div className="pt-2 text-center">
+              {q.hasNextPage ? (
+                <button
+                  onClick={() => q.fetchNextPage()}
+                  disabled={q.isFetchingNextPage}
+                  className="font-display text-ink-2 hover:text-mint border-line-2 hover:border-mint-dim rounded-md border px-4 py-1.5 text-xs tracking-wider uppercase transition-colors disabled:opacity-50"
+                >
+                  {q.isFetchingNextPage ? "Loading…" : "Load more ↓"}
+                </button>
+              ) : (
+                <span className="text-ink-3 text-xs">— end of history —</span>
+              )}
+            </div>
           </div>
-        </div>
+        </TableScroll>
       )}
     </Panel>
   );

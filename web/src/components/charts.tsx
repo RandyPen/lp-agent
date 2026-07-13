@@ -33,6 +33,11 @@ const TOOLTIP_STYLE = {
 
 const SERIES = ["#3987e5", "#199e70", "#9085e9", "#c98500"] as const;
 
+// The last X tick is centered on the final data point, which sits flush against
+// the plot's right edge — with no right margin its label gets clipped mid-word
+// ("Jul 12, 09:2…"). Reserve half a timestamp label's width.
+const CHART_MARGIN = { top: 8, right: 44, bottom: 0, left: 0 } as const;
+
 // ---------------------------------------------------------------------------
 // NAV per PM — multi-line, each PM its own series
 // ---------------------------------------------------------------------------
@@ -46,7 +51,7 @@ export function NavChart({ series }: { series: NavSeries[] }) {
   return (
     <div className={series.length > 1 ? "h-72" : "h-64"}>
       <ResponsiveContainer>
-        <LineChart margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <LineChart margin={CHART_MARGIN}>
           <CartesianGrid stroke={GRID} vertical={false} />
           <XAxis
             dataKey="ts_ms"
@@ -108,7 +113,7 @@ export function FeeChart({ ticks }: { ticks: Array<{ ts_ms: number; cum_fees: nu
   return (
     <div className="h-40">
       <ResponsiveContainer>
-        <ComposedChart data={ticks} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <ComposedChart data={ticks} margin={CHART_MARGIN}>
           <CartesianGrid stroke={GRID} vertical={false} />
           <XAxis
             dataKey="ts_ms"
@@ -203,7 +208,7 @@ export function PredictionFan({ data }: { data: FanData }) {
   return (
     <div className="h-72">
       <ResponsiveContainer>
-        <ComposedChart margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <ComposedChart margin={CHART_MARGIN}>
           <CartesianGrid stroke={GRID} vertical={false} />
           <XAxis
             dataKey="ts_ms"

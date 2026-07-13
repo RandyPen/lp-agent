@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCurrentAccount, useDAppKit } from "@mysten/dapp-kit-react";
 import { api, ApiError } from "@/lib/api";
-import { EmptyState, LoadingRow, Panel, StatTile } from "@/components/primitives";
+import { EmptyState, LoadingRow, Panel, StatTile, TableScroll } from "@/components/primitives";
 import { formatRaw, formatTs, truncateAddress } from "@/lib/format";
 
 const COIN_LABELS: Record<string, { symbol: string; decimals: number }> = {
@@ -159,29 +159,31 @@ export function AccountPage() {
         ) : (deposits.data ?? []).length === 0 ? (
           <EmptyState>No deposits yet — your first top-up will appear here.</EmptyState>
         ) : (
-          <table className="w-full text-left text-sm">
-            <thead>
-              <tr className="text-ink-3 border-line border-b font-mono text-[11px] uppercase">
-                <th className="py-2 pr-3">time</th>
-                <th className="py-2 pr-3">coin</th>
-                <th className="py-2 pr-3">amount</th>
-                <th className="py-2">credits granted</th>
-              </tr>
-            </thead>
-            <tbody className="mono-num">
-              {(deposits.data ?? []).map((d) => {
-                const { symbol, decimals } = coinLabel(d.coinType);
-                return (
-                  <tr key={d.id} className="border-line/60 border-b last:border-0">
-                    <td className="text-ink-3 py-2 pr-3">{formatTs(d.observedAtMs)}</td>
-                    <td className="py-2 pr-3">{symbol}</td>
-                    <td className="py-2 pr-3">{formatRaw(d.amountDelta, decimals, 4)}</td>
-                    <td className="text-mint py-2">+{d.creditsGranted.toLocaleString()}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <TableScroll>
+            <table className="w-full min-w-[520px] text-left text-sm">
+              <thead>
+                <tr className="text-ink-3 border-line border-b font-mono text-[11px] uppercase">
+                  <th className="py-2 pr-3">time</th>
+                  <th className="py-2 pr-3">coin</th>
+                  <th className="py-2 pr-3">amount</th>
+                  <th className="py-2">credits granted</th>
+                </tr>
+              </thead>
+              <tbody className="mono-num">
+                {(deposits.data ?? []).map((d) => {
+                  const { symbol, decimals } = coinLabel(d.coinType);
+                  return (
+                    <tr key={d.id} className="border-line/60 border-b last:border-0">
+                      <td className="text-ink-3 py-2 pr-3">{formatTs(d.observedAtMs)}</td>
+                      <td className="py-2 pr-3">{symbol}</td>
+                      <td className="py-2 pr-3">{formatRaw(d.amountDelta, decimals, 4)}</td>
+                      <td className="text-mint py-2">+{d.creditsGranted.toLocaleString()}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </TableScroll>
         )}
       </Panel>
     </div>
