@@ -16,17 +16,23 @@
  *   bun run backtest --json    # emit per-tick records as JSON to stdout
  *   bun run backtest --help    # print usage and exit
  *
- * Scope: this is a DECISION trace, not a P&L simulator — it reports what the
- * strategy would have done (trigger frequency, bins touched), with no fee, IL,
- * or gas accounting. Do not use it to rank strategies by return.
+ * Two modes:
+ *   --mode=decision (default)  what the strategy would DO — trigger frequency,
+ *                              bins touched. No fees, no IL, no gas.
+ *   --mode=pnl                 what it would have EARNED — replays REAL on-chain
+ *                              Cetus SwapEvents through the same ShadowBook the
+ *                              live shadow fleet uses, and reports fee income,
+ *                              impermanent loss and vs-HODL.
  */
 
 import { Database } from "bun:sqlite";
 import { resolve } from "node:path";
+import { openDb } from "../db/client.ts";
 import { loadPoolProfile } from "../pools/index.ts";
 import { loadExtensions } from "../kit/loadExtensions.ts";
 import { isStrategyName, listStrategyNames } from "../strategies/registry.ts";
 import { runBacktest } from "./replay.ts";
+import { runPnlBacktest, type StoredSwapEvent } from "./pnlReplay.ts";
 import type { PriceObservation } from "../domain/types.ts";
 
 // ---------------------------------------------------------------------------
@@ -40,6 +46,11 @@ Usage:
   bun run backtest [options]
 
 Options:
+  --mode=<decision|pnl>    decision (default): what the strategy would DO —
+                           trigger frequency, bins touched. No fees/IL/gas.
+                           pnl: what it would have EARNED — NAV, fee income, IL,
+                           vs-HODL, replayed through REAL on-chain swap fills.
+                           Needs swap_events (bun run backfill-cetus-events).
   --strategy=<name>        Strategy to replay. Any registered strategy, incl.
                            ones a fork registers via agent.config.ts.
                            Built-ins: singleBin | multiBinSpot | presenceAnchor
@@ -74,6 +85,17 @@ Examples:
 
 
 interface CliArgs {
+  /**
+   * "decision" (default) — replay price ticks; report trigger frequency and
+   * bins touched. Offline-friendly (works from the committed price fixture),
+   * but models NO fees, IL, or gas: it tells you what a strategy would DO.
+   *
+   * "pnl" — replay real on-chain Cetus SwapEvents through the same ShadowBook
+   * the live shadow fleet uses; report NAV, fee income, IL and vs-HODL. It
+   * tells you what a strategy would have EARNED. Needs swap_events, seeded by
+   * `bun run backfill-cetus-events` (or the committed swap fixture).
+   */
+  mode: "decision" | "pnl";
   pool: string;
   /**
    * Overrides the `price_observations.pool_id` key to replay from, decoupling
@@ -106,6 +128,7 @@ interface ParseArgsResult {
 
 function parseArgs(argv: string[]): ParseArgsResult {
   const args: CliArgs = {
+    mode: "decision",
     pool: "sui-usdc",
     poolId: null,
     strategy: "multiBinSpot",
@@ -132,6 +155,13 @@ function parseArgs(argv: string[]): ParseArgsResult {
     const key = raw.slice(2, eq);
     const val = raw.slice(eq + 1);
     switch (key) {
+      case "mode":
+        if (val !== "decision" && val !== "pnl") {
+          console.error(`backtest: --mode must be 'decision' or 'pnl', got '${val}'`);
+          process.exit(1);
+        }
+        args.mode = val;
+        break;
       case "pool":
         args.pool = val;
         break;
@@ -164,6 +194,128 @@ function parseArgs(argv: string[]): ParseArgsResult {
     }
   }
   return { args, help: false };
+}
+
+// ---------------------------------------------------------------------------
+// PnL mode
+// ---------------------------------------------------------------------------
+
+function loadSwapEvents(
+  dbPath: string,
+  poolId: string,
+  fromMs: number | null,
+  toMs: number | null,
+): StoredSwapEvent[] {
+  const db = new Database(resolve(dbPath), { readonly: true });
+  try {
+    const where: string[] = ["pool_id = ?"];
+    const params: (string | number)[] = [poolId];
+    if (fromMs !== null) {
+      where.push("ts_ms >= ?");
+      params.push(fromMs);
+    }
+    if (toMs !== null) {
+      where.push("ts_ms <= ?");
+      params.push(toMs);
+    }
+    const rows = db
+      .query<{ ts_ms: number; raw: string }, typeof params>(
+        `SELECT ts_ms, raw FROM swap_events WHERE ${where.join(" AND ")} ORDER BY ts_ms ASC`,
+      )
+      .all(...params);
+    return rows.map((r) => ({
+      tsMs: r.ts_ms,
+      raw: JSON.parse(r.raw) as StoredSwapEvent["raw"],
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+function fmtQuote(n: number): string {
+  return n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPct(n: number): string {
+  const s = n >= 0 ? "+" : "";
+  return `${s}${n.toFixed(3)} %`;
+}
+
+async function runPnlMode(args: CliArgs): Promise<void> {
+  // PnL replay needs the pool's on-chain id (that's how swap_events are keyed)
+  // and its orientation/decimals — but still touches no chain.
+  const profile = loadPoolProfile(args.pool, { requirePoolId: args.poolId === null });
+  const poolId = args.poolId ?? profile.poolId;
+
+  // Open the app DB: the replay persists cross-tick strategy state
+  // (position_state.fill_boundary_bin_id) exactly as the live agent does,
+  // because presenceSweep READS it back. Without an open DB it would silently
+  // behave like presenceAnchor.
+  openDb(args.db);
+
+  const swaps = loadSwapEvents(args.db, poolId, args.fromMs, args.toMs);
+  if (swaps.length === 0) {
+    console.error(
+      `No swap events found in ${args.db} for pool '${poolId}'.\n` +
+        `PnL mode replays REAL on-chain fills, so it needs the swap_events table.\n` +
+        `Seed it with:\n` +
+        `  bun run backfill-cetus-events --pool-id=${poolId} --bin-step=${profile.binStep} --from-hours=48\n` +
+        `(or 'bun run seed-fixture' for the committed sample, which includes swaps).`,
+    );
+    process.exit(1);
+  }
+
+  // PHYSICAL coin types — how the pool actually holds them. For SUI/USDC the
+  // physical A is USDC (see PoolProfile.poolCoinAIsQuote).
+  const physicalTypeA = profile.poolCoinAIsQuote ? profile.coinTypeB : profile.coinTypeA;
+  const physicalTypeB = profile.poolCoinAIsQuote ? profile.coinTypeA : profile.coinTypeB;
+
+  const { summary, samples } = await runPnlBacktest({
+    profile,
+    strategyName: args.strategy,
+    swaps,
+    initialA: args.initialA,
+    initialB: args.initialB,
+    historyWindowMs: args.historyWindowMs,
+    physicalTypeA,
+    physicalTypeB,
+  });
+
+  if (args.json) {
+    for (const s of samples) process.stdout.write(JSON.stringify(s) + "\n");
+    return;
+  }
+
+  const q = profile.pricePairLabel.split("/")[1] ?? "quote";
+
+  console.log("");
+  console.log(`PnL backtest — ${summary.strategyName} on ${summary.poolName}`);
+  console.log(
+    `  window:            ${formatDate(summary.firstTsMs)}  →  ${formatDate(summary.lastTsMs)}  (${summary.windowDays.toFixed(2)} days)`,
+  );
+  console.log(`  swaps replayed:    ${summary.swapsReplayed}  (${summary.fills} hit your liquidity)`);
+  console.log(
+    `  partial fills:     ${summary.skippedTerminalFills}  (uncredited — fee income is understated by these)`,
+  );
+  console.log(`  rebalances:        ${summary.rebalances}`);
+  console.log("");
+  console.log(`  NAV start:         ${fmtQuote(summary.initialNavQuote)} ${q}`);
+  console.log(`  NAV end:           ${fmtQuote(summary.finalNavQuote)} ${q}`);
+  console.log(`  HODL end:          ${fmtQuote(summary.finalHodlQuote)} ${q}   (just holding the initial inventory)`);
+  console.log("");
+  console.log(`  fee income:        ${fmtQuote(summary.feeIncomeQuote)} ${q}   (${fmtPct(summary.feeAprPct)} APR)`);
+  console.log(`  impermanent loss:  ${fmtQuote(summary.ilQuote)} ${q}   (position ex-fees vs HODL)`);
+  console.log("");
+  console.log(`  total return:      ${fmtPct(summary.totalReturnPct)}`);
+  console.log(`  VS HODL:           ${fmtPct(summary.vsHodlPct)}   ← did market-making beat holding?`);
+  console.log("");
+  console.log(
+    "  Caveat: this assumes your liquidity did not change the flow it is credited\n" +
+    "  for. Real fills would have been shared with the LPs already in those bins.\n" +
+    "  Use it to kill bad ideas cheaply — not to bless good ones. 'bun run shadow'\n" +
+    "  is the honest evaluator.",
+  );
+  console.log("");
 }
 
 function parseTimestamp(raw: string): number {
@@ -277,6 +429,11 @@ async function main(): Promise<void> {
       `Unknown strategy '${args.strategy}'. Available: ${listStrategyNames().filter((s) => s !== "mlAgent").join(", ")}`,
     );
     process.exit(1);
+  }
+
+  if (args.mode === "pnl") {
+    await runPnlMode(args);
+    return;
   }
 
   // Resolved through the registry so a fork's own profile from agent.config.ts

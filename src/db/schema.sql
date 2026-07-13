@@ -70,6 +70,30 @@ CREATE TABLE IF NOT EXISTS price_observations (
 );
 CREATE INDEX IF NOT EXISTS price_observations_lookup ON price_observations(pool_id, observed_ms DESC);
 
+-- Raw Cetus DLMM SwapEvents, verbatim.
+--
+-- price_observations stores the DERIVED mid-price and throws the per-bin swap
+-- detail away — which is fine for a decision-trace backtest, but useless for a
+-- PnL one: to know what a hypothetical position would have EARNED you need the
+-- individual bin fills (which bin, which side was consumed, how much, what fee).
+--
+-- So we keep the raw event payload and re-parse it at replay time with the same
+-- `parseSwapEvent` the live shadow fleet uses (src/services/shadowBook.ts).
+-- Storing raw rather than a parsed projection means a future change to the fill
+-- model does not require re-collecting months of history.
+--
+-- (tx_digest, event_seq) is the on-chain identity of an event, so the PK makes
+-- backfills idempotent and resumable.
+CREATE TABLE IF NOT EXISTS swap_events (
+  pool_id    TEXT NOT NULL,
+  ts_ms      INTEGER NOT NULL,
+  tx_digest  TEXT NOT NULL,
+  event_seq  TEXT NOT NULL,
+  raw        TEXT NOT NULL,   -- JSON: the Cetus SwapEvent parsedJson payload
+  PRIMARY KEY (tx_digest, event_seq)
+);
+CREATE INDEX IF NOT EXISTS swap_events_replay ON swap_events(pool_id, ts_ms ASC);
+
 ------------------------------------------------------------------------------
 -- Lending (formerly 0002_lending)
 ------------------------------------------------------------------------------

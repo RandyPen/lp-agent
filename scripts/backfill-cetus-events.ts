@@ -32,7 +32,7 @@
 
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { openDb } from "../src/db/client.ts";
+import { openDb, getDb } from "../src/db/client.ts";
 import { backfillSwapEvents, type SwapEventRecord } from "../src/data/feeds/cetusEvents.ts";
 
 // ---------------------------------------------------------------------------
@@ -138,6 +138,13 @@ console.log();
 
 let totalBatches = 0;
 let totalEvents = 0;
+let totalSwapsStored = 0;
+
+// Raw-event persistence: the fill source for the PnL backtest.
+const insertSwap = getDb().prepare(
+  `INSERT OR IGNORE INTO swap_events (pool_id, ts_ms, tx_digest, event_seq, raw)
+   VALUES (?, ?, ?, ?, ?)`,
+);
 let firstSample: SwapEventRecord | null = null;
 let lastSample: SwapEventRecord | null = null;
 
@@ -153,7 +160,31 @@ await backfillSwapEvents({
     totalEvents += batch.length;
     if (!firstSample && batch.length > 0) firstSample = batch[0]!;
     if (batch.length > 0) lastSample = batch[batch.length - 1]!;
-    process.stdout.write(`\r  ${totalBatches} pages / ${totalEvents} events`);
+
+    // Persist the RAW event too. The feed already writes the derived mid-price
+    // into price_observations, but that throws the per-bin fill detail away —
+    // and a PnL backtest needs to know which bin was hit, which side the taker
+    // consumed, and what fee was paid. Storing raw (rather than a parsed
+    // projection) means a future change to the fill model does not require
+    // re-collecting months of history.
+    //
+    // INSERT OR IGNORE + PK(tx_digest, event_seq) makes this idempotent, so a
+    // re-run over an overlapping window is safe.
+    for (const ev of batch) {
+      if (!ev.txDigest) continue; // no on-chain identity → cannot dedupe
+      insertSwap.run(
+        ev.poolId,
+        ev.timestampMs,
+        ev.txDigest,
+        ev.eventSeq,
+        JSON.stringify(ev.raw),
+      );
+      totalSwapsStored++;
+    }
+
+    process.stdout.write(
+      `\r  ${totalBatches} pages / ${totalEvents} events / ${totalSwapsStored} raw stored`,
+    );
   },
 });
 

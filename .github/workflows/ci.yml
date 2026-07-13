@@ -57,9 +57,15 @@ jobs:
       # third-party API goes red for reasons unrelated to the code.
       - name: Offline loop — seed history, replay a strategy (no keys, no network)
         working-directory: /tmp/fresh
+        env:
+          # The pool the committed swap fixture was collected from.
+          SUI_USDC_POOL_ID: "0x64e590b0e4d4f7dfc7ae9fae8e9983cd80ad83b658d8499bf550a9d4f6667076"
         run: |
           bun run seed-fixture
+          # what the strategy would DO
           bun run backtest --pool-id=binance:SUIUSDC --strategy=presenceAnchor
+          # what it would have EARNED (real on-chain fills → fees, IL, vs-HODL)
+          bun run backtest --mode=pnl --strategy=presenceAnchor
 
       - name: Fork seam — a custom strategy must run WITHOUT editing framework files
         working-directory: /tmp/fresh

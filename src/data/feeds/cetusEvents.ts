@@ -194,6 +194,17 @@ export interface SwapEventRecord {
   timestampMs: number;
   txDigest: string;
   eventSeq: string;
+  /**
+   * The verbatim SwapEvent payload (`event.parsedJson`).
+   *
+   * The derived fields above collapse a multi-bin swap to its LAST bin and drop
+   * the direction, which is enough for a mid-price but not for a fill model: a
+   * PnL backtest needs to know, per bin, which side the taker consumed and what
+   * fee was paid. Rather than widen this record with a parsed projection, we
+   * carry the raw payload so `parseSwapEvent` (src/services/shadowBook.ts) — the
+   * exact function the live shadow fleet uses — can reconstruct the fills.
+   */
+  raw: unknown;
 }
 
 function extractSwapEvent(
@@ -236,6 +247,7 @@ function extractSwapEvent(
     timestampMs,
     txDigest: id?.txDigest ?? "",
     eventSeq: id?.eventSeq ?? "",
+    raw,
   };
 }
 

@@ -177,7 +177,7 @@ only; a broken one **aborts startup** rather than silently falling back.
 flowchart LR
     F["bun run seed-fixture<br/><i>committed CSV, offline</i>"] --> B
     C["bun run collect-historical<br/><i>public Binance klines</i>"] --> B
-    B["bun run backtest<br/><b>decision trace</b><br/>no fees · no IL · no gas"] --> S
+    B["bun run backtest<br/><b>--mode=decision</b>: what it would DO<br/><b>--mode=pnl</b>: what it would EARN<br/>fees · IL · vs-HODL"] --> S
     S["bun run shadow<br/><b>real fills</b> from on-chain SwapEvents<br/>hypothetical book · zero capital"] --> L["bun start<br/>funded PositionManager"]
 ```
 
@@ -193,20 +193,45 @@ a strategy run. Two credential-free loops ship in the box:
 
 ```bash
 bun install
+bun run seed-fixture     # committed fixtures: 1d of prices + 7d of REAL on-chain swaps
 
-# A. Replay a strategy over real history — offline, no network at all.
-#    Seeds from a committed fixture (1 day of 1m SUI/USDC closes).
-bun run seed-fixture
+# A. What would my strategy DO?  (decision trace — triggers, bins touched)
 bun run backtest --pool-id=binance:SUIUSDC --strategy=presenceAnchor
 
-# B. Run strategies against the LIVE market on a hypothetical book.
-#    Fills a simulated position from real on-chain SwapEvents and never signs
-#    anything. Needs a pool id, no secrets.
+# B. What would it have EARNED?  (fees, impermanent loss, vs just HODLing)
+#    Replays 1,615 real Cetus SwapEvents through a hypothetical position.
+SUI_USDC_POOL_ID=0x64e590b0e4d4f7dfc7ae9fae8e9983cd80ad83b658d8499bf550a9d4f6667076 \
+  bun run backtest --mode=pnl --strategy=presenceAnchor
+
+# C. Run it against the LIVE market on a hypothetical book — real fills, no signing.
 SUI_USDC_POOL_ID=0x<dlmm-pool> bun run shadow
 ```
 
-For real, current, longer history use `bun run collect-historical` (public
-Binance klines) instead of the fixture.
+`--mode=pnl` prints the numbers you actually rank strategies on:
+
+```
+  swaps replayed:    1615  (241 hit your liquidity)
+  partial fills:     757   (uncredited — fee income is understated by these)
+  rebalances:        27
+
+  NAV end:           204.39 USDC
+  HODL end:          199.09 USDC   (just holding the initial inventory)
+
+  fee income:        4.66 USDC
+  impermanent loss:  0.64 USDC     (position ex-fees vs HODL)
+  VS HODL:           +2.662 %      ← did market-making beat holding?
+```
+
+**The honest caveat**: the PnL replay assumes *your liquidity did not change the
+flow it is credited for*. Real fills would have been shared with the LPs already
+in those bins, and a large position would have moved the market. Use it to **kill
+bad ideas cheaply — never to bless good ones**. `bun run shadow` (live market,
+real fills, zero capital) remains the honest evaluator; the backtest is the cheap
+filter in front of it.
+
+For current, longer history use `bun run collect-historical` (public Binance
+klines) and `bun run backfill-cetus-events` (on-chain swaps) instead of the
+fixtures.
 
 > **Region note:** `api.binance.com` is geo-blocked in some jurisdictions (incl.
 > the US), which affects `collect-historical` and the `binance` price feed. The

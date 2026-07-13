@@ -261,7 +261,35 @@ export class ShadowBook {
   }
 
   /** Synthetic PMState for feeding the strategy (v0-read fidelity: share only). */
+  /**
+   * Project the book as a PMState for `strategy.plan()`.
+   *
+   * `positionValue` is injected exactly as the live rebalancer injects it. The
+   * rebalancer dryRuns the remove prefix (`estimateRemoveProceeds`) and passes
+   * the proceeds in, because strategies are contracted to size adds from
+   * `balance + feeBag + positionValue` — the capital they are about to free by
+   * removing the current position.
+   *
+   * This used to report `amountA: 0n, amountB: 0n` per bin and no
+   * `positionValue` at all, even though the book knows the per-bin amounts
+   * precisely. A strategy recentering in shadow therefore saw ZERO deployable
+   * capital (its balance having been spent on the previous add) and could only
+   * withdraw, redeploying a tick later from the freed cash. That is not what
+   * the live agent does — so the shadow book, the framework's honest evaluator,
+   * was silently evaluating different behaviour than it would execute.
+   *
+   * No haircut is applied here: unlike the live dryRun (which discounts by
+   * READD_PROCEEDS_HAIRCUT_BPS to absorb a bin-composition shift between
+   * estimate and execution), the simulated book's amounts are exact.
+   */
   toPmState(pmId: string, poolId: string, physicalTypeA: string, physicalTypeB: string): PMState {
+    let positionA = 0n;
+    let positionB = 0n;
+    for (const v of this.bins.values()) {
+      positionA += v.a;
+      positionB += v.b;
+    }
+
     return {
       pmId,
       owner: "0xshadow",
@@ -273,9 +301,12 @@ export class ShadowBook {
       positionBins: [...this.bins.entries()].map(([binId, v]) => ({
         binId,
         liquidityShare: v.a + v.b,
-        amountA: 0n,
-        amountB: 0n,
+        amountA: v.a,
+        amountB: v.b,
       })),
+      ...(positionA > 0n || positionB > 0n
+        ? { positionValue: { a: positionA, b: positionB } }
+        : {}),
       lending: emptyLendingState(),
     };
   }
