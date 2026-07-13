@@ -1,46 +1,95 @@
 /**
  * src/risk/emergency.ts
  *
- * L3 emergency stop latch. When tripped, all on-chain operations must cease
- * until a human operator manually resets the latch (calls `reset()`).
+ * L3 emergency stop — a DRAIN-THEN-LATCH state machine.
  *
- * Design:
- * - Single in-memory latch per process, REHYDRATED from `risk_events` at
- *   construction: an unresolved `emergency_stop` row re-trips the latch, so a
- *   process restart cannot silently clear L3.
- * - `trip(reason)` is idempotent — subsequent calls are no-ops.
- * - Persists one L3 risk_event row per trip invocation (idempotent at the
- *   reason level — duplicate reasons within the same process lifetime are
- *   still stored to maintain a full audit trail).
- * - No process.exit: the caller decides what to do after checking `isTripped()`.
- * - Reset is intentionally manual-only. Two paths:
- *     - in-process `reset(ackReason)` (tests / future admin surface);
- *     - out-of-process `resolveEmergencyStopInDb(db, ackReason)` — the
- *       operator runs `scripts/risk-reset-emergency.ts` (which calls it) and
- *       then RESTARTS the agent; the running process intentionally cannot be
- *       un-tripped externally, the restart's rehydration clears the latch.
+ *     ARMED ──trip()──▶ DRAINING ──position empty──▶ HALTED
+ *                          │                            ▲
+ *                          └── drain failed N times ────┘
  *
- * See docs/risk-monitoring-design.md §4.4.2 (L3) and §9.
+ * WHY IT DRAINS FIRST (this is the load-bearing change)
+ * -----------------------------------------------------
+ * L3 used to simply halt: the rebalancer saw the veto and `return`ed, leaving
+ * the user's liquidity DEPLOYED in the pool, unmanaged, until a human with
+ * shell access noticed. Worse, `evaluateL3` runs before the L2 branch, so
+ * escalating from L2 to L3 CANCELLED the protective full-withdrawal L2 was
+ * about to perform. The response to "things got worse" was to stop defending.
+ *
+ * The objection to acting under L3 is "we are blind, and acting on bad data may
+ * be worse than not acting". That is a real argument for most actions. It does
+ * not apply to a full withdrawal, for one reason:
+ *
+ *     REMOVING LIQUIDITY NEEDS NO PRICE.
+ *
+ * `agent_remove_liquidity` over our own bins requires no oracle, no spread, no
+ * funding rate. It is the one action whose correctness does not depend on the
+ * data that just went stale — and, since the agent has no swap permission, it
+ * is also the only defensive move it has. Note the `outage_with_position`
+ * trigger fires ONLY when a position is open ("we are blind AND exposed"), and
+ * the old behaviour was to then disable the only mechanism that could remove
+ * that exposure. That was inverted.
+ *
+ * Draining is not free — it realises IL, stops fee income, and costs gas if the
+ * trigger was a false positive. That is a bounded, recoverable cost. Leaving
+ * capital deployed, unmanaged and unmonitored is not bounded.
+ *
+ * Bounded attempts: if the chain itself is what is broken, the withdrawal will
+ * fail too. After `drainMaxAttempts` we go to HALTED anyway and raise the
+ * loudest alert we have — `l3_drain_failed` — because a halted agent with a
+ * still-deployed position is the worst state this system can be in.
+ *
+ * Everything else is unchanged: the latch is REHYDRATED from `risk_events` at
+ * construction (a restart cannot silently clear L3), and reset is manual-only
+ * (`scripts/risk-reset-emergency.ts` → restart).
  */
 
 import type { Database } from "bun:sqlite";
 import { log } from "../lib/logger.ts";
+import type { AlertDispatcher } from "../alerts/sinks.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
+/**
+ * ARMED    — normal operation.
+ * DRAINING — L3 fired; the agent is force-exiting the position. On-chain
+ *            REMOVE operations are still permitted (and are the only thing
+ *            permitted); no new liquidity may be added.
+ * HALTED   — terminal. Nothing on-chain runs until an operator resets.
+ */
+export type EmergencyState = "ARMED" | "DRAINING" | "HALTED";
+
 export interface EmergencyStop {
   /**
-   * Trip the L3 emergency stop. Idempotent — once tripped, subsequent calls
-   * log but do not write additional DB rows.
+   * Trip the L3 emergency stop → DRAINING. Idempotent: calling it while already
+   * DRAINING or HALTED logs but does not re-enter the state machine.
    */
   trip(reason: string): void;
-  /** Returns true when the emergency stop is currently active. */
-  isTripped(): boolean;
+  /** Current state. */
+  state(): EmergencyState;
   /**
-   * Manually reset the emergency stop. Requires an explicit acknowledgment
-   * reason for the audit log. Throws if not currently tripped.
+   * True when NO on-chain operation may run (state === HALTED).
+   *
+   * Deliberately NOT true while DRAINING: during a drain the agent must still be
+   * able to submit the withdrawal PTB. Callers that mean "should I stop doing
+   * normal work?" want `state() !== "ARMED"`.
+   */
+  isTripped(): boolean;
+  /** True while the agent should be force-exiting rather than running a strategy. */
+  isDraining(): boolean;
+  /**
+   * Report the outcome of one drain attempt. The rebalancer calls this after
+   * trying the emergency withdrawal.
+   *
+   * `positionEmpty: true` → HALTED with `l3_drained` (capital is safe in the PM).
+   * Otherwise the attempt counter advances; once it exceeds `drainMaxAttempts`
+   * → HALTED with `l3_drain_failed` (position STILL DEPLOYED — page a human).
+   */
+  recordDrainAttempt(opts: { positionEmpty: boolean; pmId?: string; error?: string }): void;
+  /**
+   * Manually reset. Requires an explicit acknowledgment reason for the audit
+   * log. Throws if not currently tripped.
    */
   reset(ackReason: string): void;
 }
@@ -53,6 +102,17 @@ export interface EmergencyStopDeps {
   db: Database;
   /** Injectable clock for deterministic tests. Defaults to Date.now. */
   nowMs?: () => number;
+  /**
+   * How many times to attempt the emergency withdrawal before giving up and
+   * going HALTED with the position still deployed. Default 3.
+   *
+   * Bounded because the L3 trigger may BE the chain being broken (consecutive
+   * tx failures, RPC outage) — in which case the withdrawal cannot succeed and
+   * retrying forever just delays the page to a human.
+   */
+  drainMaxAttempts?: number;
+  /** Where L3 transitions are announced. Without it, they are silent. */
+  alerts?: AlertDispatcher;
 }
 
 /**
@@ -62,12 +122,28 @@ export interface EmergencyStopDeps {
  * already exist (schema.sql creates it on every `openDb()` call).
  */
 export function createEmergencyStop(deps: EmergencyStopDeps): EmergencyStop {
-  const { db } = deps;
+  const { db, alerts } = deps;
   const nowMs = deps.nowMs ?? (() => Date.now());
+  const drainMaxAttempts = deps.drainMaxAttempts ?? 3;
 
-  let tripped = false;
+  let current: EmergencyState = "ARMED";
   let tripReason: string | null = null;
   let tripEventId: number | null = null;
+  let drainAttempts = 0;
+
+  /**
+   * Fire-and-forget: an alert must never delay or abort the unwind it reports
+   * on. The dispatcher already swallows sink errors; this also detaches the
+   * await so a slow pager cannot stall the emergency path.
+   */
+  function alert(
+    severity: "info" | "warn" | "critical",
+    code: Parameters<NonNullable<typeof alerts>["emit"]>[0]["code"],
+    message: string,
+    fields?: Record<string, unknown>,
+  ): void {
+    void alerts?.emit({ severity, code, message, tsMs: nowMs(), fields });
+  }
 
   // Rehydrate from DB: an unresolved emergency_stop row means the latch was
   // tripped by a previous process and never operator-reset. Without this, a
@@ -80,12 +156,23 @@ export function createEmergencyStop(deps: EmergencyStopDeps): EmergencyStop {
     )
     .get();
   if (unresolved) {
-    tripped = true;
+    // Come up HALTED, not DRAINING. We cannot know from the row alone whether
+    // the previous run managed to exit, and re-entering a drain on every
+    // restart could thrash the position. A human is already required here; the
+    // alert tells them so instead of letting the agent boot quietly frozen.
+    current = "HALTED";
     tripEventId = unresolved.id;
     tripReason = `rehydrated:risk_event:${unresolved.id}`;
     log.error(
       "risk/emergency: L3 EMERGENCY STOP rehydrated from DB — still tripped from a previous run. " +
-        "Reset via scripts/risk-reset-emergency.ts, then restart.",
+        "Reset via 'bun run risk-reset \"<reason>\"', then restart.",
+      { riskEventId: unresolved.id },
+    );
+    alert(
+      "critical",
+      "l3_rehydrated",
+      "Agent started with L3 STILL TRIPPED from a previous run — automation is halted. " +
+        "Check whether the position was exited before resetting.",
       { riskEventId: unresolved.id },
     );
   }
@@ -109,9 +196,13 @@ export function createEmergencyStop(deps: EmergencyStopDeps): EmergencyStop {
   );
 
   function trip(reason: string): void {
-    if (tripped) {
-      // Already tripped — only log, no additional DB row (idempotent).
-      log.warn("risk/emergency: trip called while already tripped", { reason, tripReason });
+    if (current !== "ARMED") {
+      // Already DRAINING or HALTED — log only, no additional DB row (idempotent).
+      log.warn("risk/emergency: trip called while already tripped", {
+        reason,
+        state: current,
+        tripReason,
+      });
       return;
     }
 
@@ -125,26 +216,97 @@ export function createEmergencyStop(deps: EmergencyStopDeps): EmergencyStop {
       "emergency_stop",
       0,
       1,
-      "halt_all_onchain_operations",
+      // The action the agent now takes. It used to be "halt_all_onchain_operations",
+      // which was accurate and was the bug: it halted while still exposed.
+      "drain_position_then_halt",
     );
     tripEventId = Number(result.lastInsertRowid);
 
-    tripped = true;
+    current = "DRAINING";
+    drainAttempts = 0;
     tripReason = reason;
 
-    log.error("risk/emergency: L3 EMERGENCY STOP TRIPPED — all on-chain operations halted", {
+    log.error(
+      "risk/emergency: L3 TRIPPED — force-exiting the position, then halting",
+      { reason, ts, riskEventId: tripEventId, drainMaxAttempts },
+    );
+    alert("critical", "l3_tripped", `L3 emergency stop: ${reason}. Force-exiting the position.`, {
       reason,
-      ts,
       riskEventId: tripEventId,
+      drainMaxAttempts,
     });
   }
 
+  function recordDrainAttempt(opts: {
+    positionEmpty: boolean;
+    pmId?: string;
+    error?: string;
+  }): void {
+    if (current !== "DRAINING") return;
+
+    if (opts.positionEmpty) {
+      current = "HALTED";
+      log.warn("risk/emergency: L3 drain complete — position exited, agent halted", {
+        attempts: drainAttempts,
+        pmId: opts.pmId,
+      });
+      alert(
+        "critical",
+        "l3_drained",
+        "L3: position exited successfully. Funds are in the PositionManager balance and the " +
+          "agent is halted. Reset with 'bun run risk-reset \"<reason>\"' + restart.",
+        { attempts: drainAttempts, pmId: opts.pmId, reason: tripReason },
+      );
+      return;
+    }
+
+    drainAttempts++;
+    if (drainAttempts < drainMaxAttempts) {
+      log.error("risk/emergency: L3 drain attempt failed, will retry", {
+        attempt: drainAttempts,
+        of: drainMaxAttempts,
+        pmId: opts.pmId,
+        error: opts.error,
+      });
+      return;
+    }
+
+    // Give up. This is the worst state the system can reach: automation off,
+    // capital still in the market. Say so as loudly as we can.
+    current = "HALTED";
+    log.error(
+      "risk/emergency: L3 DRAIN FAILED — HALTED WITH THE POSITION STILL DEPLOYED. " +
+        "Capital is exposed and unmanaged. Human intervention required NOW.",
+      { attempts: drainAttempts, pmId: opts.pmId, error: opts.error, reason: tripReason },
+    );
+    alert(
+      "critical",
+      "l3_drain_failed",
+      "L3 COULD NOT EXIT THE POSITION after " +
+        `${drainAttempts} attempts. The agent is halted and the position is STILL DEPLOYED — ` +
+        "capital is exposed with automation disabled. Intervene manually.",
+      { attempts: drainAttempts, pmId: opts.pmId, error: opts.error, reason: tripReason },
+    );
+  }
+
+  function state(): EmergencyState {
+    return current;
+  }
+
+  /**
+   * "No on-chain operation may run." False while DRAINING — the drain itself
+   * needs to submit a PTB.
+   */
   function isTripped(): boolean {
-    return tripped;
+    return current === "HALTED";
+  }
+
+  function isDraining(): boolean {
+    return current === "DRAINING";
   }
 
   function reset(ackReason: string): void {
-    if (!tripped) {
+    if (current === "ARMED") {
       throw new Error("risk/emergency: reset() called but emergency stop is not tripped");
     }
 
@@ -174,15 +336,17 @@ export function createEmergencyStop(deps: EmergencyStopDeps): EmergencyStop {
     log.warn("risk/emergency: L3 emergency stop RESET by operator", {
       ackReason,
       originalReason: tripReason,
+      previousState: current,
       ts,
     });
 
-    tripped = false;
+    current = "ARMED";
     tripReason = null;
     tripEventId = null;
+    drainAttempts = 0;
   }
 
-  return { trip, isTripped, reset };
+  return { trip, state, isTripped, isDraining, recordDrainAttempt, reset };
 }
 
 // ---------------------------------------------------------------------------

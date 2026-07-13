@@ -1,7 +1,8 @@
 import { loadConfig } from "./config.ts";
 import { openDb, getDb } from "./db/client.ts";
 import { getAgentAddress } from "./sui/keypair.ts";
-import { loadExtensions, getCustomPredictionProvider } from "./kit/loadExtensions.ts";
+import { loadExtensions, getCustomPredictionProvider, getCustomAlertSinks } from "./kit/loadExtensions.ts";
+import { createAlertDispatcher, createLogAlertSink, createWebhookAlertSink } from "./alerts/sinks.ts";
 import { buildPriceFeed } from "./data/feedRegistry.ts";
 import type { PriceFeed } from "./data/priceFeed.ts";
 import { createSubscriptionsService } from "./services/subscriptions.ts";
@@ -110,12 +111,38 @@ async function main(): Promise<void> {
   // Hoisted to stopFeeds so shutdown() can call it directly (F3 fix).
   const stopFeeds: () => void = marketAggregator.start();
 
+  // Alerting. Without this, every catastrophic state the agent can enter — an
+  // L3 trip, a failed emergency exit, an unreachable chain — is visible only as
+  // a line on stdout. L3's entire design assumes a human notices; this is how
+  // they find out.
+  const alertSinks = [createLogAlertSink()];
+  if (cfg.alerts.webhookUrl) {
+    alertSinks.push(
+      createWebhookAlertSink({
+        url: cfg.alerts.webhookUrl,
+        minSeverity: cfg.alerts.minSeverity,
+      }),
+    );
+  }
+  const forkAlerts = getCustomAlertSinks();
+  if (forkAlerts) alertSinks.push(...forkAlerts);
+
+  const alerts = createAlertDispatcher(alertSinks);
+  log.info("liquidity-manager: alerting wired", {
+    sinks: alertSinks.map((s) => s.name),
+    webhook: cfg.alerts.webhookUrl ? "configured" : "not configured — alerts go to logs only",
+  });
+
   // Live risk monitor — construction also rehydrates the L3 emergency-stop
-  // latch from the DB (an unresolved trip survives restarts).
+  // latch from the DB (an unresolved trip survives restarts) and, if it comes
+  // up HALTED, fires `l3_rehydrated` so a restarted-but-frozen agent announces
+  // itself instead of sitting quietly.
   const riskMonitor = createRiskMonitor({
     db,
     thresholds: cfg.risk.thresholds,
     l3: cfg.risk.l3,
+    alerts,
+    drainMaxAttempts: cfg.risk.l3.drainMaxAttempts,
   });
 
   // PnL accounting (D1): NAV sampling + fee/cost/IL attribution. Its
@@ -359,6 +386,7 @@ async function main(): Promise<void> {
       // Every strategy — not just mlAgent — now receives the assembled
       // MarketSnapshot via StrategyInput.snapshot.
       marketAggregator,
+      alerts,
     },
   );
   const stopRebalancer = rebalancerService.start();

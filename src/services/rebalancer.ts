@@ -26,7 +26,8 @@ import { findUserBySuiAddress } from "../treasury/store.ts";
 import type { SubscriptionsService } from "./subscriptions.ts";
 import type { ExecutorService } from "./executor.ts";
 import type { PriceFeed } from "../data/priceFeed.ts";
-import type { RebalancePlan, PMState } from "../domain/types.ts";
+import type { RebalancePlan, PMState, PoolState, PriceObservation } from "../domain/types.ts";
+import type { AlertDispatcher } from "../alerts/sinks.ts";
 import type { MarketSnapshot, StateContext } from "../prediction/types.ts";
 import { DataOutageError, type MarketAggregator } from "../data/marketAggregator.ts";
 
@@ -326,6 +327,13 @@ export interface RebalancerOpts {
    */
   pnlService?: PnlService;
   /**
+   * Where risk events are announced. Without it, every catastrophic state — L3
+   * trips, chain outages, failed emergency exits — is visible only as a line on
+   * stdout, and the human that L3's design depends on has no way to learn they
+   * are needed.
+   */
+  alerts?: AlertDispatcher;
+  /**
    * Market aggregator. When present, every tick passes the assembled
    * `MarketSnapshot` (derivatives, cross-asset, TVL, spread) to the strategy
    * via `StrategyInput.snapshot`.
@@ -344,7 +352,7 @@ export function createRebalancerService(
   opts: RebalancerOpts,
 ): RebalancerService {
   const cfg = loadConfig();
-  const { riskMonitor, liveStrategyName, mlDeps, pnlService, marketAggregator } = opts;
+  const { riskMonitor, liveStrategyName, mlDeps, pnlService, marketAggregator, alerts } = opts;
   const strategy: Strategy = buildStrategy(liveStrategyName, mlDeps);
   log.info("rebalancer: strategy selected", { name: strategy.name });
   const agentAddress = getAgentAddress();
@@ -361,6 +369,13 @@ export function createRebalancerService(
   // failures mean something is systematically wrong (RPC, contract upgrade,
   // corrupted plan math) and automation must stop until an operator looks.
   const consecutiveTxFailures = new Map<string, number>();
+  /**
+   * Consecutive CHAIN-READ failures per PM (RPC down, price feed unreachable).
+   * Tracked separately from tx failures because a read failure means we could
+   * not even evaluate — and because these used to be counted nowhere at all,
+   * which made the data-outage L3 circuit unreachable during an outage.
+   */
+  const consecutiveReadFailures = new Map<string, number>();
 
   /**
    * Record a pnl_ticks NAV sample (D1). Accounting must never abort a tick —
@@ -445,26 +460,89 @@ export function createRebalancerService(
       // a tight loop on permanently-revoked PMs).
       lastEvalMs.set(pmId, Date.now());
 
-      // Authorization check. If we missed an AgentRemoved event (RPC hiccup),
-      // hard-delete the row here too — matches subscriptions.ts behaviour so
-      // we never carry a stale "active" subscription forward.
-      const authorized = await isAgentAuthorized(pmId, agentAddress);
-      if (!authorized) {
-        log.warn("rebalancer: agent no longer authorized, dropping subscription", {
+      // ---- Chain read phase --------------------------------------------------
+      //
+      // These RPC calls used to sit OUTSIDE the try/catch that counts failures.
+      // So during a Sui RPC outage the very first read threw, the tick unwound
+      // to a bare `.catch(log)`, and NOTHING else ran: `checkPreTick` was never
+      // reached, so `evaluateL3` never executed, so the `outage_with_position`
+      // circuit — the circuit written for exactly this scenario — could not fire
+      // during it. The agent would spin its interval for hours, logging an error
+      // each time, tripping nothing, alerting no one, while the position drifted
+      // out of range unmanaged.
+      //
+      // Count read failures like any other failure, and escalate.
+      let authorized: boolean;
+      let pm: PMState;
+      let pool: PoolState;
+      let spot: PriceObservation;
+      let history: PriceObservation[];
+
+      try {
+        // Authorization check. If we missed an AgentRemoved event (RPC hiccup),
+        // hard-delete the row here too — matches subscriptions.ts behaviour so
+        // we never carry a stale "active" subscription forward.
+        authorized = await isAgentAuthorized(pmId, agentAddress);
+        if (!authorized) {
+          log.warn("rebalancer: agent no longer authorized, dropping subscription", {
+            tickId,
+            pmId,
+          });
+          db.prepare(`DELETE FROM subscriptions WHERE pm_id = ?`).run(pmId);
+          return;
+        }
+
+        pm = await getPositionManager(pmId);
+        pool = await getPoolState(cfg.poolProfile.poolId);
+        spot = await priceFeed.getSpot();
+        // Window sized by the live strategy's declared need (presenceAnchor: 4h
+        // for its anchor + vol-regime nowcast); default 5 minutes.
+        history = await priceFeed.getHistory(strategy.historyWindowMs ?? 5 * 60 * 1000);
+
+        consecutiveReadFailures.delete(pmId); // reads are healthy again
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const failures = (consecutiveReadFailures.get(pmId) ?? 0) + 1;
+        consecutiveReadFailures.set(pmId, failures);
+
+        log.error("rebalancer: chain/price read failed — cannot evaluate this tick", {
           tickId,
           pmId,
+          error: msg,
+          consecutiveFailures: failures,
+          threshold: cfg.risk.l3.txFailureCount,
         });
-        db.prepare(`DELETE FROM subscriptions WHERE pm_id = ?`).run(pmId);
+
+        if (failures >= cfg.risk.l3.txFailureCount) {
+          void alerts?.emit({
+            severity: "critical",
+            code: "chain_unreachable",
+            message:
+              `Chain/price reads have failed ${failures} times in a row. The agent cannot ` +
+              `evaluate or exit the position — capital may be deployed and unmanaged.`,
+            tsMs: Date.now(),
+            pmId,
+            poolId: cfg.poolProfile.poolId,
+            fields: { error: msg, consecutiveFailures: failures },
+          });
+
+          // Trip L3. We cannot DRAIN — reading the PM is exactly what is
+          // failing, so there is no way to build (let alone submit) a
+          // withdrawal. Report the attempt as failed so the bounded counter
+          // advances to HALTED and raises `l3_drain_failed`, which says the
+          // true thing: automation is off and the position may still be
+          // deployed. Silently retrying forever would be worse.
+          riskMonitor.emergencyStop.trip(
+            `chain unreachable: ${failures} consecutive read failures for pm ${pmId} (last: ${msg})`,
+          );
+          riskMonitor.emergencyStop.recordDrainAttempt({
+            positionEmpty: false,
+            pmId,
+            error: `cannot read chain state: ${msg}`,
+          });
+        }
         return;
       }
-
-      // Fetch current state.
-      const pm = await getPositionManager(pmId);
-      const pool = await getPoolState(cfg.poolProfile.poolId);
-      const spot = await priceFeed.getSpot();
-      // Window sized by the live strategy's declared need (presenceAnchor: 4h
-      // for its anchor + vol-regime nowcast); default 5 minutes.
-      const history = await priceFeed.getHistory(strategy.historyWindowMs ?? 5 * 60 * 1000);
 
       // Market snapshot for the strategy (derivatives, cross-asset, TVL, spread).
       //
@@ -499,25 +577,73 @@ export function createRebalancerService(
         ...(snapshot !== undefined ? { snapshot } : {}),
       };
 
-      // Pre-tick risk veto for RULE-BASED strategies. mlAgent runs
-      // checkPreTick internally (and persists its own veto rows), so running
-      // it here too would double-persist; every other strategy has no risk
-      // awareness at all and gets it from the rebalancer:
-      //   L3 → no on-chain operations this tick.
-      //   L2 → bypass the strategy entirely; issue the protective
-      //        full-withdrawal plan (lendingPct 1.0 comes from the EXTREME
-      //        semantics of deployIdleViaLending post-remove).
-      //   L1 → log and proceed (rule strategies have no halfWidth knob).
+      // ---- L3 gate: applies to EVERY strategy, including mlAgent -------------
+      //
+      // Safety is not a strategy decision. This runs before the strategy branch
+      // so mlAgent cannot keep trading while the emergency stop is draining.
+      //
+      //   HALTED   → nothing on-chain. Terminal until an operator resets.
+      //   DRAINING → force-exit, bypassing the strategy entirely.
+      //
+      // `plan_only`, NOT `plan_and_reconcile`: an L3 drain must NOT sweep the
+      // freed capital into Scallop/Kai. L3 means "something is systematically
+      // broken", and the correct destination is the PositionManager balance —
+      // where the OWNER can withdraw it without us — not a third-party lending
+      // protocol whose health we do not monitor and whose withdrawals can be
+      // paused. Get flat, stay in the PM.
       let output: StrategyOutput;
-      if (strategy.name !== "mlAgent") {
+      let drainAttempt = false;
+
+      const emergency = riskMonitor.emergencyStop;
+      if (emergency.isTripped()) {
+        log.warn("rebalancer: L3 HALTED — skipping tick", { tickId, pmId });
+        return;
+      }
+
+      if (emergency.isDraining()) {
+        const drainPlan = buildExtremeWithdrawPlan(pm, "L3 emergency drain: force-exit before halt");
+        if (!drainPlan) {
+          // Nothing left to withdraw — the position is already flat. Done.
+          emergency.recordDrainAttempt({ positionEmpty: true, pmId });
+          return;
+        }
+        drainPlan.priority = "emergency";
+        drainAttempt = true;
+        output = { kind: "plan_only", plan: drainPlan };
+        log.error("rebalancer: L3 DRAINING — force-exiting the position", { tickId, pmId });
+      } else if (strategy.name !== "mlAgent") {
+        // Pre-tick risk veto for RULE-BASED strategies. mlAgent runs
+        // checkPreTick internally (and persists its own veto rows), so running
+        // it here too would double-persist; every other strategy has no risk
+        // awareness at all and gets it from the rebalancer:
+        //   L3 → handled above, plus the "drain" veto below for a trip that
+        //        fires during THIS tick's evaluation.
+        //   L2 → bypass the strategy entirely; issue the protective
+        //        full-withdrawal plan (lendingPct 1.0 comes from the EXTREME
+        //        semantics of deployIdleViaLending post-remove).
+        //   L1 → log and proceed (rule strategies have no halfWidth knob).
         const veto = riskMonitor.checkPreTick(strategyInput);
         if (veto?.kind === "emergency") {
-          log.warn("rebalancer: L3 emergency veto — skipping tick", {
+          log.warn("rebalancer: L3 HALTED — skipping tick", {
             tickId, pmId, reason: veto.reason,
           });
           return;
         }
-        if (veto?.kind === "extreme") {
+        if (veto?.kind === "drain") {
+          // L3 tripped during THIS tick's evaluation — start the exit now
+          // rather than waiting for the next one.
+          const drainPlan = buildExtremeWithdrawPlan(pm, `L3 emergency drain: ${veto.reason}`);
+          if (!drainPlan) {
+            emergency.recordDrainAttempt({ positionEmpty: true, pmId });
+            return;
+          }
+          drainPlan.priority = "emergency";
+          drainAttempt = true;
+          output = { kind: "plan_only", plan: drainPlan };
+          log.error("rebalancer: L3 tripped — force-exiting the position", {
+            tickId, pmId, reason: veto.reason,
+          });
+        } else if (veto?.kind === "extreme") {
           const withdrawPlan = buildExtremeWithdrawPlan(
             pm,
             `EXTREME full withdrawal (L2, rule path): ${veto.trigger}`,
@@ -995,8 +1121,20 @@ export function createRebalancerService(
         finalError = err instanceof Error ? err.message : String(err);
         log.error("rebalancer: tick failed", { tickId, pmId, error: finalError });
 
+        // A failed DRAIN is the dangerous case: we are trying to get flat and
+        // cannot. Advance the bounded attempt counter — once exhausted, the
+        // emergency stop goes HALTED and raises `l3_drain_failed` (position
+        // still deployed, automation off, human needed now).
+        if (drainAttempt) {
+          riskMonitor.emergencyStop.recordDrainAttempt({
+            positionEmpty: false,
+            pmId,
+            error: finalError,
+          });
+        }
+
         // L3 escalation on repeated failures: something is systematically
-        // broken (RPC, contract, plan math) — halt automation for a human.
+        // broken (RPC, contract, plan math) — start the emergency exit.
         const failures = (consecutiveTxFailures.get(pmId) ?? 0) + 1;
         consecutiveTxFailures.set(pmId, failures);
         if (failures >= cfg.risk.l3.txFailureCount) {
@@ -1015,6 +1153,14 @@ export function createRebalancerService(
             log.warn("rebalancer: refundCharge failed", { tickId, pmId, error: msg });
           }
         }
+      }
+
+      // A drain PTB that landed removed every bin (buildExtremeWithdrawPlan
+      // withdraws the whole position), so the position is now flat: go HALTED
+      // with `l3_drained` — capital sits in the PositionManager balance, where
+      // the owner can withdraw it without us.
+      if (drainAttempt && finalStatus === "succeeded") {
+        riskMonitor.emergencyStop.recordDrainAttempt({ positionEmpty: true, pmId });
       }
 
       // Update the rebalance row.

@@ -167,13 +167,27 @@ describe("L3 emergency stop veto", () => {
     db = freshDb();
   });
 
-  it("checkPreTick returns L3 veto when emergency stop is tripped", () => {
+  it("checkPreTick returns a DRAIN veto right after a trip (exit first, halt after)", () => {
     const emergencyStop = createEmergencyStop({ db });
     const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
 
     emergencyStop.trip("manual test");
     const veto = monitor.checkPreTick(makeStrategyInput());
     expect(veto).not.toBeNull();
+    expect(veto!.level).toBe("L3");
+    // "drain", not "emergency": the rebalancer must force-exit the position
+    // rather than freeze on top of it.
+    expect(veto!.kind).toBe("drain");
+  });
+
+  it("checkPreTick returns an EMERGENCY veto once HALTED", () => {
+    const emergencyStop = createEmergencyStop({ db });
+    const monitor = createRiskMonitor({ db, thresholds: DEFAULT_THRESHOLDS, emergencyStop });
+
+    emergencyStop.trip("manual test");
+    emergencyStop.recordDrainAttempt({ positionEmpty: true }); // exit succeeded → HALTED
+
+    const veto = monitor.checkPreTick(makeStrategyInput());
     expect(veto!.level).toBe("L3");
     expect(veto!.kind).toBe("emergency");
   });
@@ -664,6 +678,7 @@ const TEST_L3: L3Thresholds = {
   outageMs: 300_000,
   pnlPct: -0.15,
   txFailureCount: 5,
+  drainMaxAttempts: 3,
 };
 
 function makeStaleness(overrides: Partial<StalenessInfo> = {}): StalenessInfo {
@@ -708,8 +723,8 @@ describe("L3 auto-trip: repeated L2 activations", () => {
 
     // 3 L2 entries recorded within the 1h window → checkPreTick trips L3.
     const veto = monitor.checkPreTick(makeStrategyInput());
-    expect(veto?.kind).toBe("emergency");
-    expect(monitor.emergencyStop.isTripped()).toBe(true);
+    expect(veto?.kind).toBe("drain");
+    expect(monitor.emergencyStop.state()).toBe("DRAINING");
     const trips = getRiskEvents(db).filter((e) => e.kind === "emergency_trip");
     expect(trips.some((e) => e.metric === "repeated_l2")).toBe(true);
   });
@@ -741,8 +756,8 @@ describe("L3 auto-trip: data outage with open position", () => {
     now += TEST_L3.outageMs + 1_000;
 
     const veto = monitor.checkPreTick(makeInputWithPosition());
-    expect(veto?.kind).toBe("emergency");
-    expect(monitor.emergencyStop.isTripped()).toBe(true);
+    expect(veto?.kind).toBe("drain");
+    expect(monitor.emergencyStop.state()).toBe("DRAINING");
   });
 
   it("does NOT trip on outage when no position is open (L2 handles it)", () => {
@@ -778,7 +793,9 @@ describe("L3 auto-trip: catastrophic 24h PnL", () => {
     });
     monitor.set24hPnl(POOL_ID, -0.20); // below -0.15
     const veto = monitor.checkPreTick(makeStrategyInput());
-    expect(veto?.kind).toBe("emergency");
+    // Catastrophic PnL trips L3 → the agent force-exits ("drain") before halting.
+    expect(veto?.kind).toBe("drain");
+    expect(veto?.level).toBe("L3");
   });
 
   it("L2 pnl territory (-0.06) does not trip L3", () => {

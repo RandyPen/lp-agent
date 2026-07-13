@@ -48,7 +48,14 @@ function makeSpyMonitor(): SpyMonitor {
     set24hPnl: (_poolId, pnl) => { pnlValues.push(pnl); },
     volRecovered: () => true,
     activeLevel: () => null,
-    emergencyStop: { trip: () => {}, isTripped: () => false, reset: () => {} },
+    emergencyStop: {
+      trip: () => {},
+      state: () => "ARMED" as const,
+      isTripped: () => false,
+      isDraining: () => false,
+      recordDrainAttempt: () => {},
+      reset: () => {},
+    },
   };
 }
 

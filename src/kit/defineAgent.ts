@@ -23,6 +23,7 @@ import type { Strategy } from "../strategies/types.ts";
 import type { PoolProfile } from "../pools/types.ts";
 import type { PriceFeedBuilder } from "../data/feedRegistry.ts";
 import type { PredictionProvider } from "../prediction/provider.ts";
+import type { AlertSink } from "../alerts/types.ts";
 
 export interface AgentExtensions {
   /**
@@ -49,6 +50,13 @@ export interface AgentExtensions {
 
   /** The model behind `mlAgent`. Overrides PREDICTION_PROVIDER. */
   prediction?: () => PredictionProvider;
+
+  /**
+   * Extra alert sinks, ADDED to the built-ins (log + optional webhook) rather
+   * than replacing them. Use this to page your own on-call system.
+   * `send()` must never throw — see AlertSink.
+   */
+  alerts?: AlertSink[];
 }
 
 /** Identity function — exists so `agent.config.ts` gets type checking. */

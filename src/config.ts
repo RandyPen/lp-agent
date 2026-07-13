@@ -196,6 +196,27 @@ export interface L3Thresholds {
   pnlPct: number;
   /** Trip after this many consecutive failed on-chain rebalance attempts. */
   txFailureCount: number;
+  /**
+   * How many times to attempt the emergency withdrawal before going HALTED
+   * with the position still deployed.
+   *
+   * Bounded because the L3 trigger may BE the chain being broken (consecutive
+   * tx failures, RPC outage), in which case the exit cannot succeed and
+   * retrying forever only delays paging a human.
+   */
+  drainMaxAttempts: number;
+}
+
+/**
+ * Alerting. Without a webhook, every catastrophic state (L3 trip, failed
+ * emergency exit, unreachable chain) is visible only in the logs — and L3's
+ * design depends on a human noticing.
+ */
+export interface AlertsAppConfig {
+  /** POST target for alerts. Slack/Discord/PagerDuty/anything. Empty = logs only. */
+  webhookUrl: string;
+  /** Minimum severity delivered to the webhook. Default "warn". */
+  minSeverity: "info" | "warn" | "critical";
 }
 
 export interface RiskAppConfig {
@@ -269,6 +290,8 @@ export interface AppConfig {
   treasury: TreasuryAppConfig;
   /** Python prediction sidecar config (v1 ML layer). */
   prediction: PredictionAppConfig;
+  /** Alert delivery. Empty webhook = logs only. */
+  alerts: AlertsAppConfig;
   /** ML runtime switches (shadow mode, etc.). */
   ml: MlAppConfig;
   shadowFleet: ShadowFleetConfig;
@@ -623,6 +646,13 @@ export function loadConfig(): AppConfig {
   const l3OutageMs = Number(optional("RISK_L3_OUTAGE_MS", "300000"));
   const l3PnlPct = Number(optional("RISK_L3_PNL_PCT", "-0.15"));
   const l3TxFailureCount = Number(optional("RISK_L3_TX_FAILURE_COUNT", "5"));
+  const l3DrainMaxAttempts = Number(optional("RISK_L3_DRAIN_MAX_ATTEMPTS", "3"));
+  if (!Number.isFinite(l3DrainMaxAttempts) || l3DrainMaxAttempts < 1) {
+    errs.push(
+      `RISK_L3_DRAIN_MAX_ATTEMPTS must be >= 1, got '${process.env.RISK_L3_DRAIN_MAX_ATTEMPTS ?? ""}' ` +
+        `(it bounds how many times L3 tries to exit the position before halting anyway)`,
+    );
+  }
 
   if (!Number.isInteger(l3RepeatedL2Count) || l3RepeatedL2Count < 1) {
     errs.push(`RISK_L3_REPEATED_L2_COUNT must be a positive integer, got '${process.env.RISK_L3_REPEATED_L2_COUNT ?? ""}'`);
@@ -763,7 +793,19 @@ export function loadConfig(): AppConfig {
       outageMs: l3OutageMs,
       pnlPct: l3PnlPct,
       txFailureCount: l3TxFailureCount,
+      drainMaxAttempts: l3DrainMaxAttempts,
     },
+  };
+
+  const alertMinSeverityRaw = optional("ALERT_MIN_SEVERITY", "warn").trim();
+  if (!["info", "warn", "critical"].includes(alertMinSeverityRaw)) {
+    errs.push(`ALERT_MIN_SEVERITY must be info|warn|critical, got '${alertMinSeverityRaw}'`);
+  }
+  const alerts: AlertsAppConfig = {
+    webhookUrl: optional("ALERT_WEBHOOK_URL", "").trim(),
+    minSeverity: (alertMinSeverityRaw === "info" || alertMinSeverityRaw === "critical"
+      ? alertMinSeverityRaw
+      : "warn") as AlertsAppConfig["minSeverity"],
   };
 
   // Surface every gap in one shot.
@@ -811,6 +853,7 @@ export function loadConfig(): AppConfig {
     lending,
     treasury,
     prediction,
+    alerts,
     ml,
     shadowFleet,
     fallbackStrategy,

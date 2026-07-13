@@ -64,10 +64,17 @@ describe("createEmergencyStop", () => {
     expect(stop.isTripped()).toBe(false);
   });
 
-  it("trips and is reflected in isTripped()", () => {
+  it("trip() enters DRAINING, not HALTED — the agent must exit before it freezes", () => {
     const stop = createEmergencyStop({ db, nowMs });
     stop.trip("manual test");
-    expect(stop.isTripped()).toBe(true);
+
+    // The load-bearing change: L3 used to halt immediately, leaving the user's
+    // liquidity deployed and unmanaged. It now force-exits first.
+    expect(stop.state()).toBe("DRAINING");
+    expect(stop.isDraining()).toBe(true);
+    // isTripped() means "no on-chain op may run" — false while draining,
+    // because the drain itself has to submit a withdrawal PTB.
+    expect(stop.isTripped()).toBe(false);
   });
 
   it("persists an L3 risk_event row on trip", () => {
@@ -87,13 +94,14 @@ describe("createEmergencyStop", () => {
     stop.trip("first reason");
     stop.trip("second reason"); // should be no-op on DB
     expect(countRiskEvents(db)).toBe(1);
-    expect(stop.isTripped()).toBe(true);
+    expect(stop.state()).toBe("DRAINING");
   });
 
   it("reset clears the latch", () => {
     const stop = createEmergencyStop({ db, nowMs });
     stop.trip("test");
     stop.reset("acknowledged: test resolved");
+    expect(stop.state()).toBe("ARMED");
     expect(stop.isTripped()).toBe(false);
   });
 
@@ -128,7 +136,7 @@ describe("createEmergencyStop", () => {
     stop.trip("first");
     stop.reset("ack");
     stop.trip("second");
-    expect(stop.isTripped()).toBe(true);
+    expect(stop.state()).toBe("DRAINING");
     // Should have: trip + reset + trip_again = 3 rows
     expect(countRiskEvents(db)).toBe(3);
   });
@@ -155,10 +163,14 @@ describe("emergency stop rehydration (restart survival)", () => {
   it("a tripped latch survives a process restart via DB rehydration", () => {
     const stop1 = createEmergencyStop({ db, nowMs });
     stop1.trip("first process trips");
-    expect(stop1.isTripped()).toBe(true);
+    expect(stop1.state()).toBe("DRAINING");
 
-    // Simulate a restart: a NEW latch over the same DB must come up tripped.
+    // A NEW latch over the same DB comes up HALTED, not DRAINING: we cannot
+    // tell from the row alone whether the previous run managed to exit, and
+    // re-entering a drain on every restart could thrash the position. A human
+    // is already required — the `l3_rehydrated` alert tells them so.
     const stop2 = createEmergencyStop({ db, nowMs });
+    expect(stop2.state()).toBe("HALTED");
     expect(stop2.isTripped()).toBe(true);
   });
 
@@ -174,6 +186,98 @@ describe("emergency stop rehydration (restart survival)", () => {
   it("a fresh DB (no trips ever) rehydrates un-tripped", () => {
     const stop = createEmergencyStop({ db, nowMs });
     expect(stop.isTripped()).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Drain-then-latch: L3 must exit the position before it freezes
+// ---------------------------------------------------------------------------
+
+import type { Alert } from "../../src/alerts/types.ts";
+import { createAlertDispatcher } from "../../src/alerts/sinks.ts";
+
+function captureAlerts(): { alerts: Alert[]; dispatcher: ReturnType<typeof createAlertDispatcher> } {
+  const alerts: Alert[] = [];
+  const dispatcher = createAlertDispatcher([
+    { name: "capture", async send(a: Alert) { alerts.push(a); } },
+  ]);
+  return { alerts, dispatcher };
+}
+
+describe("L3 drain-then-latch", () => {
+  it("a successful drain HALTS and reports that capital is safe", async () => {
+    const { alerts, dispatcher } = captureAlerts();
+    const stop = createEmergencyStop({ db, nowMs, alerts: dispatcher });
+
+    stop.trip("catastrophic pnl");
+    expect(stop.state()).toBe("DRAINING");
+
+    stop.recordDrainAttempt({ positionEmpty: true, pmId: "0xpm" });
+
+    expect(stop.state()).toBe("HALTED");
+    expect(stop.isTripped()).toBe(true);
+
+    await Promise.resolve(); // let the fire-and-forget alerts flush
+    expect(alerts.map((a) => a.code)).toEqual(["l3_tripped", "l3_drained"]);
+    expect(alerts.every((a) => a.severity === "critical")).toBe(true);
+  });
+
+  it("retries a failed drain, then HALTS with the LOUDEST alert when it gives up", async () => {
+    // This is the worst state the system can be in: automation off, capital
+    // still deployed. It must be impossible to reach it quietly.
+    const { alerts, dispatcher } = captureAlerts();
+    const stop = createEmergencyStop({ db, nowMs, alerts: dispatcher, drainMaxAttempts: 3 });
+
+    stop.trip("5 consecutive tx failures");
+
+    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    expect(stop.state()).toBe("DRAINING"); // attempt 1 — keep trying
+    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    expect(stop.state()).toBe("DRAINING"); // attempt 2
+
+    stop.recordDrainAttempt({ positionEmpty: false, error: "rpc down" });
+    expect(stop.state()).toBe("HALTED"); // attempt 3 — give up
+
+    await Promise.resolve();
+    const codes = alerts.map((a) => a.code);
+    expect(codes).toEqual(["l3_tripped", "l3_drain_failed"]);
+
+    const failure = alerts.find((a) => a.code === "l3_drain_failed")!;
+    expect(failure.severity).toBe("critical");
+    // The operator must be able to tell "we got flat" from "we are still exposed".
+    expect(failure.message).toMatch(/STILL DEPLOYED/);
+  });
+
+  it("bounded attempts: a broken chain cannot make the drain retry forever", () => {
+    const stop = createEmergencyStop({ db, nowMs, drainMaxAttempts: 2 });
+    stop.trip("chain unreachable");
+
+    stop.recordDrainAttempt({ positionEmpty: false });
+    stop.recordDrainAttempt({ positionEmpty: false });
+    expect(stop.state()).toBe("HALTED");
+
+    // Further reports are ignored — we are already terminal.
+    stop.recordDrainAttempt({ positionEmpty: false });
+    expect(stop.state()).toBe("HALTED");
+  });
+
+  it("recordDrainAttempt is a no-op when not draining", () => {
+    const stop = createEmergencyStop({ db, nowMs });
+    stop.recordDrainAttempt({ positionEmpty: true });
+    expect(stop.state()).toBe("ARMED");
+  });
+
+  it("a rehydrated latch alerts — a restarted-but-frozen agent must announce itself", async () => {
+    const first = createEmergencyStop({ db, nowMs });
+    first.trip("something bad");
+
+    const { alerts, dispatcher } = captureAlerts();
+    const restarted = createEmergencyStop({ db, nowMs, alerts: dispatcher });
+
+    expect(restarted.state()).toBe("HALTED");
+    await Promise.resolve();
+    expect(alerts.map((a) => a.code)).toEqual(["l3_rehydrated"]);
+    expect(alerts[0]!.severity).toBe("critical");
   });
 });
 

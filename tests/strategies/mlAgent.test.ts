@@ -185,7 +185,10 @@ function makeMockRiskMonitor(veto: RiskVeto | null = null): RiskMonitor {
     activeLevel: () => null,
     emergencyStop: {
       trip: () => {},
+      state: () => "ARMED" as const,
       isTripped: () => false,
+      isDraining: () => false,
+      recordDrainAttempt: () => {},
       reset: () => {},
     },
   };

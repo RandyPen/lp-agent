@@ -25,11 +25,14 @@ import { registerPool } from "../pools/index.ts";
 import { registerPriceFeed } from "../data/feedRegistry.ts";
 import type { AgentExtensions } from "./defineAgent.ts";
 import type { PredictionProvider } from "../prediction/provider.ts";
+import type { AlertSink } from "../alerts/types.ts";
 
 const DEFAULT_CONFIG_PATH = "./agent.config.ts";
 
 /** Set by loadExtensions when the fork supplies a prediction provider. */
 let customPrediction: (() => PredictionProvider) | null = null;
+/** Set by loadExtensions when the fork supplies extra alert sinks. */
+let customAlerts: AlertSink[] | null = null;
 
 /**
  * The fork's prediction provider factory, or null when it did not declare one.
@@ -39,12 +42,18 @@ export function getCustomPredictionProvider(): (() => PredictionProvider) | null
   return customPrediction;
 }
 
+/** Extra alert sinks the fork registered, or null. */
+export function getCustomAlertSinks(): AlertSink[] | null {
+  return customAlerts;
+}
+
 let loaded = false;
 
 /** Test-only: forget that extensions were loaded. */
 export function resetExtensionsForTests(): void {
   loaded = false;
   customPrediction = null;
+  customAlerts = null;
 }
 
 /**
@@ -93,6 +102,10 @@ export async function loadExtensions(): Promise<void> {
 
   if (ext.prediction) {
     customPrediction = ext.prediction;
+  }
+
+  if (ext.alerts && ext.alerts.length > 0) {
+    customAlerts = ext.alerts;
   }
 
   // Only now: a config that threw above must stay unloaded, so a retry

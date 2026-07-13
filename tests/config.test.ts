@@ -149,6 +149,7 @@ describe("risk L3 thresholds", () => {
       outageMs: 300_000,
       pnlPct: -0.15,
       txFailureCount: 5,
+      drainMaxAttempts: 3,
     });
   });
 

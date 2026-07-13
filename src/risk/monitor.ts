@@ -42,13 +42,26 @@ import {
   type TriggerResult,
 } from "./circuits.ts";
 import { createEmergencyStop, type EmergencyStop } from "./emergency.ts";
+import type { AlertDispatcher } from "../alerts/sinks.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 export type RiskVeto =
+  /** HALTED: nothing on-chain may run. Terminal until an operator resets. */
   | { kind: "emergency"; level: "L3"; reason: string }
+  /**
+   * DRAINING: L3 fired and the agent is force-exiting. The caller must bypass
+   * the strategy and issue `buildExtremeWithdrawPlan` — the same action L2
+   * takes — then report the outcome via `emergencyStop.recordDrainAttempt`.
+   *
+   * This is what stops L3 from halting with capital still deployed. It also
+   * dissolves the old inverted escalation, where `evaluateL3` running before
+   * the L2 branch meant that escalating from L2 to L3 CANCELLED the protective
+   * withdrawal L2 was about to perform: both levels now converge on "withdraw".
+   */
+  | { kind: "drain"; level: "L3"; reason: string }
   | { kind: "extreme"; level: "L2"; reason: string; trigger: string }
   | { kind: "soft"; level: "L1"; reason: string; lendingPctBonusPp: number; halfWidthFactor: number };
 
@@ -190,6 +203,7 @@ export const DEFAULT_L3_THRESHOLDS: L3Thresholds = {
   outageMs: 300_000,
   pnlPct: -0.15,
   txFailureCount: 5,
+  drainMaxAttempts: 3,
 };
 
 export interface RiskMonitorDeps {
@@ -207,6 +221,10 @@ export interface RiskMonitorDeps {
    * filter on source='live' instead of relying on timestamp correlation.
    */
   source?: "live" | "shadow";
+  /** Where L3 transitions are announced. Without it, they are silent. */
+  alerts?: AlertDispatcher;
+  /** Bounded emergency-exit attempts before going HALTED anyway. Default 3. */
+  drainMaxAttempts?: number;
 }
 
 /**
@@ -218,7 +236,14 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   const l3 = deps.l3 ?? DEFAULT_L3_THRESHOLDS;
   const source = deps.source ?? "live";
   const nowMs = deps.nowMs ?? (() => Date.now());
-  const emergencyStop = deps.emergencyStop ?? createEmergencyStop({ db, nowMs });
+  const emergencyStop =
+    deps.emergencyStop ??
+    createEmergencyStop({
+      db,
+      nowMs,
+      ...(deps.alerts ? { alerts: deps.alerts } : {}),
+      ...(deps.drainMaxAttempts !== undefined ? { drainMaxAttempts: deps.drainMaxAttempts } : {}),
+    });
 
   // Per-pool state map: poolId → PoolRiskState
   const poolStates = new Map<string, PoolRiskState>();
@@ -608,12 +633,22 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
     // condition satisfied right now must veto this very tick.
     evaluateL3(input, state);
 
-    // L3 check first — highest priority
+    // L3, highest priority. Two distinct states:
+    //   HALTED   → nothing runs (terminal, needs an operator).
+    //   DRAINING → force-exit the position. Removing liquidity needs no price,
+    //              so this is safe to do even when the trigger was "we are blind".
     if (emergencyStop.isTripped()) {
       return {
         kind: "emergency",
         level: "L3",
-        reason: "emergency stop is active",
+        reason: "emergency stop is active (HALTED)",
+      };
+    }
+    if (emergencyStop.isDraining()) {
+      return {
+        kind: "drain",
+        level: "L3",
+        reason: "L3 emergency stop: force-exiting the position before halting",
       };
     }
 
@@ -705,7 +740,9 @@ export function createRiskMonitor(deps: RiskMonitorDeps): RiskMonitor {
   // ---------------------------------------------------------------------------
 
   function activeLevel(poolId: string): "L1" | "L2" | "L3" | null {
-    if (emergencyStop.isTripped()) return "L3";
+    // DRAINING is still L3 — the emergency is active, we are just exiting
+    // rather than frozen. Only ARMED is "no L3".
+    if (emergencyStop.state() !== "ARMED") return "L3";
     const state = poolStates.get(poolId);
     if (!state) return null;
     if (state.extremeActive) return "L2";

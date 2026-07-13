@@ -249,7 +249,20 @@ export function createMlAgentStrategy(deps: MlAgentDeps): Strategy {
       // -----------------------------------------------------------------------
       const veto = riskMonitor.checkPreTick(input);
       if (veto?.kind === "emergency") {
-        log.warn("mlAgent: L3 emergency veto, returning quiet", { poolId, reason: veto.reason });
+        log.warn("mlAgent: L3 HALTED, returning quiet", { poolId, reason: veto.reason });
+        return { kind: "quiet", reason: veto.reason };
+      }
+      if (veto?.kind === "drain") {
+        // L3 just tripped. Do NOT plan — the rebalancer owns the emergency exit
+        // and bypasses the strategy entirely while draining. Going quiet here
+        // hands control back to it; it picks the drain up on the next tick.
+        // (Rule-based strategies drain in the same tick because the rebalancer
+        // sees this veto directly; mlAgent evaluates it internally, so its exit
+        // starts one tick later.)
+        log.error("mlAgent: L3 DRAINING — yielding to the rebalancer's emergency exit", {
+          poolId,
+          reason: veto.reason,
+        });
         return { kind: "quiet", reason: veto.reason };
       }
 
