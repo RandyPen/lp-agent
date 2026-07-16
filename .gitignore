@@ -6,9 +6,10 @@ node_modules/
 .DS_Store
 
 # Internal design notes (Chinese) — kept local, not published.
-# Root level: any markdown whose name does not start with an ASCII letter
-# (covers the operator's Chinese-named notes file).
+# Root level: any markdown/html whose name does not start with an ASCII letter
+# (covers the operator's Chinese-named notes + pitch-deck files).
 /[!A-Za-z]*.md
+/[!A-Za-z]*.html
 
 # Internal design documents (Chinese) — kept local, not published.
 # Ignored per-file on purpose: future English docs under docs/ stay tracked
@@ -69,3 +70,6 @@ docs/system-status-and-gaps.md
 
 # Web portal build output (web/ sources are tracked; dist is generated)
 web/dist/
+
+# Local pitch-material archive (old snapshots) — never published
+/archive-local/
