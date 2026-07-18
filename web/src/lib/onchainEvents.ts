@@ -1,21 +1,30 @@
 /**
  * On-chain agent activity — queried DIRECTLY from Sui GraphQL (no backend).
  *
- * Every row is a real mainnet transaction. We filter by the cdpm module and
- * keep only the four Agent* event structs; this surfaces real agent activity
- * across ALL PositionManagers — including third-party agents that are not ours.
+ * Every row is a real mainnet transaction. We surface the four Agent* event
+ * structs the CDPM package emits when an AUTHORIZED AGENT acts — across ALL
+ * PositionManagers, including third-party agents that are not ours.
  *
- * Pagination: the GraphQL `events` connection returns the most-recent page for
- * `last: N`; `pageInfo.startCursor` + `before:` walks backward into older
- * history ("load more"). Schema verified against graphql.mainnet.sui.io:
- *   EventFilter.module (String, "<pkg>::cdpm"), Event.sender/timestamp,
- *   Event.transaction.digest, Event.contents.{type.repr, json}.
+ * Why filter by event `type`, not by `module`:
+ *   The cdpm module also emits Protocol* events (user/owner-initiated deposits)
+ *   and, within the same transactions, Cetus `pool::*` events. A broad
+ *   `filter: { module: "<pkg>::cdpm" }` query returns all of those interleaved,
+ *   so the sparser Agent* rows get crowded off the most-recent page and never
+ *   render. Filtering by the exact Agent* `type` strings pulls agent activity
+ *   directly. (Schema check: EventFilter has `type` (String) and `module`
+ *   (String) — there is no multi-type filter, so we issue one connection per
+ *   type in a single aliased query and merge.)
+ *
+ * Pagination: each type paginates independently (backward via `last`/`before`;
+ * `pageInfo.startCursor` walks into older history). The page cursor we hand back
+ * to react-query is a composite of every still-live type's cursor; a type whose
+ * `hasPreviousPage` is false drops out of subsequent requests. Schema verified
+ * against graphql.mainnet.sui.io.
  */
 
 import { CDPM, POOL } from "./cdpm";
 
 const GRAPHQL_URL = "https://graphql.mainnet.sui.io/graphql";
-const CDPM_MODULE = `${CDPM.PACKAGE_ID}::cdpm`;
 
 export type AgentEventKind =
   | "AgentLiquidityAdded"
@@ -29,6 +38,14 @@ const AGENT_KINDS: readonly AgentEventKind[] = [
   "AgentFeeCollected",
   "AgentRewardCollected",
 ];
+
+/** Fully-qualified event type string for each kind, on the current package. */
+const TYPE_OF: Record<AgentEventKind, string> = {
+  AgentLiquidityAdded: `${CDPM.PACKAGE_ID}::cdpm::AgentLiquidityAdded`,
+  AgentLiquidityRemoved: `${CDPM.PACKAGE_ID}::cdpm::AgentLiquidityRemoved`,
+  AgentFeeCollected: `${CDPM.PACKAGE_ID}::cdpm::AgentFeeCollected`,
+  AgentRewardCollected: `${CDPM.PACKAGE_ID}::cdpm::AgentRewardCollected`,
+};
 
 export interface AgentOnchainEvent {
   kind: AgentEventKind;
@@ -48,28 +65,27 @@ export interface AgentOnchainEvent {
 
 export interface AgentEventsPage {
   events: AgentOnchainEvent[];
-  /** startCursor of this page — pass as `before` to load the next-older page. */
+  /** Opaque composite cursor — pass as `before` to load the next-older page. */
   cursor: string | null;
   hasMore: boolean;
 }
 
-const QUERY = `query($first: Int!, $before: String, $module: String!) {
-  events(last: $first, before: $before, filter: { module: $module }) {
-    pageInfo { hasPreviousPage startCursor }
-    nodes {
-      sender { address }
-      timestamp
-      transaction { digest }
-      contents { type { repr } json }
-    }
-  }
-}`;
+/** Per-kind pagination state, serialized into the opaque `before` cursor. */
+interface CursorState {
+  c: Partial<Record<AgentEventKind, string | null>>;
+  done: Partial<Record<AgentEventKind, boolean>>;
+}
 
 interface RawNode {
   sender?: { address?: string } | null;
   timestamp?: string | null;
   transaction?: { digest?: string } | null;
   contents?: { type?: { repr?: string } | null; json?: Record<string, unknown> } | null;
+}
+
+interface RawConn {
+  pageInfo?: { hasPreviousPage?: boolean; startCursor?: string | null } | null;
+  nodes?: RawNode[] | null;
 }
 
 function shortType(repr: string): string {
@@ -111,36 +127,68 @@ function decodeNode(n: RawNode): AgentOnchainEvent | null {
 export async function fetchAgentEvents(
   opts: { before?: string | null; pageSize?: number } = {},
 ): Promise<AgentEventsPage> {
-  const first = opts.pageSize ?? 20;
+  const pageSize = opts.pageSize ?? 20;
+  const state: CursorState = opts.before
+    ? (JSON.parse(opts.before) as CursorState)
+    : { c: {}, done: {} };
+
+  // Only query kinds that still have older history to walk.
+  const active = AGENT_KINDS.filter((k) => !state.done[k]);
+  if (active.length === 0) return { events: [], cursor: null, hasMore: false };
+
+  // One aliased `events` connection per active kind, each with its own type
+  // filter and backward cursor. Single round-trip.
+  const varDefs = active.map((_, i) => `$t${i}: String!, $b${i}: String`).join(", ");
+  const fields = active
+    .map(
+      (_, i) => `a${i}: events(last: $n, before: $b${i}, filter: { type: $t${i} }) {
+      pageInfo { hasPreviousPage startCursor }
+      nodes { sender { address } timestamp transaction { digest } contents { type { repr } json } }
+    }`,
+    )
+    .join("\n");
+  const query = `query($n: Int!, ${varDefs}) {\n${fields}\n}`;
+
+  const variables: Record<string, unknown> = { n: pageSize };
+  active.forEach((k, i) => {
+    variables[`t${i}`] = TYPE_OF[k];
+    variables[`b${i}`] = state.c[k] ?? null;
+  });
+
   const res = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      query: QUERY,
-      variables: { first, before: opts.before ?? null, module: CDPM_MODULE },
-    }),
+    body: JSON.stringify({ query, variables }),
   });
   if (!res.ok) throw new Error(`Sui GraphQL HTTP ${res.status}`);
   const body = (await res.json()) as {
-    data?: {
-      events?: {
-        pageInfo?: { hasPreviousPage?: boolean; startCursor?: string | null };
-        nodes?: RawNode[];
-      };
-    };
+    data?: Record<string, RawConn | undefined>;
     errors?: unknown;
   };
   if (body.errors) throw new Error(`Sui GraphQL error: ${JSON.stringify(body.errors)}`);
-  const conn = body.data?.events;
-  const events = (conn?.nodes ?? [])
-    .map(decodeNode)
-    .filter((e): e is AgentOnchainEvent => e !== null)
-    .sort((a, b) => b.timestampMs - a.timestampMs); // newest first
-  return {
-    events,
-    cursor: conn?.pageInfo?.startCursor ?? null,
-    hasMore: !!conn?.pageInfo?.hasPreviousPage,
-  };
+
+  const events: AgentOnchainEvent[] = [];
+  const nextC: CursorState["c"] = { ...state.c };
+  const nextDone: CursorState["done"] = { ...state.done };
+
+  active.forEach((k, i) => {
+    const conn = body.data?.[`a${i}`];
+    const nodes = conn?.nodes ?? [];
+    for (const nd of nodes) {
+      const ev = decodeNode(nd);
+      if (ev) events.push(ev);
+    }
+    if (!conn?.pageInfo?.hasPreviousPage || nodes.length === 0) {
+      nextDone[k] = true; // exhausted — stop querying this kind
+    } else {
+      nextC[k] = conn.pageInfo.startCursor ?? null;
+    }
+  });
+
+  events.sort((a, b) => b.timestampMs - a.timestampMs); // newest first
+  const hasMore = AGENT_KINDS.some((k) => !nextDone[k]);
+  const cursor = hasMore ? JSON.stringify({ c: nextC, done: nextDone }) : null;
+  return { events, cursor, hasMore };
 }
 
 /** Human one-liner for an event's amounts, using the single pool's decimals. */
