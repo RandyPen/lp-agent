@@ -10,6 +10,8 @@ node_modules/
 # (covers the operator's Chinese-named notes + pitch-deck files).
 /[!A-Za-z]*.md
 /[!A-Za-z]*.html
+# Pitch/intro material that happens to start with an ASCII letter — keep local.
+/LP-Agent.md
 
 # Internal design documents (Chinese) — kept local, not published.
 # Ignored per-file on purpose: future English docs under docs/ stay tracked
