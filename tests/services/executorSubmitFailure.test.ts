@@ -18,6 +18,16 @@
 
 import { describe, it, expect, beforeAll, afterAll } from "bun:test";
 import { mock } from "bun:test";
+import * as realSubmitModule from "../../src/sui/submit.ts";
+
+// `mock.module` is PROCESS-GLOBAL and permanent — it rewrites the module
+// registry for every test file that runs after this one in the same `bun test`
+// process. Without an explicit restore, tests/sui/submit.test.ts (which tests
+// the REAL submitWithRetry) silently gets this stub instead, and fails or
+// passes purely on filesystem ordering: macOS happened to load it first, CI's
+// Linux ordering loaded it second. Snapshot the genuine exports here — before
+// the mock is installed — and re-install them in afterAll below.
+const REAL_SUBMIT_EXPORTS = { ...realSubmitModule };
 
 mock.module("../../src/sui/submit.ts", () => {
   class OnChainExecutionError extends Error {
@@ -69,6 +79,8 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
+  // Undo the process-global module mock so later test files see the real thing.
+  mock.module("../../src/sui/submit.ts", () => REAL_SUBMIT_EXPORTS);
   for (const k of Object.keys(REQUIRED_ENV)) {
     if (origEnv[k] !== undefined) process.env[k] = origEnv[k];
     else delete process.env[k];
