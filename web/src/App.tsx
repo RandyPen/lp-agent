@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { BinMark } from "@/components/BinMark";
+import { StatusStrip } from "@/components/StatusStrip";
 import { WalletConnectButton } from "@/components/WalletConnectButton";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IntelligencePage } from "@/pages/IntelligencePage";
@@ -30,6 +32,11 @@ export function App() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
+  useEffect(() => {
+    const label = PAGES.find((p) => p.id === page)?.label ?? "Dashboard";
+    document.title = `${label} — LiquidityManager`;
+  }, [page]);
+
   const navigate = (next: Page) => {
     window.history.pushState(null, "", next === "dashboard" ? "/" : `/${next}`);
     setPage(next);
@@ -40,8 +47,8 @@ export function App() {
   return (
     <div className="mx-auto min-h-screen max-w-6xl px-4 pb-16">
       {summary.data?.demo && (
-        <div className="border-l1/40 bg-l1/10 -mx-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b px-4 py-2 text-center">
-          <span className="font-display text-l1 text-[0.72rem] font-bold tracking-[0.18em] uppercase">
+        <div className="-mx-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b px-4 py-2 text-center" style={{ borderColor: "color-mix(in srgb, var(--color-gold) 35%, transparent)", background: "color-mix(in srgb, var(--color-gold) 8%, transparent)" }}>
+          <span className="font-display text-gold text-[0.72rem] font-bold tracking-[0.18em] uppercase">
             ● Demo data
           </span>
           <span className="text-ink-2 text-xs">
@@ -50,16 +57,20 @@ export function App() {
           </span>
         </div>
       )}
-      <header className="border-line flex items-center justify-between border-b py-4">
-        <div className="flex items-baseline gap-3">
-          <span className="font-display text-mint text-lg font-bold tracking-widest">
-            LIQUIDITY<span className="text-ink">MANAGER</span>
-          </span>
-          <span className="font-mono text-ink-3 hidden text-[11px] sm:inline">
-            open-source LP-agent framework · self-host for your own users
-          </span>
+
+      <header className="flex items-center justify-between gap-3 py-4">
+        <div className="flex min-w-0 items-center gap-3">
+          <BinMark />
+          <div className="min-w-0">
+            <div className="font-display text-ink text-base font-bold tracking-wider sm:text-lg sm:tracking-widest">
+              LIQUIDITY<span className="text-mint">MANAGER</span>
+            </div>
+            <div className="font-mono text-ink-3 hidden text-[11px] sm:block">
+              non-custodial LP agent · Sui DLMM · open-source, self-hosted
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-3">
           {summary.data && (
             <span className="text-ink-3 hidden items-center gap-2 text-xs md:flex">
               <span className="live-dot" />
@@ -73,7 +84,9 @@ export function App() {
         </div>
       </header>
 
-      <nav className="border-line mt-0 flex gap-1 overflow-x-auto border-b">
+      <StatusStrip summary={summary.data} />
+
+      <nav className="border-line flex gap-1 overflow-x-auto border-b">
         {PAGES.map((p) => (
           <button
             key={p.id}
@@ -106,14 +119,14 @@ export function App() {
         {page === "account" && <AccountPage />}
       </main>
 
-      <footer className="text-ink-3 mt-16 flex flex-col items-start justify-between gap-2 text-xs sm:flex-row sm:items-center sm:gap-4">
+      <footer className="border-line text-ink-3 mt-16 flex flex-col items-start justify-between gap-2 border-t pt-4 text-xs sm:flex-row sm:items-center sm:gap-4">
         <span>
           Reference portal from the open-source <b className="text-ink-2">lp-agent framework</b>{" "}
           (Apache-2.0) — each operator self-hosts it for their own users. Non-custodial: the agent
           can never withdraw, only the owner can.
         </span>
         {summary.data && (
-          <span className="mono-num">model {summary.data.modelVersion ?? "—"}</span>
+          <span className="mono-num shrink-0">model {summary.data.modelVersion ?? "—"}</span>
         )}
       </footer>
     </div>

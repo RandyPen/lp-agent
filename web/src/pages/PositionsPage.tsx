@@ -3,7 +3,7 @@ import { useQuery, useInfiniteQuery } from "@tanstack/react-query";
 import { useCurrentAccount } from "@mysten/dapp-kit-react";
 import { api, type RebalanceEntry } from "@/lib/api";
 import { NavChart } from "@/components/charts";
-import { EmptyState, LoadingRow, Panel, StatusPill, TableScroll } from "@/components/primitives";
+import { EmptyState, LoadingRow, Panel, StatusPill } from "@/components/primitives";
 import { EnrollWizard } from "./EnrollWizard";
 import {
   explorerAddressUrl,
@@ -338,7 +338,7 @@ function OnchainActivityPanel() {
       ) : events.length === 0 ? (
         <EmptyState>No agent events found on-chain yet.</EmptyState>
       ) : (
-        <TableScroll>
+        <div className="max-h-[26rem] overflow-auto">
           <div className="min-w-[600px] space-y-1.5">
             {events.map((e, i) => (
               <AgentEventRow key={`${e.digest}-${e.kind}-${e.pmId}-${i}`} e={e} />
@@ -357,7 +357,7 @@ function OnchainActivityPanel() {
               )}
             </div>
           </div>
-        </TableScroll>
+        </div>
       )}
     </Panel>
   );

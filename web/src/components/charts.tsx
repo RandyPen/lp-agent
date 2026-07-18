@@ -19,16 +19,16 @@ import {
 import type { MarketStateEpisode, PnlTick, Prediction, PricePoint } from "@/lib/api";
 import { formatTs, formatUsd } from "@/lib/format";
 
-const GRID = "rgba(159, 176, 188, 0.08)";
-const AXIS_TICK = { fill: "#5c6c78", fontSize: 11, fontFamily: "IBM Plex Mono" } as const;
+const GRID = "rgba(157, 180, 200, 0.08)";
+const AXIS_TICK = { fill: "#5a7288", fontSize: 11, fontFamily: "IBM Plex Mono" } as const;
 
 const TOOLTIP_STYLE = {
-  backgroundColor: "#151c22",
-  border: "1px solid #2b3945",
-  borderRadius: 6,
+  backgroundColor: "#101d2c",
+  border: "1px solid #28425a",
+  borderRadius: 4,
   fontFamily: "IBM Plex Mono",
   fontSize: 12,
-  color: "#e8eef2",
+  color: "#e9f1f7",
 } as const;
 
 const SERIES = ["#3987e5", "#199e70", "#9085e9", "#c98500"] as const;
@@ -58,6 +58,7 @@ export function NavChart({ series }: { series: NavSeries[] }) {
             type="number"
             domain={["dataMin", "dataMax"]}
             tickFormatter={(v: number) => formatTs(v)}
+            minTickGap={48}
             tick={AXIS_TICK}
             stroke={GRID}
             allowDuplicatedCategory={false}
@@ -120,6 +121,7 @@ export function FeeChart({ ticks }: { ticks: Array<{ ts_ms: number; cum_fees: nu
             type="number"
             domain={["dataMin", "dataMax"]}
             tickFormatter={(v: number) => formatTs(v)}
+            minTickGap={48}
             tick={AXIS_TICK}
             stroke={GRID}
           />
@@ -215,6 +217,7 @@ export function PredictionFan({ data }: { data: FanData }) {
             type="number"
             domain={["dataMin", "dataMax"]}
             tickFormatter={(v: number) => formatTs(v)}
+            minTickGap={48}
             tick={AXIS_TICK}
             stroke={GRID}
           />

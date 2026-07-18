@@ -95,7 +95,13 @@ export function DashboardPage() {
         />
         <StatTile
           label="Fees harvested"
-          value={pnlQueries.isSuccess ? `$${formatUsd(cumFees)}` : "—"}
+          value={
+            pnlQueries.isSuccess ? (
+              <span className="text-gold">${formatUsd(cumFees)}</span>
+            ) : (
+              "—"
+            )
+          }
           sub="cumulative swap-fee income"
         />
         <StatTile

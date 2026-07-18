@@ -2,11 +2,13 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
- * LiquidityManager — quant terminal design system (dark-only, deliberate).
+ * LiquidityManager — "abyssal instrument" design system (dark-only, deliberate).
  *
- * Chart series colors are the dataviz reference palette's DARK categorical
- * steps (validated as a set against the dark surface). UI chrome uses the
- * brand phosphor-mint accent, which is NOT used as a series color.
+ * Surfaces are blue-cast ocean ink (Sui = water), never neutral black. Two
+ * accents with paired meaning: sea-phosphor mint = structure / custody / live,
+ * fee amber = earned yield. Chart series colors are the dataviz reference
+ * palette's DARK categorical steps (validated as a set against the dark
+ * surface); neither accent is used as a series color.
  * ------------------------------------------------------------------------- */
 
 @theme {
@@ -14,18 +16,19 @@
   --font-body: "IBM Plex Sans", sans-serif;
   --font-mono: "IBM Plex Mono", monospace;
 
-  --color-bg: #0a0d10;
-  --color-panel: #10151a;
-  --color-panel-2: #151c22;
-  --color-line: #1f2a33;
-  --color-line-2: #2b3945;
+  --color-bg: #04090f;
+  --color-panel: #0a1420;
+  --color-panel-2: #101d2c;
+  --color-line: #17293b;
+  --color-line-2: #28425a;
 
-  --color-ink: #e8eef2;
-  --color-ink-2: #9fb0bc;
-  --color-ink-3: #5c6c78;
+  --color-ink: #e9f1f7;
+  --color-ink-2: #9db4c8;
+  --color-ink-3: #5a7288;
 
-  --color-mint: #35e0a1;
-  --color-mint-dim: #1d7a58;
+  --color-mint: #2fe6ae;
+  --color-mint-dim: #1a7a5c;
+  --color-gold: #e0b568;
 
   /* dataviz dark categorical slots */
   --color-s-blue: #3987e5;
@@ -55,97 +58,177 @@ body {
   font-family: var(--font-body);
   color: var(--color-ink);
   background:
-    radial-gradient(ellipse 80% 50% at 50% -20%, rgba(53, 224, 161, 0.06), transparent),
+    radial-gradient(ellipse 90% 55% at 50% -25%, rgba(47, 230, 174, 0.055), transparent),
+    radial-gradient(ellipse 70% 60% at 85% 110%, rgba(57, 135, 229, 0.04), transparent),
     var(--color-bg);
   min-height: 100vh;
 }
 
-/* subtle scanline texture for the terminal feel */
+/* Faint vertical hairlines — the bin grid the agent trades on, not CRT kitsch. */
 body::before {
   content: "";
   position: fixed;
   inset: 0;
   pointer-events: none;
   background: repeating-linear-gradient(
-    to bottom,
+    to right,
     transparent 0px,
-    transparent 3px,
-    rgba(255, 255, 255, 0.006) 3px,
-    rgba(255, 255, 255, 0.006) 4px
+    transparent 95px,
+    rgba(157, 180, 200, 0.022) 95px,
+    rgba(157, 180, 200, 0.022) 96px
   );
   z-index: 50;
 }
 
 ::selection {
-  background: rgba(53, 224, 161, 0.25);
+  background: rgba(47, 230, 174, 0.25);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-mint-dim);
+  outline-offset: 2px;
+}
+
+/* Thin, chrome-matched scrollbars for the local-scroll regions. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-2) transparent;
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-2);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 /* --------------------------------------------------------------------------
- * Reusable primitives
+ * Reusable primitives — in the components layer so utilities can override.
  * ------------------------------------------------------------------------ */
 
-.panel {
-  background: var(--color-panel);
-  border: 1px solid var(--color-line);
-  border-radius: 6px;
-}
+@layer components {
+  /* HUD instrument panel: hairline box with phosphor corner brackets. */
+  .panel {
+    position: relative;
+    background: var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: 2px;
+  }
+  .panel::before,
+  .panel::after {
+    content: "";
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    pointer-events: none;
+  }
+  .panel::before {
+    top: -1px;
+    left: -1px;
+    border-top: 1px solid color-mix(in srgb, var(--color-mint) 40%, var(--color-line-2));
+    border-left: 1px solid color-mix(in srgb, var(--color-mint) 40%, var(--color-line-2));
+  }
+  .panel::after {
+    bottom: -1px;
+    right: -1px;
+    border-bottom: 1px solid var(--color-line-2);
+    border-right: 1px solid var(--color-line-2);
+  }
 
-.panel-title {
-  font-family: var(--font-display);
-  font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--color-ink-2);
-}
+  .panel-title {
+    font-family: var(--font-display);
+    font-size: 0.72rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-ink-2);
+  }
+  .panel-title::before {
+    content: "";
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-right: 0.55rem;
+    margin-bottom: 1px;
+    background: var(--color-mint);
+  }
 
-.mono-num {
-  font-family: var(--font-mono);
-  font-variant-numeric: tabular-nums;
-}
+  .mono-num {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
 
-.btn-primary {
-  font-family: var(--font-display);
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  font-size: 0.78rem;
-  color: #06231a;
-  background: var(--color-mint);
-  border-radius: 4px;
-  padding: 0.55rem 1.1rem;
-  transition: filter 120ms ease, transform 120ms ease;
-}
-.btn-primary:hover:not(:disabled) {
-  filter: brightness(1.12);
-}
-.btn-primary:active:not(:disabled) {
-  transform: translateY(1px);
-}
-.btn-primary:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
+  /* Primary CTA — notched top-right corner, phosphor fill. */
+  .btn-primary {
+    font-family: var(--font-display);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 0.78rem;
+    color: #052019;
+    background: var(--color-mint);
+    clip-path: polygon(0 0, calc(100% - 9px) 0, 100% 9px, 100% 100%, 0 100%);
+    border-radius: 2px;
+    padding: 0.55rem 1.1rem;
+    transition: filter 120ms ease, transform 120ms ease;
+  }
+  .btn-primary:hover:not(:disabled) {
+    filter: brightness(1.12);
+  }
+  .btn-primary:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .btn-primary:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
 
-.btn-ghost {
-  font-family: var(--font-display);
-  font-weight: 500;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  font-size: 0.78rem;
-  color: var(--color-ink-2);
-  border: 1px solid var(--color-line-2);
-  border-radius: 4px;
-  padding: 0.5rem 1rem;
-  transition: color 120ms ease, border-color 120ms ease;
-}
-.btn-ghost:hover:not(:disabled) {
-  color: var(--color-mint);
-  border-color: var(--color-mint-dim);
-}
-.btn-ghost:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
+  .btn-ghost {
+    font-family: var(--font-display);
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    font-size: 0.78rem;
+    color: var(--color-ink-2);
+    border: 1px solid var(--color-line-2);
+    border-radius: 2px;
+    padding: 0.5rem 1rem;
+    transition: color 120ms ease, border-color 120ms ease;
+  }
+  .btn-ghost:hover:not(:disabled) {
+    color: var(--color-mint);
+    border-color: var(--color-mint-dim);
+  }
+  .btn-ghost:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* Masthead status strip cell: LABEL value, mono, hairline-separated. */
+  .strip-cell {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.5rem;
+    white-space: nowrap;
+  }
+  .strip-label {
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--color-ink-3);
+  }
+  .strip-value {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.74rem;
+    color: var(--color-ink-2);
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -177,7 +260,7 @@ body::before {
   --popover-foreground: var(--color-ink);
 
   --primary: var(--color-mint);
-  --primary-foreground: #06231a;
+  --primary-foreground: #052019;
 
   --secondary: var(--color-panel-2);
   --secondary-foreground: var(--color-ink);
@@ -211,10 +294,11 @@ mysten-dapp-kit-connect-button::part(trigger) {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   font-size: 0.78rem;
-  color: #06231a;
+  color: #052019;
   background: var(--color-mint);
   border: none;
-  border-radius: 4px;
+  clip-path: polygon(0 0, calc(100% - 9px) 0, 100% 9px, 100% 100%, 0 100%);
+  border-radius: 2px;
   padding: 0.55rem 1.1rem;
   transition: filter 120ms ease, transform 120ms ease;
 }
@@ -224,6 +308,10 @@ mysten-dapp-kit-connect-button::part(trigger):hover {
 mysten-dapp-kit-connect-button::part(trigger):active {
   transform: translateY(1px);
 }
+
+/* --------------------------------------------------------------------------
+ * Motion
+ * ------------------------------------------------------------------------ */
 
 @keyframes rise-in {
   from {
@@ -251,4 +339,37 @@ mysten-dapp-kit-connect-button::part(trigger):active {
   border-radius: 9999px;
   background: var(--color-mint);
   animation: pulse-dot 2.2s ease-in-out infinite;
+}
+
+/* Brand mark: liquidity bars rise once on load, staggered per bin. */
+@keyframes bin-rise {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+.binmark rect {
+  transform-box: fill-box;
+  transform-origin: bottom;
+  animation: bin-rise 420ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+.binmark rect:nth-child(1) { animation-delay: 40ms; }
+.binmark rect:nth-child(2) { animation-delay: 100ms; }
+.binmark rect:nth-child(3) { animation-delay: 160ms; }
+.binmark rect:nth-child(4) { animation-delay: 220ms; }
+.binmark rect:nth-child(5) { animation-delay: 280ms; }
+.binmark rect:nth-child(6) { animation-delay: 340ms; }
+.binmark rect:nth-child(7) { animation-delay: 400ms; }
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

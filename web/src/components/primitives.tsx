@@ -1,10 +1,11 @@
 import type { ReactNode } from "react";
+import { BinMark } from "./BinMark";
 
 export function StatTile(props: { label: string; value: ReactNode; sub?: ReactNode }) {
   return (
     <div className="panel p-4">
       <div className="panel-title">{props.label}</div>
-      <div className="mono-num text-ink mt-1.5 text-2xl font-medium">{props.value}</div>
+      <div className="mono-num text-ink mt-1.5 text-2xl font-medium md:text-[1.75rem]">{props.value}</div>
       {props.sub != null && <div className="text-ink-3 mt-1 text-xs">{props.sub}</div>}
     </div>
   );
@@ -93,7 +94,10 @@ export function TableScroll({ children }: { children: ReactNode }) {
 
 export function EmptyState({ children }: { children: ReactNode }) {
   return (
-    <div className="border-line-2 text-ink-3 rounded-md border border-dashed px-4 py-8 text-center text-sm">
+    <div className="border-line-2 text-ink-3 rounded-sm border border-dashed px-4 py-8 text-center text-sm">
+      <div className="mb-3 flex justify-center opacity-35 grayscale">
+        <BinMark size={20} />
+      </div>
       {children}
     </div>
   );

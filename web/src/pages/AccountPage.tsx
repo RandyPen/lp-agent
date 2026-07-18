@@ -109,7 +109,7 @@ export function AccountPage() {
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3">
         <StatTile
           label="Credit balance"
-          value={<span className="text-mint">{u.credits.toLocaleString()}</span>}
+          value={<span className="text-gold">{u.credits.toLocaleString()}</span>}
           sub="1 credit = 0.01 USDC · debited per rebalance"
         />
         <StatTile
@@ -177,7 +177,7 @@ export function AccountPage() {
                       <td className="text-ink-3 py-2 pr-3">{formatTs(d.observedAtMs)}</td>
                       <td className="py-2 pr-3">{symbol}</td>
                       <td className="py-2 pr-3">{formatRaw(d.amountDelta, decimals, 4)}</td>
-                      <td className="text-mint py-2">+{d.creditsGranted.toLocaleString()}</td>
+                      <td className="text-gold py-2">+{d.creditsGranted.toLocaleString()}</td>
                     </tr>
                   );
                 })}

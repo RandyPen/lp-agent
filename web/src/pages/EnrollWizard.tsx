@@ -174,11 +174,29 @@ export function EnrollWizard({ onClose }: { onClose: () => void }) {
         {/* step indicator */}
         <div className="mb-6 flex items-center gap-2">
           {steps.map((s, i) => (
-            <div key={s.id} className="flex flex-1 items-center gap-2">
+            <div key={s.id} className="flex flex-1 items-center gap-2 last:flex-none">
               <span
-                className={`font-mono text-[11px] ${i <= stepIdx ? "text-mint" : "text-ink-3"}`}
+                className="font-mono flex h-5 w-5 shrink-0 items-center justify-center rounded-sm text-[11px]"
+                style={
+                  i === stepIdx
+                    ? { background: "var(--color-mint)", color: "#052019" }
+                    : i < stepIdx
+                      ? { background: "var(--color-mint-dim)", color: "var(--color-ink)" }
+                      : {
+                          background: "var(--color-panel-2)",
+                          color: "var(--color-ink-3)",
+                          border: "1px solid var(--color-line-2)",
+                        }
+                }
               >
-                {i + 1}·{s.label}
+                {i < stepIdx ? "✓" : i + 1}
+              </span>
+              <span
+                className={`font-display hidden text-[10px] font-semibold tracking-wider uppercase sm:inline ${
+                  i <= stepIdx ? "text-ink-2" : "text-ink-3"
+                }`}
+              >
+                {s.label}
               </span>
               {i < steps.length - 1 && (
                 <span
